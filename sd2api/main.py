@@ -364,6 +364,7 @@ async def admin_config_status() -> dict[str, Any]:
     return {
         "mode": settings.sd2api_mode,
         "auto_login": settings.sd2api_auto_login,
+        "auto_accept_terms": settings.sd2api_auto_accept_terms,
         "credential_encryption": bool(settings.credential_master_key),
         "temp_mail_configured": bool(
             settings.sd2api_temp_mail_base_url and settings.sd2api_temp_mail_api_key

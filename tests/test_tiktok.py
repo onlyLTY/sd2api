@@ -511,6 +511,194 @@ async def test_credits_fallback_reads_new_navigation_text() -> None:
 
 
 @pytest.mark.asyncio
+async def test_subaccount_scan_uses_control_apis_without_ui_navigation(
+    tmp_path: Path,
+) -> None:
+    partner_id = "7668593711596617729"
+    client_id = "7668491362075033608"
+
+    class Page:
+        url = "https://ads.tiktok.com/creative/creativestudio/create"
+        current_id = partner_id
+        selected: list[str] = []
+
+        @staticmethod
+        def is_closed() -> bool:
+            return False
+
+        async def evaluate(self, script, payload) -> None:
+            self.current_id = payload["value"]
+            self.selected.append(self.current_id)
+
+    class ApiScanClient(BrowserTikTokClient):
+        async def start(self) -> dict:
+            return {}
+
+        async def _is_logged_in(self, page) -> bool:
+            return True
+
+        async def _api_json(self, method, path, *, data=None):
+            current_id = self._require_page().current_id
+            if path.endswith("ClientGetAccountList"):
+                return {
+                    "accounts": [
+                        {
+                            "aioClientID": partner_id,
+                            "profileName": "Seedance partner",
+                            "accountType": 3,
+                        },
+                        {
+                            "aioClientID": client_id,
+                            "profileName": "Client account",
+                            "accountType": 1,
+                        },
+                    ]
+                }
+            if path.endswith("ClientGetAccountInfo"):
+                return {"account": {"aioClientID": current_id}}
+            if path.endswith("QueryCreditAccount"):
+                return {"credits": "1975" if current_id == partner_id else "2000"}
+            if path.endswith("QueryUserLevelDetail"):
+                return {
+                    "user_level_info": {
+                        "user_segment_tier": (
+                            "T1" if current_id == partner_id else "T4"
+                        )
+                    }
+                }
+            if path.endswith("get_miniapp_permission_with_allowlist"):
+                return {
+                    "data": {
+                        "allowlist": [
+                            {
+                                "tool": "cue_mini_i2v_seedance",
+                                "auth": ["visit", "entry"],
+                            }
+                        ]
+                    }
+                }
+            raise AssertionError(path)
+
+    page = Page()
+    client = ApiScanClient(
+        Settings(sd2api_browser_profile=str(tmp_path / "api-scan")),
+        account_id="api-scan",
+    )
+    client._page = page  # type: ignore[assignment]
+    client._context = object()  # type: ignore[assignment]
+
+    result = await client.scan_subaccounts(check_access=True)
+    assert page.selected == [partner_id, client_id, partner_id]
+    assert result == [
+        {
+            "advertiser_id": partner_id,
+            "name": "Seedance partner",
+            "account_type": "partner",
+            "active": True,
+            "credits": 1975,
+            "seedance_access": True,
+            "last_error": None,
+            "last_checked_at": result[0]["last_checked_at"],
+        },
+        {
+            "advertiser_id": client_id,
+            "name": "Client account",
+            "account_type": "client",
+            "active": False,
+            "credits": 2000,
+            "seedance_access": False,
+            "last_error": None,
+            "last_checked_at": result[1]["last_checked_at"],
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_terms_are_automatically_accepted_only_when_enabled(
+    tmp_path: Path,
+) -> None:
+    class Page:
+        def __init__(self) -> None:
+            self.terms_visible = True
+            self.accept_visible = True
+            self.accept_enabled = False
+            self.accept_clicked = False
+
+        def locator(self, selector: str):
+            assert selector == '[class*="ai-disclaimer"]:visible'
+            return Locator(self, "terms")
+
+        def get_by_text(self, text):
+            return Locator(self, "terms")
+
+        def get_by_role(self, role, name):
+            assert role == "button"
+            return Locator(self, "accept")
+
+        async def wait_for_timeout(self, value: int) -> None:
+            assert value == 500
+
+    class Locator:
+        def __init__(self, page: Page, kind: str) -> None:
+            self.page = page
+            self.kind = kind
+
+        async def count(self) -> int:
+            return 1
+
+        def nth(self, index: int):
+            assert index == 0
+            return self
+
+        async def is_visible(self) -> bool:
+            return (
+                self.page.terms_visible
+                if self.kind == "terms"
+                else self.page.accept_visible
+            )
+
+        async def evaluate(self, script) -> None:
+            assert self.kind == "terms"
+            self.page.accept_enabled = True
+
+        async def is_enabled(self) -> bool:
+            return self.page.accept_enabled
+
+        async def click(self) -> None:
+            self.page.accept_clicked = True
+            self.page.accept_visible = False
+
+        async def wait_for(self, *, state: str, timeout: int) -> None:
+            assert state == "hidden"
+            assert timeout == 10_000
+            assert not self.page.accept_visible
+
+    disabled_page = Page()
+    disabled = BrowserTikTokClient(
+        Settings(
+            sd2api_browser_profile=str(tmp_path / "terms-disabled"),
+            sd2api_auto_accept_terms=False,
+        ),
+        account_id="terms-disabled",
+    )
+    with pytest.raises(TikTokUpstreamError) as error:
+        await disabled._ensure_terms_accepted(disabled_page)  # type: ignore[arg-type]
+    assert error.value.code == "terms_acceptance_required"
+    assert disabled_page.accept_clicked is False
+
+    enabled_page = Page()
+    enabled = BrowserTikTokClient(
+        Settings(
+            sd2api_browser_profile=str(tmp_path / "terms-enabled"),
+            sd2api_auto_accept_terms=True,
+        ),
+        account_id="terms-enabled",
+    )
+    await enabled._ensure_terms_accepted(enabled_page)  # type: ignore[arg-type]
+    assert enabled_page.accept_clicked is True
+
+
+@pytest.mark.asyncio
 async def test_create_and_check_success() -> None:
     requests: list[httpx.Request] = []
 

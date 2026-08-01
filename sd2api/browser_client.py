@@ -29,6 +29,16 @@ STUDIO_URL = (
     "?subApp=CreativeStudio/MiniApp/TextToVideo"
 )
 IMAGE_STUDIO_URL = "https://ads.tiktok.com/creative/creativestudio/image-to-video"
+ACCOUNT_LIST_PATH = "/CreativeOne/Client/ClientGetAccountList"
+ACCOUNT_INFO_PATH = "/CreativeOne/Client/ClientGetAccountInfo"
+CREDIT_ACCOUNT_PATH = "/CreativeOne/SymphonyPlatform/QueryCreditAccount"
+USER_LEVEL_PATH = "/CreativeOne/SymphonyPlatform/QueryUserLevelDetail"
+MINIAPP_PERMISSION_PATH = (
+    "/creative_bff_i18n/api/cue/get_miniapp_permission_with_allowlist"
+)
+ACCOUNT_CONTEXT_COOKIE = "s_aio_client_id"
+SEEDANCE2_ALLOWLIST_TOOL = "cue_mini_i2v_seedance_2"
+SEEDANCE2_USER_TIERS = {"T00", "T0", "T1"}
 
 
 @dataclass(slots=True)
@@ -350,7 +360,7 @@ class BrowserTikTokClient:
         await self._require_page().bring_to_front()
 
     async def scan_subaccounts(self, *, check_access: bool = True) -> list[dict[str, Any]]:
-        """Discover child advertisers and optionally check each one's SD2 access and credits."""
+        """Discover accounts and capabilities through TikTok's JSON control APIs."""
         async with self._subaccount_lock:
             await self.start()
             page = self._require_page()
@@ -360,42 +370,49 @@ class BrowserTikTokClient:
                     status_code=401,
                     code="browser_login_required",
                 )
-            if not page.url.startswith("https://ads.tiktok.com/creative/creativestudio/"):
-                await page.goto(STUDIO_URL, wait_until="domcontentloaded", timeout=90_000)
-            # The studio is a SPA and can replace its main frame shortly after
-            # authentication/navigation. Let that redirect settle before
-            # querying the account menu.
-            await page.wait_for_load_state("domcontentloaded", timeout=30_000)
-            await page.wait_for_timeout(2_000)
             discovered = await self._discover_subaccounts(page)
-            original = next(
-                (item["advertiser_id"] for item in discovered if item.get("active")), None
-            )
+            original = self._active_advertiser_id
             if not check_access:
                 return discovered
 
             results: list[dict[str, Any]] = []
-            for item in discovered:
-                checked = dict(item)
-                try:
-                    await self._switch_subaccount(page, item["advertiser_id"])
-                    checked["active"] = True
-                    checked["credits"] = await self._visible_credits(page)
-                    checked["seedance_access"] = await self._has_seedance_access(page)
-                    checked["last_error"] = None
-                except Exception as exc:
-                    checked["seedance_access"] = False
-                    checked["credits"] = None
-                    checked["active"] = False
-                    checked["last_error"] = f"{exc.__class__.__name__}: {exc}"
-                checked["last_checked_at"] = int(time.time())
-                results.append(checked)
+            try:
+                for item in discovered:
+                    checked = dict(item)
+                    try:
+                        advertiser_id = str(item["advertiser_id"])
+                        await self._set_account_context(page, advertiser_id)
+                        info, credit, permissions, user_level = await asyncio.gather(
+                            self._api_json("GET", ACCOUNT_INFO_PATH),
+                            self._api_json("POST", CREDIT_ACCOUNT_PATH, data={}),
+                            self._api_json("GET", MINIAPP_PERMISSION_PATH),
+                            self._api_json("POST", USER_LEVEL_PATH, data={}),
+                        )
+                        returned_id = str(
+                            (info.get("account") or {}).get("aioClientID") or ""
+                        )
+                        if returned_id != advertiser_id:
+                            raise RuntimeError(
+                                f"TikTok returned account {returned_id!r} after selecting "
+                                f"{advertiser_id!r}"
+                            )
+                        checked["credits"] = self._parse_credits(credit)
+                        checked["seedance_access"] = self._seedance2_access(
+                            permissions, user_level
+                        )
+                        checked["last_error"] = None
+                    except Exception as exc:
+                        checked["seedance_access"] = False
+                        checked["credits"] = None
+                        checked["last_error"] = f"{exc.__class__.__name__}: {exc}"
+                    checked["active"] = checked["advertiser_id"] == original
+                    checked["last_checked_at"] = int(time.time())
+                    results.append(checked)
+            finally:
+                if original:
+                    await self._set_account_context(page, original)
+                self._active_advertiser_id = original
 
-            if original and original != self._active_advertiser_id:
-                try:
-                    await self._switch_subaccount(page, original)
-                except Exception:
-                    pass
             for item in results:
                 item["active"] = item["advertiser_id"] == self._active_advertiser_id
             return results
@@ -437,122 +454,147 @@ class BrowserTikTokClient:
         raise RuntimeError("Could not open the TikTok subaccount menu")
 
     async def _discover_subaccounts(self, page: Page) -> list[dict[str, Any]]:
-        await self._open_subaccount_menu(page)
-        payload = await page.evaluate(
-            """
-            () => {
-              const clean = value => (value || '').replace(/\\s+/g, ' ').trim();
-              const idPattern = /^ID:\\s*(\\d{10,})$/;
-              const current = Array.from(document.querySelectorAll(
-                'div[class*="justify-between"][class*="text-neutral-highOnSurface"]'
-              )).map(el => clean(el.textContent)).map(text => text.match(idPattern))
-                .find(Boolean)?.[1] || null;
-              const rows = [];
-              for (const label of document.querySelectorAll('p')) {
-                const match = clean(label.textContent).match(idPattern);
-                if (!match) continue;
-                const row = label.parentElement?.parentElement?.parentElement;
-                if (!row) continue;
-                const rowText = clean(row.textContent);
-                const name = clean(rowText.replace(idPattern, '').replace(`ID: ${match[1]}`, ''));
-                let accountType = 'unknown';
-                let cursor = row.previousElementSibling;
-                while (cursor) {
-                  const heading = clean(cursor.textContent).toLowerCase();
-                  if (heading === 'client account') { accountType = 'client'; break; }
-                  if (heading === 'partner account') { accountType = 'partner'; break; }
-                  cursor = cursor.previousElementSibling;
+        account_list, account_info = await asyncio.gather(
+            self._api_json("GET", ACCOUNT_LIST_PATH),
+            self._api_json("GET", ACCOUNT_INFO_PATH),
+        )
+        accounts = account_list.get("accounts")
+        if not isinstance(accounts, list) or not accounts:
+            raise RuntimeError("TikTok did not return any Client or Partner accounts")
+        active_id = str(
+            ((account_info.get("account") or {}).get("aioClientID")) or ""
+        )
+        result: list[dict[str, Any]] = []
+        for account in accounts:
+            if not isinstance(account, dict):
+                continue
+            advertiser_id = str(account.get("aioClientID") or "")
+            if not advertiser_id:
+                continue
+            account_type = account.get("accountType")
+            result.append(
+                {
+                    "advertiser_id": advertiser_id,
+                    "name": str(
+                        account.get("profileName")
+                        or account.get("companyName")
+                        or advertiser_id
+                    ),
+                    "account_type": (
+                        "client"
+                        if account_type == 1
+                        else "partner"
+                        if account_type == 3
+                        else "unknown"
+                    ),
+                    "active": advertiser_id == active_id,
                 }
-                rows.push({
-                  advertiser_id: match[1],
-                  name: name || match[1],
-                  account_type: accountType,
-                  active: match[1] === current,
-                });
-              }
-              return rows;
-            }
-            """
-        )
-        if not isinstance(payload, list) or not payload:
-            raise RuntimeError("TikTok did not expose any Client or Partner subaccounts")
-        result = [item for item in payload if isinstance(item, dict) and item.get("advertiser_id")]
-        self._active_advertiser_id = next(
-            (str(item["advertiser_id"]) for item in result if item.get("active")), None
-        )
-        await page.keyboard.press("Escape")
+            )
+        if not result:
+            raise RuntimeError("TikTok returned an empty account list")
+        self._active_advertiser_id = active_id or None
         return result
 
     async def _switch_subaccount(self, page: Page, advertiser_id: str) -> None:
-        if not page.url.startswith("https://ads.tiktok.com/creative/creativestudio/"):
-            await page.goto(STUDIO_URL, wait_until="domcontentloaded", timeout=90_000)
-            await page.wait_for_timeout(2_000)
         entries = await self._discover_subaccounts(page)
         if not any(item["advertiser_id"] == advertiser_id for item in entries):
             raise RuntimeError(f"TikTok subaccount {advertiser_id} is not available")
-        if self._active_advertiser_id == advertiser_id:
-            return
-        await self._open_subaccount_menu(page)
-        labels = page.get_by_text(f"ID: {advertiser_id}", exact=True)
-        visible = [
-            labels.nth(index)
-            for index in range(await labels.count())
-            if await labels.nth(index).is_visible()
-        ]
-        if len(visible) != 1:
+        await self._set_account_context(page, advertiser_id)
+        account_info = await self._api_json("GET", ACCOUNT_INFO_PATH)
+        returned_id = str((account_info.get("account") or {}).get("aioClientID") or "")
+        if returned_id != advertiser_id:
             raise RuntimeError(
-                f"Could not uniquely locate TikTok subaccount {advertiser_id}"
+                f"TikTok did not activate subaccount {advertiser_id}; got {returned_id!r}"
             )
-        try:
-            await visible[0].locator("xpath=../../..").click(timeout=10_000)
-        except PlaywrightTimeoutError:
-            # The account switch is an SPA navigation and can outlive the
-            # original row element even though the click was accepted.
-            pass
-        await page.wait_for_timeout(5_000)
-        if not page.url.startswith("https://ads.tiktok.com/creative/creativestudio/"):
-            await page.goto(STUDIO_URL, wait_until="domcontentloaded", timeout=90_000)
-            await page.wait_for_timeout(3_000)
-        refreshed = await self._discover_subaccounts(page)
-        if any(
-            item["advertiser_id"] == advertiser_id and item.get("active")
-            for item in refreshed
-        ):
-            return
+        await page.goto(STUDIO_URL, wait_until="domcontentloaded", timeout=90_000)
+        await page.wait_for_load_state("domcontentloaded", timeout=30_000)
+        await page.wait_for_timeout(1_000)
+        await self._ensure_terms_accepted(page)
+        self._active_advertiser_id = advertiser_id
 
-        # Newer account menus bind the action to the radio/avatar at the start
-        # of the row rather than the text container.
-        for selector in ('input[type="radio"]', '[role="radio"]', ':scope > *'):
-            await self._open_subaccount_menu(page)
-            labels = page.get_by_text(f"ID: {advertiser_id}", exact=True)
-            visible = [
-                labels.nth(index)
-                for index in range(await labels.count())
-                if await labels.nth(index).is_visible()
-            ]
-            if len(visible) != 1:
-                break
-            row = visible[0].locator("xpath=../../..")
-            targets = row.locator(selector)
-            if not await targets.count():
-                continue
-            try:
-                await targets.first.click(timeout=10_000, force=True)
-            except PlaywrightTimeoutError:
-                pass
-            await page.wait_for_timeout(5_000)
-            if not page.url.startswith("https://ads.tiktok.com/creative/creativestudio/"):
-                await page.goto(STUDIO_URL, wait_until="domcontentloaded", timeout=90_000)
-                await page.wait_for_timeout(3_000)
-            refreshed = await self._discover_subaccounts(page)
-            if any(
-                item["advertiser_id"] == advertiser_id and item.get("active")
-                for item in refreshed
-            ):
-                return
-        raise RuntimeError(
-            f"TikTok did not activate subaccount {advertiser_id}; it may require onboarding"
+    async def _set_account_context(self, page: Page, advertiser_id: str) -> None:
+        if not re.fullmatch(r"\d{10,}", advertiser_id):
+            raise ValueError(f"Invalid TikTok account ID {advertiser_id!r}")
+        await page.evaluate(
+            """
+            ({name, value}) => {
+              const expires = new Date();
+              expires.setDate(expires.getDate() + 30);
+              document.cookie = `${name}=${value}; domain=tiktok.com; ` +
+                `expires=${expires.toUTCString()}; path=/`;
+            }
+            """,
+            {"name": ACCOUNT_CONTEXT_COOKIE, "value": advertiser_id},
         )
+
+    async def _api_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        data: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        context = self._context
+        if context is None:
+            raise RuntimeError("Persistent browser is not running")
+        url = f"{self.settings.tiktok_base_url.rstrip('/')}/{path.lstrip('/')}"
+        if method == "GET":
+            response = await context.request.get(url)
+        elif method == "POST":
+            response = await context.request.post(url, data=data or {})
+        else:
+            raise ValueError(f"Unsupported browser API method {method!r}")
+        if not response.ok:
+            raise TikTokUpstreamError(
+                f"TikTok {path} returned HTTP {response.status}",
+                status_code=502,
+                code="tiktok_control_api_error",
+            )
+        payload = await response.json()
+        if not isinstance(payload, dict):
+            raise TikTokUpstreamError(
+                f"TikTok {path} returned a non-object response",
+                status_code=502,
+                code="tiktok_control_api_error",
+            )
+        base_response = payload.get("BaseResp")
+        if isinstance(base_response, dict) and int(base_response.get("StatusCode") or 0):
+            raise TikTokUpstreamError(
+                str(base_response.get("StatusMessage") or f"TikTok {path} failed"),
+                status_code=502,
+                code="tiktok_control_api_error",
+            )
+        if int(payload.get("code") or 0):
+            raise TikTokUpstreamError(
+                str(payload.get("message") or f"TikTok {path} failed"),
+                status_code=502,
+                code="tiktok_control_api_error",
+            )
+        return payload
+
+    @staticmethod
+    def _parse_credits(payload: dict[str, Any]) -> int | None:
+        value = payload.get("credits")
+        if isinstance(value, bool):
+            return None
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _seedance2_access(
+        permissions: dict[str, Any], user_level: dict[str, Any]
+    ) -> bool:
+        allowlist = (permissions.get("data") or {}).get("allowlist") or []
+        allowlisted = any(
+            isinstance(item, dict)
+            and item.get("tool") == SEEDANCE2_ALLOWLIST_TOOL
+            and "entry" in (item.get("auth") or [])
+            for item in allowlist
+        )
+        tier = str((user_level.get("user_level_info") or {}).get("user_segment_tier") or "")
+        return allowlisted or tier in SEEDANCE2_USER_TIERS
 
     async def _has_seedance_access(self, page: Page) -> bool:
         current = page.get_by_text(re.compile(r"^Dreamina Seedance", re.I))
@@ -1653,32 +1695,69 @@ class BrowserTikTokClient:
                     return int(value)
         return None
 
-    @staticmethod
-    async def _ensure_terms_accepted(page: Page) -> None:
+    async def _ensure_terms_accepted(self, page: Page) -> None:
         disclaimers = page.locator('[class*="ai-disclaimer"]:visible')
-        terms_text = page.get_by_text(re.compile(r"Creative GenAI Terms", re.I))
-        accept_text = page.get_by_text("Accept", exact=True)
-        visible = False
+        terms_text = page.get_by_text(re.compile(r"Creative GenA[Il] Terms", re.I))
+        accept_text = page.get_by_role(
+            "button", name=re.compile(r"^Accept$", re.I)
+        )
+        visible_anchor = None
         for locator in (disclaimers, terms_text):
             for index in range(await locator.count()):
-                if await locator.nth(index).is_visible():
-                    visible = True
+                candidate = locator.nth(index)
+                if await candidate.is_visible():
+                    visible_anchor = candidate
                     break
-            if visible:
+            if visible_anchor is not None:
                 break
-        if visible:
-            accept_visible = False
-            for index in range(await accept_text.count()):
-                if await accept_text.nth(index).is_visible():
-                    accept_visible = True
-                    break
-            if accept_visible:
-                raise TikTokUpstreamError(
-                    "TikTok Creative GenAI Terms require one-time acceptance for this "
-                    "subaccount in Chromium; review the terms, click Accept, then retry",
-                    status_code=409,
-                    code="terms_acceptance_required",
-                )
+        if visible_anchor is None:
+            return
+        visible_accept = None
+        for index in range(await accept_text.count()):
+            candidate = accept_text.nth(index)
+            if await candidate.is_visible():
+                visible_accept = candidate
+                break
+        if visible_accept is None:
+            return
+        if not self.settings.sd2api_auto_accept_terms:
+            raise TikTokUpstreamError(
+                "TikTok Creative GenAI Terms require one-time acceptance for this "
+                "subaccount in Chromium; review the terms, click Accept, then retry",
+                status_code=409,
+                code="terms_acceptance_required",
+            )
+        await visible_anchor.evaluate(
+            """
+            element => {
+              let node = element;
+              while (node) {
+                if (node.scrollHeight > node.clientHeight + 2) {
+                  node.scrollTop = node.scrollHeight;
+                  node.dispatchEvent(new Event('scroll', {bubbles: true}));
+                  return;
+                }
+                node = node.parentElement;
+              }
+            }
+            """
+        )
+        await page.wait_for_timeout(500)
+        if not await visible_accept.is_enabled():
+            raise TikTokUpstreamError(
+                "TikTok Creative GenAI Terms Accept button stayed disabled after scrolling",
+                status_code=409,
+                code="terms_acceptance_failed",
+            )
+        await visible_accept.click()
+        try:
+            await visible_accept.wait_for(state="hidden", timeout=10_000)
+        except PlaywrightTimeoutError as exc:
+            raise TikTokUpstreamError(
+                "TikTok Creative GenAI Terms remained visible after automatic acceptance",
+                status_code=409,
+                code="terms_acceptance_failed",
+            ) from exc
 
     def _mark_context_closed(self, context: BrowserContext) -> None:
         if self._context is context:

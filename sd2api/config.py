@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     sd2api_pool_start_concurrency: int = Field(default=3, ge=1, le=50)
     sd2api_credential_key: str = ""
     sd2api_auto_login: bool = True
+    sd2api_auto_accept_terms: bool = False
     sd2api_login_timeout: int = Field(default=600, ge=60, le=3600)
     sd2api_relogin_interval: int = Field(default=300, ge=30, le=86400)
     sd2api_temp_mail_base_url: str = ""
