@@ -1,0 +1,14 @@
+.env
+.env.docker
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.browser-profile/
+uploads/
+test-assets/
+*.mp4
+uvicorn*.log
+sd2api.db*

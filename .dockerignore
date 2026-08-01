@@ -1,0 +1,14 @@
+.browser-profile
+.env
+.env.docker
+.git
+.pytest_cache
+.ruff_cache
+.venv
+__pycache__
+*.egg-info
+*.log
+*.mp4
+uploads
+sd2api.db*
+tests

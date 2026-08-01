@@ -1,0 +1,32 @@
+services:
+  sd2api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    ipc: host
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+    ports:
+      - "127.0.0.1:8765:8765"
+      - "127.0.0.1:6080:6080"
+    volumes:
+      - browser_profiles:/data/profiles
+      - task_database:/data/db
+      - staged_uploads:/data/uploads
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/healthz', timeout=5)"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  browser_profiles:
+  task_database:
+  staged_uploads:
