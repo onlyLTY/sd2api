@@ -44,6 +44,82 @@ def mp4_bytes() -> bytes:
     return b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2"
 
 
+class _VisibleLocator:
+    def __init__(self, visible: bool) -> None:
+        self.visible = visible
+
+    async def count(self) -> int:
+        return int(self.visible)
+
+    def nth(self, index: int) -> "_VisibleLocator":
+        return self
+
+    async def is_visible(self) -> bool:
+        return self.visible
+
+
+class _LoginStatePage:
+    def __init__(
+        self,
+        url: str,
+        *,
+        login_visible: bool = False,
+        logout_visible: bool = False,
+        generation_visible: bool = False,
+    ) -> None:
+        self.url = url
+        self.login_visible = login_visible
+        self.logout_visible = logout_visible
+        self.generation_visible = generation_visible
+
+    def get_by_role(self, role: str, *, name) -> _VisibleLocator:
+        assert role == "button"
+        return _VisibleLocator(self.login_visible)
+
+    def locator(self, selector: str) -> _VisibleLocator:
+        return _VisibleLocator(False)
+
+    def get_by_text(self, name, *, exact: bool) -> _VisibleLocator:
+        return _VisibleLocator(
+            self.logout_visible if exact else self.generation_visible
+        )
+
+
+@pytest.mark.asyncio
+async def test_public_studio_landing_page_is_not_logged_in() -> None:
+    page = _LoginStatePage(
+        "https://ads.tiktok.com/creative/creativestudio/home/en",
+        login_visible=True,
+    )
+    assert await BrowserTikTokClient._is_logged_in(page) is False  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_loading_generation_route_is_not_logged_in() -> None:
+    page = _LoginStatePage(
+        "https://ads.tiktok.com/creative/creativestudio/image-to-video"
+    )
+    assert await BrowserTikTokClient._is_logged_in(page) is False  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_generation_workspace_is_logged_in() -> None:
+    page = _LoginStatePage(
+        "https://ads.tiktok.com/creative/creativestudio/image-to-video",
+        generation_visible=True,
+    )
+    assert await BrowserTikTokClient._is_logged_in(page) is True  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_new_create_workspace_route_is_logged_in() -> None:
+    page = _LoginStatePage(
+        "https://ads.tiktok.com/creative/creativestudio/create",
+        generation_visible=True,
+    )
+    assert await BrowserTikTokClient._is_logged_in(page) is True  # type: ignore[arg-type]
+
+
 def test_store_round_trip(tmp_path: Path) -> None:
     store = TaskStore(str(tmp_path / "tasks.db"))
     created = store.create(
@@ -139,6 +215,34 @@ def test_store_tracks_subaccounts_and_preserves_user_selection(tmp_path: Path) -
     assert partner["credits"] == 1995
 
 
+def test_browser_profile_is_reused_by_login_email(tmp_path: Path) -> None:
+    root = tmp_path / "profiles"
+    store = TaskStore(str(tmp_path / "profiles.db"))
+    store.create_account(
+        account_id="old-account",
+        name="Old",
+        username="Login@Example.com",
+    )
+    legacy = root / "old-account"
+    legacy.mkdir(parents=True)
+    pool = BrowserPoolClient(
+        Settings(sd2api_browser_profile=str(root)),
+        store,
+    )
+    first = Path(pool._profile_path("old-account"))
+    assert first.name.startswith("user_")
+    assert first.exists()
+    assert not legacy.exists()
+
+    store.delete_account("old-account")
+    store.create_account(
+        account_id="new-account",
+        name="New",
+        username="login@example.com",
+    )
+    assert Path(pool._profile_path("new-account")) == first
+
+
 @pytest.mark.asyncio
 async def test_temp_mail_client_reads_tiktok_verification_code() -> None:
     requested: list[httpx.Request] = []
@@ -197,10 +301,49 @@ def test_temp_mail_client_extracts_alphanumeric_tiktok_html_code() -> None:
     assert code == "SPNRZX"
 
 
+def test_temp_mail_client_extracts_code_from_tiktok_table_cell() -> None:
+    code = TempMailClient._extract_code(
+        {
+            "subject": "TikTok for Business Verification help",
+            "htmlBody": (
+                "<table><tr><td> TikTok verification </td></tr>"
+                "<tr><td> Your code: ABC12Z </td></tr></table>"
+            ),
+        }
+    )
+    assert code == "ABC12Z"
+
+
+@pytest.mark.asyncio
+async def test_multi_box_otp_uses_key_event_for_final_character() -> None:
+    class Field:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, str | None]] = []
+
+        async def fill(self, value: str) -> None:
+            self.events.append(("fill", value))
+
+        async def click(self) -> None:
+            self.events.append(("click", None))
+
+        async def press(self, value: str) -> None:
+            self.events.append(("press", value))
+
+    fields = [Field() for _ in range(6)]
+    await BrowserTikTokClient._fill_code_inputs(fields, "ABC12Z")
+    assert fields[0].events == [("fill", "A")]
+    assert fields[-1].events == [
+        ("fill", ""),
+        ("click", None),
+        ("press", "Z"),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_login_detects_manual_success_while_mail_polling(tmp_path: Path) -> None:
     class FakePage:
         url = "https://ads.tiktok.com/login"
+        frames: list = []
 
         @staticmethod
         def is_closed() -> bool:

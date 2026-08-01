@@ -116,6 +116,16 @@ class TempMailClient:
         match = re.search(r"(?<![A-Z0-9])([A-Z0-9]{4,8})(?![A-Z0-9])", direct, re.I)
         if match:
             return match.group(1)
+        raw_html = " ".join(
+            str(item.get(key) or "") for key in ("htmlBody", "html_body")
+        )
+        # TikTok for Business currently places the six-character code in a
+        # table cell. Keep this raw-HTML fallback before tags are stripped.
+        match = re.search(
+            r"(?<=\s)\b([A-Z0-9]{6})\b(?=[\s\S]*?</td)", raw_html
+        )
+        if match:
+            return match.group(1)
         raw = " ".join(
             str(item.get(key) or "")
             for key in ("subject", "textBody", "text_body", "htmlBody", "html_body")

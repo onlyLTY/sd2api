@@ -237,14 +237,22 @@ async def stop_browser() -> dict[str, bool]:
 async def browser_diagnostics(
     account_id: str | None = None,
     open_generation_menu: bool = False,
+    open_subaccount_menu: bool = False,
+    click_subaccount_id: str | None = None,
 ) -> dict[str, Any]:
     if isinstance(client, BrowserPoolClient):
         return await client.diagnostics(
             account_id=account_id,
             open_generation_menu=open_generation_menu,
+            open_subaccount_menu=open_subaccount_menu,
+            click_subaccount_id=click_subaccount_id,
         )
     if isinstance(client, BrowserTikTokClient):
-        return await client.diagnostics(open_generation_menu=open_generation_menu)
+        return await client.diagnostics(
+            open_generation_menu=open_generation_menu,
+            open_subaccount_menu=open_subaccount_menu,
+            click_subaccount_id=click_subaccount_id,
+        )
     raise HTTPException(status_code=409, detail="SD2API_MODE is not browser")
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from pathlib import Path
 import time
 from typing import Any
@@ -44,7 +45,18 @@ class BrowserPoolClient:
 
     def _profile_path(self, account_id: str) -> str:
         root = Path(self.settings.sd2api_browser_profile).resolve()
-        return str(root / account_id)
+        account = self.store.get_account(account_id)
+        username = str((account or {}).get("username") or "").strip().lower()
+        if not username:
+            return str(root / account_id)
+        profile_key = hashlib.sha256(username.encode("utf-8")).hexdigest()[:24]
+        stable = root / f"user_{profile_key}"
+        legacy = root / account_id
+        # Migrate the currently retained account-id profile once. Future
+        # delete/re-add operations for the same email resolve to `stable`.
+        if legacy.exists() and not stable.exists():
+            legacy.rename(stable)
+        return str(stable)
 
     def _worker(self, account_id: str) -> BrowserTikTokClient:
         account = self.store.get_account(account_id)
@@ -187,6 +199,16 @@ class BrowserPoolClient:
         password: str,
         auto_login: bool = True,
     ) -> dict[str, Any]:
+        normalized_username = username.strip().lower()
+        if any(
+            str(item.get("username") or "").strip().lower() == normalized_username
+            for item in self.store.list_accounts()
+        ):
+            raise TikTokUpstreamError(
+                f"Login email {username!r} is already present in the account pool",
+                status_code=409,
+                code="account_username_exists",
+            )
         if account_id is None:
             while True:
                 account_id = "account_" + uuid.uuid4().hex[:12]
@@ -434,7 +456,12 @@ class BrowserPoolClient:
                     self._schedule_login(account["id"])
 
     async def diagnostics(
-        self, *, account_id: str | None = None, open_generation_menu: bool = False
+        self,
+        *,
+        account_id: str | None = None,
+        open_generation_menu: bool = False,
+        open_subaccount_menu: bool = False,
+        click_subaccount_id: str | None = None,
     ) -> dict[str, Any]:
         if not account_id:
             running = [key for key, worker in self._workers.items() if worker.load == 0]
@@ -446,7 +473,9 @@ class BrowserPoolClient:
                 )
             account_id = sorted(running)[0]
         return await self._worker(account_id).diagnostics(
-            open_generation_menu=open_generation_menu
+            open_generation_menu=open_generation_menu,
+            open_subaccount_menu=open_subaccount_menu,
+            click_subaccount_id=click_subaccount_id,
         )
 
     async def refresh_subaccounts(
@@ -492,6 +521,7 @@ class BrowserPoolClient:
                 code="subaccount_scan_failed",
             ) from exc
         self.store.upsert_subaccounts(account_id, discovered)
+        self.store.update_account(account_id, last_error=None)
         return await self.account_status(account_id)
 
     async def set_subaccount_enabled(

@@ -408,25 +408,32 @@ class BrowserTikTokClient:
     async def _open_subaccount_menu(self, page: Page) -> None:
         await self._ensure_terms_accepted(page)
         labels = page.locator("p").filter(has_text=re.compile(r"^ID:\s*\d{10,}$"))
-        for index in range(await labels.count()):
-            if await labels.nth(index).is_visible():
-                return
+        sections = page.get_by_text(
+            re.compile(r"^(Client account|Partner account)$", re.I)
+        )
+
+        async def menu_visible() -> bool:
+            for locator in (labels, sections):
+                for index in range(await locator.count()):
+                    if await locator.nth(index).is_visible():
+                        return True
+            return False
+
+        if await menu_visible():
+            return
         triggers = page.locator('nav p[class*="xl:block"]')
         for index in range(await triggers.count()):
             trigger = triggers.nth(index)
             if await trigger.is_visible():
-                try:
-                    await trigger.locator("xpath=../../..").click(timeout=10_000)
-                except PlaywrightTimeoutError:
-                    # A one-time terms dialog can appear just after the SPA
-                    # settles and intercept this click.
-                    await self._ensure_terms_accepted(page)
-                    raise RuntimeError("Could not open the TikTok subaccount menu")
-                await page.wait_for_timeout(500)
-                break
-        for index in range(await labels.count()):
-            if await labels.nth(index).is_visible():
-                return
+                for ancestor in ("xpath=..", "xpath=../..", "xpath=../../.."):
+                    try:
+                        await trigger.locator(ancestor).click(timeout=5_000)
+                    except PlaywrightTimeoutError:
+                        await self._ensure_terms_accepted(page)
+                        continue
+                    await page.wait_for_timeout(500)
+                    if await menu_visible():
+                        return
         raise RuntimeError("Could not open the TikTok subaccount menu")
 
     async def _discover_subaccounts(self, page: Page) -> list[dict[str, Any]]:
@@ -493,32 +500,66 @@ class BrowserTikTokClient:
             if await labels.nth(index).is_visible()
         ]
         if len(visible) != 1:
-            raise RuntimeError(f"Could not uniquely locate TikTok subaccount {advertiser_id}")
+            raise RuntimeError(
+                f"Could not uniquely locate TikTok subaccount {advertiser_id}"
+            )
         try:
             await visible[0].locator("xpath=../../..").click(timeout=10_000)
         except PlaywrightTimeoutError:
-            # TikTok sometimes redirects to an onboarding surface while the click
-            # is still waiting for the original page's navigation lifecycle.
+            # The account switch is an SPA navigation and can outlive the
+            # original row element even though the click was accepted.
             pass
-        await page.wait_for_timeout(1_500)
+        await page.wait_for_timeout(5_000)
         if not page.url.startswith("https://ads.tiktok.com/creative/creativestudio/"):
             await page.goto(STUDIO_URL, wait_until="domcontentloaded", timeout=90_000)
-            await page.wait_for_timeout(2_000)
+            await page.wait_for_timeout(3_000)
         refreshed = await self._discover_subaccounts(page)
-        if not any(
+        if any(
             item["advertiser_id"] == advertiser_id and item.get("active")
             for item in refreshed
         ):
-            raise RuntimeError(
-                f"TikTok did not activate subaccount {advertiser_id}; it may require onboarding"
-            )
+            return
+
+        # Newer account menus bind the action to the radio/avatar at the start
+        # of the row rather than the text container.
+        for selector in ('input[type="radio"]', '[role="radio"]', ':scope > *'):
+            await self._open_subaccount_menu(page)
+            labels = page.get_by_text(f"ID: {advertiser_id}", exact=True)
+            visible = [
+                labels.nth(index)
+                for index in range(await labels.count())
+                if await labels.nth(index).is_visible()
+            ]
+            if len(visible) != 1:
+                break
+            row = visible[0].locator("xpath=../../..")
+            targets = row.locator(selector)
+            if not await targets.count():
+                continue
+            try:
+                await targets.first.click(timeout=10_000, force=True)
+            except PlaywrightTimeoutError:
+                pass
+            await page.wait_for_timeout(5_000)
+            if not page.url.startswith("https://ads.tiktok.com/creative/creativestudio/"):
+                await page.goto(STUDIO_URL, wait_until="domcontentloaded", timeout=90_000)
+                await page.wait_for_timeout(3_000)
+            refreshed = await self._discover_subaccounts(page)
+            if any(
+                item["advertiser_id"] == advertiser_id and item.get("active")
+                for item in refreshed
+            ):
+                return
+        raise RuntimeError(
+            f"TikTok did not activate subaccount {advertiser_id}; it may require onboarding"
+        )
 
     async def _has_seedance_access(self, page: Page) -> bool:
-        current = page.get_by_role("button", name=re.compile(r"Dreamina Seedance"))
+        current = page.get_by_text(re.compile(r"^Dreamina Seedance", re.I))
         for index in range(await current.count()):
             if await current.nth(index).is_visible():
                 return True
-        selectors = page.get_by_role("button", name=re.compile(r"Video 1\.5"))
+        selectors = page.get_by_text(re.compile(r"^Video 1\.5", re.I))
         visible = [
             selectors.nth(index)
             for index in range(await selectors.count())
@@ -582,45 +623,70 @@ class BrowserTikTokClient:
                         )
                         await page.wait_for_timeout(2_000)
 
-                    self._set_login_state("entering_credentials")
-                    await self._open_password_login(page)
-                    try:
-                        username_input = await self._wait_for_visible(
-                            page,
-                            (
-                                'input[type="email"]',
-                                'input[name*="email" i]',
-                                'input[name*="username" i]',
-                                'input[autocomplete="username"]',
-                            ),
-                            timeout=30,
-                        )
-                    except RuntimeError:
-                        if await self._is_logged_in(page):
-                            self._last_login_at = int(time.time())
-                            self._set_login_state("logged_in")
-                            return await self.status()
-                        raise
-                    await username_input.fill(username)
+                    existing_code_inputs = await self._visible_code_inputs(page)
+                    if existing_code_inputs:
+                        # A service/browser restart can restore an unfinished
+                        # email challenge. Ask TikTok for a fresh code and resume
+                        # there instead of starting the credential form again.
+                        for frame in self._search_frames(page):
+                            resend = frame.get_by_role(
+                                "button",
+                                name=re.compile(r"^(Send again|Resend|重新发送)$", re.I),
+                            )
+                            clicked = False
+                            for index in range(await resend.count()):
+                                button = resend.nth(index)
+                                if await button.is_visible() and await button.is_enabled():
+                                    await button.click()
+                                    started_at = time.time()
+                                    await page.wait_for_timeout(750)
+                                    clicked = True
+                                    break
+                            if clicked:
+                                break
+                    else:
+                        self._set_login_state("entering_credentials")
+                        await self._open_password_login(page)
+                        try:
+                            username_input = await self._wait_for_visible(
+                                page,
+                                (
+                                    'input[type="email"]',
+                                    'input[type="text"]',
+                                    'input[name*="email" i]',
+                                    'input[name*="username" i]',
+                                    'input[placeholder*="email" i]',
+                                    'input[aria-label*="email" i]',
+                                    'input[autocomplete="username"]',
+                                ),
+                                timeout=30,
+                            )
+                        except RuntimeError:
+                            if await self._is_logged_in(page):
+                                self._last_login_at = int(time.time())
+                                self._set_login_state("logged_in")
+                                return await self.status()
+                            raise
+                        await username_input.fill(username)
 
-                    password_input = await self._first_visible(
-                        page,
-                        ('input[type="password"]', 'input[autocomplete="current-password"]'),
-                    )
-                    if password_input is None:
-                        await self._click_login_action(
-                            page, re.compile(r"^(Continue|Next|继续|下一步)$", re.I)
-                        )
-                        password_input = await self._wait_for_visible(
+                        password_input = await self._first_visible(
                             page,
                             ('input[type="password"]', 'input[autocomplete="current-password"]'),
-                            timeout=30,
                         )
-                    await password_input.fill(password)
-                    await self._click_login_action(
-                        page,
-                        re.compile(r"^(Log in|Sign in|Continue|登录|登入|继续)$", re.I),
-                    )
+                        if password_input is None:
+                            await self._click_login_action(
+                                page, re.compile(r"^(Continue|Next|继续|下一步)$", re.I)
+                            )
+                            password_input = await self._wait_for_visible(
+                                page,
+                                ('input[type="password"]', 'input[autocomplete="current-password"]'),
+                                timeout=30,
+                            )
+                        await password_input.fill(password)
+                        await self._click_login_action(
+                            page,
+                            re.compile(r"^(Log in|Sign in|Continue|登录|登入|继续)$", re.I),
+                        )
 
                     code_submitted = False
                     automatic_mail_failed: str | None = None
@@ -675,8 +741,7 @@ class BrowserTikTokClient:
                                     except RuntimeError:
                                         # Some OTP forms submit immediately when
                                         # their final digit is filled.
-                                        if await self._visible_code_inputs(page):
-                                            raise
+                                        await page.wait_for_timeout(2_000)
                                     code_submitted = True
                                     mail_task = None
                                     continue
@@ -725,7 +790,13 @@ class BrowserTikTokClient:
             self._set_login_state("login_failed", message)
             raise RuntimeError(message)
 
-    async def diagnostics(self, *, open_generation_menu: bool = False) -> dict[str, Any]:
+    async def diagnostics(
+        self,
+        *,
+        open_generation_menu: bool = False,
+        open_subaccount_menu: bool = False,
+        click_subaccount_id: str | None = None,
+    ) -> dict[str, Any]:
         """Return visible page labels without reading browser authentication storage."""
         await self.start()
         page = self._require_page()
@@ -737,12 +808,35 @@ class BrowserTikTokClient:
             if await selectors.count():
                 await selectors.last.click()
                 await page.wait_for_timeout(500)
+        if open_subaccount_menu:
+            await self._open_subaccount_menu(page)
+        if click_subaccount_id:
+            await self._open_subaccount_menu(page)
+            labels = page.get_by_text(f"ID: {click_subaccount_id}", exact=True)
+            visible = [
+                labels.nth(index)
+                for index in range(await labels.count())
+                if await labels.nth(index).is_visible()
+            ]
+            if len(visible) != 1:
+                raise RuntimeError(
+                    f"Could not uniquely locate TikTok subaccount {click_subaccount_id}"
+                )
+            try:
+                await visible[0].locator("xpath=../../..").click(timeout=10_000)
+            except PlaywrightTimeoutError:
+                pass
+            await page.wait_for_timeout(5_000)
         buttons = page.locator("button:visible")
         roles = page.locator('[role="option"]:visible, [role="menuitem"]:visible')
         upload_candidates = page.locator(
             'input, [class*="upload" i], [class*="drop" i], [aria-label*="upload" i]'
         )
         frames = []
+        visible_inputs: list[dict[str, Any]] = []
+        use_email_elements: list[dict[str, Any]] = []
+        topbar_elements: list[dict[str, Any]] = []
+        subaccount_elements: list[dict[str, Any]] = []
         for frame in page.frames:
             frame_inputs = frame.locator('input[type="file"]')
             frames.append(
@@ -757,6 +851,87 @@ class BrowserTikTokClient:
                         }
                         for index in range(min(await frame_inputs.count(), 20))
                     ],
+                }
+            )
+            all_inputs = frame.locator("input")
+            for index in range(min(await all_inputs.count(), 50)):
+                item = all_inputs.nth(index)
+                if not await item.is_visible():
+                    continue
+                visible_inputs.append(
+                    {
+                        "type": await item.get_attribute("type"),
+                        "name": await item.get_attribute("name"),
+                        "id": await item.get_attribute("id"),
+                        "placeholder": await item.get_attribute("placeholder"),
+                        "autocomplete": await item.get_attribute("autocomplete"),
+                        "inputmode": await item.get_attribute("inputmode"),
+                        "maxlength": await item.get_attribute("maxlength"),
+                        "class": await item.get_attribute("class"),
+                    }
+                )
+            email_switches = frame.get_by_text("Use email", exact=True)
+            for index in range(min(await email_switches.count(), 20)):
+                item = email_switches.nth(index)
+                if not await item.is_visible():
+                    continue
+                parent = item.locator("xpath=..")
+                use_email_elements.append(
+                    {
+                        "tag": await item.evaluate("element => element.tagName"),
+                        "role": await item.get_attribute("role"),
+                        "class": await item.get_attribute("class"),
+                        "parent_tag": await parent.evaluate("element => element.tagName"),
+                        "parent_role": await parent.get_attribute("role"),
+                        "parent_class": await parent.get_attribute("class"),
+                    }
+                )
+        topbar = page.locator("nav:visible *, header:visible *")
+        for index in range(min(await topbar.count(), 300)):
+            item = topbar.nth(index)
+            if not await item.is_visible():
+                continue
+            text = " ".join(((await item.text_content()) or "").split())
+            if not text or len(text) > 80:
+                continue
+            parent = item.locator("xpath=..")
+            topbar_elements.append(
+                {
+                    "text": text,
+                    "tag": await item.evaluate("element => element.tagName"),
+                    "role": await item.get_attribute("role"),
+                    "class": await item.get_attribute("class"),
+                    "parent_tag": await parent.evaluate("element => element.tagName"),
+                    "parent_class": await parent.get_attribute("class"),
+                }
+            )
+        account_labels = page.locator("p").filter(
+            has_text=re.compile(r"^ID:\s*\d{10,}$")
+        )
+        for index in range(min(await account_labels.count(), 30)):
+            label = account_labels.nth(index)
+            if not await label.is_visible():
+                continue
+            ancestors: list[dict[str, Any]] = []
+            node = label
+            for _ in range(6):
+                ancestors.append(
+                    {
+                        "tag": await node.evaluate("element => element.tagName"),
+                        "class": await node.get_attribute("class"),
+                        "role": await node.get_attribute("role"),
+                        "text": " ".join(
+                            (((await node.text_content()) or "")[:160]).split()
+                        ),
+                    }
+                )
+                node = node.locator("xpath=..")
+            subaccount_elements.append(
+                {
+                    "id_text": " ".join(
+                        (((await label.text_content()) or "")[:80]).split()
+                    ),
+                    "ancestors": ancestors,
                 }
             )
         return {
@@ -789,6 +964,10 @@ class BrowserTikTokClient:
                 }
                 for index in range(min(await upload_candidates.count(), 50))
             ],
+            "visible_inputs": visible_inputs,
+            "use_email_elements": use_email_elements,
+            "topbar_elements": topbar_elements,
+            "subaccount_elements": subaccount_elements,
             "frames": frames,
             "visible_text": (await page.locator("body").inner_text())[:20_000],
         }
@@ -1181,21 +1360,90 @@ class BrowserTikTokClient:
 
     @classmethod
     async def _open_password_login(cls, page: Page) -> None:
+        credential_selectors = (
+            'input[type="email"]',
+            'input[name*="email" i]',
+            'input[name*="username" i]',
+            'input[placeholder*="email" i]',
+            'input[aria-label*="email" i]',
+            'input[autocomplete="username"]:not([name="mobile"])',
+        )
         patterns = (
             re.compile(r"Use (?:phone|email|username)", re.I),
             re.compile(r"Log in with (?:email|username)", re.I),
             re.compile(r"Email / Username", re.I),
             re.compile(r"邮箱|用户名|账号密码"),
         )
-        for frame in cls._search_frames(page):
-            for pattern in patterns:
-                candidate = frame.get_by_text(pattern)
-                for index in range(await candidate.count()):
-                    item = candidate.nth(index)
+
+        # The public landing page can finish rendering several seconds after
+        # Playwright's domcontentloaded event. Wait for its login action rather
+        # than checking only once at task startup.
+        on_login_page = any(
+            token in page.url.lower() for token in ("/login", "/signin")
+        )
+        if not on_login_page:
+            landing_deadline = time.monotonic() + 30
+            while time.monotonic() < landing_deadline:
+                if await cls._first_visible(page, credential_selectors) is not None:
+                    return
+                opened = False
+                for frame in cls._search_frames(page):
+                    actions = frame.get_by_role(
+                        "button",
+                        name=re.compile(r"^(Log in|Sign in|登录|登入)$", re.I),
+                    )
+                    for index in range(await actions.count()):
+                        action = actions.nth(index)
+                        if await action.is_visible() and await action.is_enabled():
+                            await action.click()
+                            await page.wait_for_timeout(750)
+                            opened = True
+                            break
+                    if opened:
+                        break
+                if opened:
+                    break
+                await page.wait_for_timeout(500)
+
+        method_deadline = time.monotonic() + 15
+        while time.monotonic() < method_deadline:
+            if await cls._first_visible(page, credential_selectors) is not None:
+                return
+
+            switched_to_email = False
+            for frame in cls._search_frames(page):
+                switches = frame.locator("div.login-form__change_item").filter(
+                    has_text=re.compile(r"^Use email$", re.I)
+                )
+                for index in range(await switches.count()):
+                    item = switches.nth(index)
                     if await item.is_visible():
                         await item.click()
                         await page.wait_for_timeout(750)
-                        return
+                        switched_to_email = True
+                        break
+                if switched_to_email:
+                    break
+            if switched_to_email:
+                continue
+
+            method_selected = False
+            for frame in cls._search_frames(page):
+                for pattern in patterns:
+                    candidate = frame.get_by_text(pattern)
+                    for index in range(await candidate.count()):
+                        item = candidate.nth(index)
+                        if await item.is_visible():
+                            await item.click()
+                            await page.wait_for_timeout(750)
+                            method_selected = True
+                            break
+                    if method_selected:
+                        break
+                if method_selected:
+                    break
+            await page.wait_for_timeout(500)
+        raise RuntimeError("Could not switch the TikTok login form to email")
 
     @classmethod
     async def _click_login_action(cls, page: Page, pattern: re.Pattern[str]) -> None:
@@ -1247,7 +1495,11 @@ class BrowserTikTokClient:
         selectors = (
             'input[autocomplete="one-time-code"]',
             'input[name*="code" i]',
+            'input[id*="code" i]',
+            'input[aria-label*="code" i]',
             'input[placeholder*="code" i]',
+            'input[placeholder*="verification" i]',
+            'input[maxlength="6"]',
             'input[placeholder*="验证码"]',
             'input[inputmode="numeric"]',
         )
@@ -1261,6 +1513,34 @@ class BrowserTikTokClient:
                         result.append(item)
                 if result:
                     return result
+
+            # Some TikTok builds render the OTP as unlabelled text inputs.
+            # Only broaden the selector when the page explicitly says that it
+            # is waiting for a verification code, so the username field cannot
+            # be mistaken for an OTP field.
+            try:
+                body_text = (await frame.locator("body").inner_text()).lower()
+            except Exception:
+                body_text = ""
+            if any(
+                token in body_text
+                for token in (
+                    "verification code",
+                    "enter the code",
+                    "code has been sent",
+                    "邮箱验证码",
+                    "输入验证码",
+                )
+            ):
+                generic = frame.locator(
+                    'input:visible:not([type="password"]):not([type="email"]):not([type="hidden"])'
+                )
+                for index in range(await generic.count()):
+                    item = generic.nth(index)
+                    if await item.is_visible():
+                        result.append(item)
+                if result:
+                    return result
         return result
 
     @staticmethod
@@ -1270,8 +1550,17 @@ class BrowserTikTokClient:
             return
         if len(inputs) < len(code):
             raise RuntimeError("TikTok verification form has fewer fields than the received code")
-        for field, digit in zip(inputs, code, strict=False):
-            await field.fill(digit)
+        fields = list(zip(inputs, code, strict=False))
+        for index, (field, digit) in enumerate(fields):
+            if index == len(fields) - 1:
+                # TikTok's six-box OTP form submits from the final key event.
+                # locator.fill() updates the value but does not fire that
+                # keydown handler, so type the final character as a real key.
+                await field.fill("")
+                await field.click()
+                await field.press(digit)
+            else:
+                await field.fill(digit)
 
     @classmethod
     async def _login_error_text(cls, page: Page) -> str | None:
@@ -1298,11 +1587,51 @@ class BrowserTikTokClient:
     async def _is_logged_in(page: Page) -> bool:
         if any(token in page.url.lower() for token in ("login", "signin")):
             return False
-        logout = page.get_by_text("Log out", exact=True)
-        if await logout.count():
-            return True
-        studio = page.get_by_text("Symphony Creative Studio", exact=False)
-        return bool(await studio.count())
+
+        # The public landing page uses the same "Symphony Creative Studio"
+        # branding as the authenticated app.  Treating that text as proof of a
+        # session made a fresh profile look logged in while a visible "Log in"
+        # button was still on screen.
+        login_actions = page.get_by_role(
+            "button", name=re.compile(r"^(Log in|Sign in|登录|登入)$", re.I)
+        )
+        for index in range(await login_actions.count()):
+            if await login_actions.nth(index).is_visible():
+                return False
+
+        logout = page.get_by_text(
+            re.compile(r"^(Log out|Sign out|退出登录|登出)$", re.I), exact=True
+        )
+        for index in range(await logout.count()):
+            if await logout.nth(index).is_visible():
+                return True
+
+        # A successful login returns to the generation route. Do not trust the
+        # route alone: a fresh logged-out page briefly keeps this URL while its
+        # redirect is loading. Require a control that only exists in the actual
+        # generation workspace as well.
+        studio_url = page.url.lower()
+        authenticated_routes = (
+            "/creative/creativestudio/image-to-video",
+            "/creative/creativestudio/create",
+        )
+        if not any(route in studio_url for route in authenticated_routes):
+            return False
+        account_identity = page.locator('nav p[class*="xl:block"]')
+        for index in range(await account_identity.count()):
+            if await account_identity.nth(index).is_visible():
+                return True
+        generation_controls = page.get_by_text(
+            re.compile(
+                r"^(Text|Image|Reference) to video$|^Dreamina Seedance 2\.0$",
+                re.I,
+            ),
+            exact=False,
+        )
+        for index in range(await generation_controls.count()):
+            if await generation_controls.nth(index).is_visible():
+                return True
+        return False
 
     @staticmethod
     async def _visible_credits(page: Page) -> int | None:
@@ -1327,11 +1656,26 @@ class BrowserTikTokClient:
     @staticmethod
     async def _ensure_terms_accepted(page: Page) -> None:
         disclaimers = page.locator('[class*="ai-disclaimer"]:visible')
-        for index in range(await disclaimers.count()):
-            if await disclaimers.nth(index).is_visible():
+        terms_text = page.get_by_text(re.compile(r"Creative GenAI Terms", re.I))
+        accept_text = page.get_by_text("Accept", exact=True)
+        visible = False
+        for locator in (disclaimers, terms_text):
+            for index in range(await locator.count()):
+                if await locator.nth(index).is_visible():
+                    visible = True
+                    break
+            if visible:
+                break
+        if visible:
+            accept_visible = False
+            for index in range(await accept_text.count()):
+                if await accept_text.nth(index).is_visible():
+                    accept_visible = True
+                    break
+            if accept_visible:
                 raise TikTokUpstreamError(
-                    "TikTok Creative GenAI Terms require one-time acceptance in Chromium; "
-                    "open/focus this account, review the terms, click Accept, then retry",
+                    "TikTok Creative GenAI Terms require one-time acceptance for this "
+                    "subaccount in Chromium; review the terms, click Accept, then retry",
                     status_code=409,
                     code="terms_acceptance_required",
                 )
