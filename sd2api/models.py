@@ -219,3 +219,11 @@ class AccountUpdateRequest(BaseModel):
 
 class AccountLoginRequest(BaseModel):
     wait: bool = False
+
+
+class SubaccountRefreshRequest(BaseModel):
+    check_access: bool = True
+
+
+class SubaccountUpdateRequest(BaseModel):
+    enabled: bool

@@ -8,7 +8,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from playwright.async_api import BrowserContext, Frame, Page, Playwright, async_playwright
+from playwright.async_api import (
+    BrowserContext,
+    Frame,
+    Page,
+    Playwright,
+    TimeoutError as PlaywrightTimeoutError,
+    async_playwright,
+)
 
 from .config import Settings
 from .models import UpstreamTask
@@ -32,10 +39,11 @@ class BrowserJob:
     duration: int
     mode: Literal["text", "image", "reference"] = "text"
     media: tuple[StagedMedia, ...] = ()
+    advertiser_id: str | None = None
 
 
 class BrowserTikTokClient:
-    """TikTok client that drives a dedicated persistent Edge profile.
+    """TikTok client that drives a dedicated persistent Chromium profile.
 
     The profile owns its authentication state. This class intentionally never
     reads cookies, localStorage, or the browser profile files.
@@ -59,10 +67,12 @@ class BrowserTikTokClient:
         self._tasks: dict[str, UpstreamTask] = {}
         self._start_lock = asyncio.Lock()
         self._login_lock = asyncio.Lock()
+        self._subaccount_lock = asyncio.Lock()
         self._running_job = False
         self._login_state = "not_logged_in"
         self._login_error: str | None = None
         self._last_login_at: int | None = None
+        self._active_advertiser_id: str | None = None
 
     async def start(self) -> dict[str, Any]:
         async with self._start_lock:
@@ -113,6 +123,7 @@ class BrowserTikTokClient:
                 "login_state": self._login_state,
                 "login_error": self._login_error,
                 "last_login_at": self._last_login_at,
+                "active_advertiser_id": self._active_advertiser_id,
             }
         logged_in = await self._is_logged_in(self._page)
         if logged_in and self._login_state != "logging_in":
@@ -129,23 +140,38 @@ class BrowserTikTokClient:
             "login_state": self._login_state,
             "login_error": self._login_error,
             "last_login_at": self._last_login_at,
+            "active_advertiser_id": self._active_advertiser_id,
         }
 
     @property
     def load(self) -> int:
         return self._queue.qsize() + int(self._running_job)
 
-    async def create_text_video(self, *, prompt: str, model: str, duration: int) -> str:
+    async def create_text_video(
+        self,
+        *,
+        prompt: str,
+        model: str,
+        duration: int,
+        advertiser_id: str | None = None,
+    ) -> str:
         return await self._create_video(
             prompt=prompt,
             model=model,
             duration=duration,
             mode="text",
             media=[],
+            advertiser_id=advertiser_id,
         )
 
     async def create_image_video(
-        self, *, prompt: str, model: str, duration: int, image_path: str
+        self,
+        *,
+        prompt: str,
+        model: str,
+        duration: int,
+        image_path: str,
+        advertiser_id: str | None = None,
     ) -> str:
         return await self._create_video(
             prompt=prompt,
@@ -153,6 +179,7 @@ class BrowserTikTokClient:
             duration=duration,
             mode="image",
             media=[StagedMedia(kind="image", path=image_path)],
+            advertiser_id=advertiser_id,
         )
 
     async def create_reference_video(
@@ -162,6 +189,7 @@ class BrowserTikTokClient:
         model: str,
         duration: int,
         media: list[StagedMedia],
+        advertiser_id: str | None = None,
     ) -> str:
         return await self._create_video(
             prompt=prompt,
@@ -169,6 +197,7 @@ class BrowserTikTokClient:
             duration=duration,
             mode="reference",
             media=media,
+            advertiser_id=advertiser_id,
         )
 
     async def _create_video(
@@ -179,6 +208,7 @@ class BrowserTikTokClient:
         duration: int,
         mode: Literal["text", "image", "reference"],
         media: list[StagedMedia],
+        advertiser_id: str | None,
     ) -> str:
         if model.lower() not in T2V_MODELS:
             raise TikTokUpstreamError(
@@ -230,7 +260,7 @@ class BrowserTikTokClient:
         status = await self.status()
         if not status["logged_in"]:
             raise TikTokUpstreamError(
-                "The persistent Edge window is not logged in to TikTok Ads yet",
+                "The persistent Chromium session is not logged in to TikTok Ads yet",
                 status_code=401,
                 code="browser_login_required",
             )
@@ -242,6 +272,7 @@ class BrowserTikTokClient:
             duration=duration,
             mode=mode,
             media=resolved_media,
+            advertiser_id=advertiser_id,
         )
         return task_id
 
@@ -254,15 +285,205 @@ class BrowserTikTokClient:
         duration: int,
         mode: Literal["text", "image", "reference"] = "text",
         media: list[StagedMedia] | None = None,
+        advertiser_id: str | None = None,
     ) -> None:
         self._tasks[task_id] = UpstreamTask(id=task_id, status="queued", progress=0)
         await self._queue.put(
-            BrowserJob(task_id, prompt, model, duration, mode, tuple(media or []))
+            BrowserJob(
+                task_id,
+                prompt,
+                model,
+                duration,
+                mode,
+                tuple(media or []),
+                advertiser_id,
+            )
         )
 
     async def focus(self) -> None:
         await self.start()
         await self._require_page().bring_to_front()
+
+    async def scan_subaccounts(self, *, check_access: bool = True) -> list[dict[str, Any]]:
+        """Discover child advertisers and optionally check each one's SD2 access and credits."""
+        async with self._subaccount_lock:
+            await self.start()
+            page = self._require_page()
+            if not await self._is_logged_in(page):
+                raise TikTokUpstreamError(
+                    "The Chromium session must be logged in before scanning subaccounts",
+                    status_code=401,
+                    code="browser_login_required",
+                )
+            if not page.url.startswith("https://ads.tiktok.com/creative/creativestudio/"):
+                await page.goto(STUDIO_URL, wait_until="domcontentloaded", timeout=90_000)
+                await page.wait_for_timeout(2_000)
+            discovered = await self._discover_subaccounts(page)
+            original = next(
+                (item["advertiser_id"] for item in discovered if item.get("active")), None
+            )
+            if not check_access:
+                return discovered
+
+            results: list[dict[str, Any]] = []
+            for item in discovered:
+                checked = dict(item)
+                try:
+                    await self._switch_subaccount(page, item["advertiser_id"])
+                    checked["active"] = True
+                    checked["credits"] = await self._visible_credits(page)
+                    checked["seedance_access"] = await self._has_seedance_access(page)
+                    checked["last_error"] = None
+                except Exception as exc:
+                    checked["seedance_access"] = False
+                    checked["credits"] = None
+                    checked["active"] = False
+                    checked["last_error"] = f"{exc.__class__.__name__}: {exc}"
+                checked["last_checked_at"] = int(time.time())
+                results.append(checked)
+
+            if original and original != self._active_advertiser_id:
+                try:
+                    await self._switch_subaccount(page, original)
+                except Exception:
+                    pass
+            for item in results:
+                item["active"] = item["advertiser_id"] == self._active_advertiser_id
+            return results
+
+    async def select_subaccount(self, advertiser_id: str) -> None:
+        async with self._subaccount_lock:
+            page = self._require_page()
+            await self._switch_subaccount(page, advertiser_id)
+
+    async def _open_subaccount_menu(self, page: Page) -> None:
+        labels = page.locator("p").filter(has_text=re.compile(r"^ID:\s*\d{10,}$"))
+        for index in range(await labels.count()):
+            if await labels.nth(index).is_visible():
+                return
+        triggers = page.locator('nav p[class*="xl:block"]')
+        for index in range(await triggers.count()):
+            trigger = triggers.nth(index)
+            if await trigger.is_visible():
+                await trigger.locator("xpath=../../..").click()
+                await page.wait_for_timeout(500)
+                break
+        for index in range(await labels.count()):
+            if await labels.nth(index).is_visible():
+                return
+        raise RuntimeError("Could not open the TikTok subaccount menu")
+
+    async def _discover_subaccounts(self, page: Page) -> list[dict[str, Any]]:
+        await self._open_subaccount_menu(page)
+        payload = await page.evaluate(
+            """
+            () => {
+              const clean = value => (value || '').replace(/\\s+/g, ' ').trim();
+              const idPattern = /^ID:\\s*(\\d{10,})$/;
+              const current = Array.from(document.querySelectorAll(
+                'div[class*="justify-between"][class*="text-neutral-highOnSurface"]'
+              )).map(el => clean(el.textContent)).map(text => text.match(idPattern))
+                .find(Boolean)?.[1] || null;
+              const rows = [];
+              for (const label of document.querySelectorAll('p')) {
+                const match = clean(label.textContent).match(idPattern);
+                if (!match) continue;
+                const row = label.parentElement?.parentElement?.parentElement;
+                if (!row) continue;
+                const rowText = clean(row.textContent);
+                const name = clean(rowText.replace(idPattern, '').replace(`ID: ${match[1]}`, ''));
+                let accountType = 'unknown';
+                let cursor = row.previousElementSibling;
+                while (cursor) {
+                  const heading = clean(cursor.textContent).toLowerCase();
+                  if (heading === 'client account') { accountType = 'client'; break; }
+                  if (heading === 'partner account') { accountType = 'partner'; break; }
+                  cursor = cursor.previousElementSibling;
+                }
+                rows.push({
+                  advertiser_id: match[1],
+                  name: name || match[1],
+                  account_type: accountType,
+                  active: match[1] === current,
+                });
+              }
+              return rows;
+            }
+            """
+        )
+        if not isinstance(payload, list) or not payload:
+            raise RuntimeError("TikTok did not expose any Client or Partner subaccounts")
+        result = [item for item in payload if isinstance(item, dict) and item.get("advertiser_id")]
+        self._active_advertiser_id = next(
+            (str(item["advertiser_id"]) for item in result if item.get("active")), None
+        )
+        await page.keyboard.press("Escape")
+        return result
+
+    async def _switch_subaccount(self, page: Page, advertiser_id: str) -> None:
+        if not page.url.startswith("https://ads.tiktok.com/creative/creativestudio/"):
+            await page.goto(STUDIO_URL, wait_until="domcontentloaded", timeout=90_000)
+            await page.wait_for_timeout(2_000)
+        entries = await self._discover_subaccounts(page)
+        if not any(item["advertiser_id"] == advertiser_id for item in entries):
+            raise RuntimeError(f"TikTok subaccount {advertiser_id} is not available")
+        if self._active_advertiser_id == advertiser_id:
+            return
+        await self._open_subaccount_menu(page)
+        labels = page.get_by_text(f"ID: {advertiser_id}", exact=True)
+        visible = [
+            labels.nth(index)
+            for index in range(await labels.count())
+            if await labels.nth(index).is_visible()
+        ]
+        if len(visible) != 1:
+            raise RuntimeError(f"Could not uniquely locate TikTok subaccount {advertiser_id}")
+        try:
+            await visible[0].locator("xpath=../../..").click(timeout=10_000)
+        except PlaywrightTimeoutError:
+            # TikTok sometimes redirects to an onboarding surface while the click
+            # is still waiting for the original page's navigation lifecycle.
+            pass
+        await page.wait_for_timeout(1_500)
+        if not page.url.startswith("https://ads.tiktok.com/creative/creativestudio/"):
+            await page.goto(STUDIO_URL, wait_until="domcontentloaded", timeout=90_000)
+            await page.wait_for_timeout(2_000)
+        refreshed = await self._discover_subaccounts(page)
+        if not any(
+            item["advertiser_id"] == advertiser_id and item.get("active")
+            for item in refreshed
+        ):
+            raise RuntimeError(
+                f"TikTok did not activate subaccount {advertiser_id}; it may require onboarding"
+            )
+
+    async def _has_seedance_access(self, page: Page) -> bool:
+        current = page.get_by_role("button", name=re.compile(r"Dreamina Seedance"))
+        for index in range(await current.count()):
+            if await current.nth(index).is_visible():
+                return True
+        selectors = page.get_by_role("button", name=re.compile(r"Video 1\.5"))
+        visible = [
+            selectors.nth(index)
+            for index in range(await selectors.count())
+            if await selectors.nth(index).is_visible()
+        ]
+        if not visible:
+            return False
+        await visible[-1].click()
+        await page.wait_for_timeout(300)
+        options = page.get_by_text("Dreamina Seedance 2.0", exact=True)
+        for index in range(await options.count()):
+            option = options.nth(index)
+            if not await option.is_visible():
+                continue
+            container = option.locator("xpath=../..")
+            disabled = (await container.get_attribute("aria-disabled")) == "true"
+            classes = await container.get_attribute("class") or ""
+            await page.keyboard.press("Escape")
+            return not disabled and "cursor-not-allowed" not in classes
+        await page.keyboard.press("Escape")
+        return False
 
     async def login(
         self,
@@ -500,6 +721,11 @@ class BrowserTikTokClient:
         await page.wait_for_timeout(3_000)
         if not await self._is_logged_in(page):
             raise RuntimeError("TikTok session is no longer logged in")
+        if job.advertiser_id:
+            await self.select_subaccount(job.advertiser_id)
+            if page.url.split("?", 1)[0] != target_url.split("?", 1)[0]:
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=90_000)
+                await page.wait_for_timeout(2_000)
 
         # Close transient overlays without inspecting authentication storage.
         await page.keyboard.press("Escape")
@@ -547,6 +773,8 @@ class BrowserTikTokClient:
                     raw={
                         "backend": "browser",
                         "account_id": self.account_id,
+                        "advertiser_id": job.advertiser_id,
+                        "credits": await self._visible_credits(page),
                         "elapsed_seconds": int(time.monotonic() - started),
                     },
                 )
@@ -586,14 +814,38 @@ class BrowserTikTokClient:
 
     async def _select_model(self, page: Page, model: str) -> None:
         target = "Dreamina Seedance 2.5" if "2.5" in model else "Dreamina Seedance 2.0"
-        current = page.get_by_role("button", name=re.compile(r"Dreamina Seedance"))
-        if not await current.count():
+        selectors = page.get_by_role(
+            "button", name=re.compile(r"Dreamina Seedance|Video 1\.5", re.I)
+        )
+        visible = [
+            selectors.nth(index)
+            for index in range(await selectors.count())
+            if await selectors.nth(index).is_visible()
+        ]
+        if not visible:
             raise RuntimeError("Could not find the TikTok model selector")
-        current_text = (await current.last.inner_text()).strip()
+        current = visible[-1]
+        current_text = (await current.inner_text()).strip()
         if target not in current_text:
-            await current.last.click()
-            option = page.get_by_text(target, exact=True)
-            await option.last.click()
+            await current.click()
+            options = page.get_by_text(target, exact=True)
+            candidates = [
+                options.nth(index)
+                for index in range(await options.count())
+                if await options.nth(index).is_visible()
+            ]
+            if not candidates:
+                raise RuntimeError(f"TikTok does not expose model {target!r}")
+            option = candidates[-1]
+            container = option.locator("xpath=../..")
+            disabled = (await container.get_attribute("aria-disabled")) == "true"
+            classes = await container.get_attribute("class") or ""
+            if disabled or "cursor-not-allowed" in classes:
+                await page.keyboard.press("Escape")
+                raise RuntimeError(
+                    f"The active TikTok subaccount does not have access to {target}"
+                )
+            await option.click()
 
     @staticmethod
     async def _select_generation_mode(

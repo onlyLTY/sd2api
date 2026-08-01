@@ -26,6 +26,8 @@ from .models import (
     ImageURLContent,
     OpenAICreateVideoRequest,
     SeedanceCreateRequest,
+    SubaccountRefreshRequest,
+    SubaccountUpdateRequest,
     VideoURLContent,
 )
 from .store import TaskRecord, TaskStore
@@ -325,6 +327,32 @@ async def login_pool_account(
     return await require_pool().login_account(account_id, wait=body.wait)
 
 
+@app.post(
+    "/admin/accounts/{account_id}/subaccounts/refresh",
+    dependencies=[Depends(require_admin_key)],
+)
+async def refresh_pool_subaccounts(
+    account_id: str, body: SubaccountRefreshRequest
+) -> dict[str, Any]:
+    return await require_pool().refresh_subaccounts(
+        account_id, check_access=body.check_access
+    )
+
+
+@app.patch(
+    "/admin/accounts/{account_id}/subaccounts/{advertiser_id}",
+    dependencies=[Depends(require_admin_key)],
+)
+async def update_pool_subaccount(
+    account_id: str,
+    advertiser_id: str,
+    body: SubaccountUpdateRequest,
+) -> dict[str, Any]:
+    return await require_pool().set_subaccount_enabled(
+        account_id, advertiser_id, enabled=body.enabled
+    )
+
+
 @app.get("/admin/config/status", dependencies=[Depends(require_admin_key)])
 async def admin_config_status() -> dict[str, Any]:
     return {
@@ -356,6 +384,7 @@ async def list_admin_tasks(
             {
                 "id": record.id,
                 "account_id": record.account_id,
+                "advertiser_id": record.advertiser_id,
                 "status": record.status,
                 "progress": record.progress,
                 "model": record.model,
@@ -420,6 +449,11 @@ async def create_seedance_video(body: SeedanceCreateRequest) -> dict[str, Any]:
         ratio=body.ratio,
         resolution=body.resolution,
         account_id=client.account_for_task(task_id) if isinstance(client, BrowserPoolClient) else None,
+        advertiser_id=(
+            client.advertiser_for_task(task_id)
+            if isinstance(client, BrowserPoolClient)
+            else None
+        ),
     )
     return seedance_task(record)
 
@@ -647,6 +681,11 @@ async def create_openai_video(request: Request) -> dict[str, Any]:
         seconds=seconds,
         size=body.size,
         account_id=client.account_for_task(task_id) if isinstance(client, BrowserPoolClient) else None,
+        advertiser_id=(
+            client.advertiser_for_task(task_id)
+            if isinstance(client, BrowserPoolClient)
+            else None
+        ),
     )
     return openai_video(record)
 

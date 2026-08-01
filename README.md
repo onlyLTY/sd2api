@@ -23,8 +23,10 @@
 - OpenAI 兼容状态对象和 MP4 流式下载
 - SQLite 任务持久化
 - 可选 Bearer API Key
-- 多账号浏览器 Profile 隔离与中央调度
-- 多账号并行、单账号串行的安全并发模型
+- 登录账号浏览器 Profile 隔离与中央调度
+- 自动发现 Client/Partner 子账号，并由用户选择哪些加入生成池
+- 逐子账号显示 Seedance 2 权限、Credits 和检查错误
+- 不同登录账号并行、同一登录账号下的子账号串行切换
 
 暂未支持：
 
@@ -45,8 +47,9 @@ Copy-Item .env.example .env
 `create_generate_task` 请求，手动复制以下值：
 
 - 完整 `Cookie` 请求头到 `TIKTOK_COOKIE`
-- URL 查询参数 `device_id` 到 `TIKTOK_DEVICE_ID`
 - 如果请求里存在且无法从 Cookie 自动识别，再填写 `x-csrftoken`、`x-creative-csrf-token` 和 `x-fp-id`
+
+`device_id` 不需要也不能单独配置：浏览器池模式由 Chromium 登录会话自行维护；旧的 direct 模式只会尝试从 Cookie 中的会话设备字段自动派生。
 
 不要把 `.env` 发给别人或提交到版本库。浏览器会话过期后需要重新复制。
 
@@ -64,13 +67,13 @@ uvicorn sd2api.main:app --host 127.0.0.1 --port 8765
 
 ```dotenv
 SD2API_MODE=browser
-SD2API_BROWSER_CHANNEL=msedge
+SD2API_BROWSER_CHANNEL=
 SD2API_BROWSER_PROFILE=.browser-profile
 ```
 
-服务启动后调用 `POST /browser/start`，程序会打开一个独立的 Edge 窗口。只需在这个窗口登录 TikTok Ads；登录状态由 Edge 自己保存在 `.browser-profile`，适配器不会读取或导出 Cookie。之后 `/v1/videos` 和 Seedance 端点会把任务加入队列并依次操作网页。
+服务启动后调用 `POST /browser/start`，程序会打开 Playwright 自带的独立 Chromium。只需在这个窗口登录 TikTok Ads；登录状态由 Chromium 自己保存在 `.browser-profile`，适配器不会读取或导出 Cookie。之后 `/v1/videos` 和 Seedance 端点会把任务加入队列并依次操作网页。
 
-浏览器模式的限制：任务串行执行，容易受到网页 UI 更新影响，吞吐量低于直接 HTTP 模式。开发结束后可在该 Edge 窗口登出；如需彻底移除本地会话，应先停止服务，再手动删除 `.browser-profile`。
+浏览器模式的限制：任务串行执行，容易受到网页 UI 更新影响，吞吐量低于直接 HTTP 模式。开发结束后可在该 Chromium 窗口登出；如需彻底移除本地会话，应先停止服务，再手动删除 `.browser-profile`。
 
 ## Docker / VPS 多账号池
 
@@ -114,6 +117,8 @@ ssh -L 8765:127.0.0.1:8765 -L 6080:127.0.0.1:6080 user@your-vps
 
 推荐在账号池面板中添加账号，填写 TikTok Ads 账号、密码和接码邮箱。密码经 Fernet 加密后才写入 SQLite，管理 API 和面板不会回传密码或密文。容器启动、账号掉线或点击“登录”时会自动执行账号密码登录，并通过 `cf_temp_mail` 的 `GET /api/emails?to_address=...` 获取本次登录产生的邮件验证码。
 
+登录成功后程序会发现该登录身份下的全部 Client/Partner 子账号，并逐个检查 Dreamina Seedance 2.0 是否可选以及当前 Credits。子账号默认不加入生成池；管理员在面板中勾选一个或多个“SD2 可用”的子账号后才会参与调度。重新扫描会更新名称、权限和 Credits，但保留已有勾选结果。
+
 图形验证码属于 TikTok 的交互式安全验证：程序会把账号状态标记为 `captcha_required` 并保持对应浏览器页面，管理员通过 noVNC 完成验证后，登录状态机会自动继续邮箱接码和后续登录。项目不包含验证码破解或绕过逻辑。
 
 也可以通过 API 添加账号：
@@ -139,12 +144,13 @@ curl http://127.0.0.1:8765/admin/pool/status \
   -H "Authorization: Bearer $SD2API_ADMIN_KEY"
 ```
 
-返回值包含每个账号的 `enabled`、`running`、`logged_in`、`login_state`、`credits`、`busy` 和 `queued`，以及账号池的 `max_parallel`、`logging_in` 和 `captcha_required`。任务与账号分配可通过 `GET /admin/tasks` 查询。
+返回值包含每个登录账号的 `enabled`、`running`、`logged_in`、`login_state`、`busy`、`queued` 和 `subaccounts`。每个子账号包含 `advertiser_id`、`account_type`、`enabled`、`seedance_access`、`credits` 和检查错误；汇总状态还包含 `max_parallel`、`enabled_subaccounts`、`logging_in` 和 `captcha_required`。
 
 ### 并发规则
 
-- 一个登录账号同一时间执行一个网页生成任务，防止 UI 与结果卡片串线。
+- 一个登录账号同一时间执行一个网页生成任务；其下多个子账号会在任务开始前自动切换，但不会在同一个 Chromium Profile 中并发操作。
 - 不同账号并行执行；10 个在线账号的理论安全并发为 10。
+- 同一登录账号勾选 5 个子账号不会把安全并发从 1 提升到 5；如需并行，必须使用不同登录 Profile。
 - 调度器按当前负载最小优先分配；同负载时优先 credits 较多的账号，再做轮转。
 - 页面可见 credits 为 0 的账号不会接收新任务；无法读取余额时仍可参与调度。
 - `SD2API_POOL_MAX_PENDING` 限制全池等待与运行任务总量，超限返回 HTTP 429。

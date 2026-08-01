@@ -23,6 +23,7 @@ class BrowserPoolClient:
         self.store = store
         self._workers: dict[str, BrowserTikTokClient] = {}
         self._task_accounts: dict[str, str] = {}
+        self._task_advertisers: dict[str, str] = {}
         self._scheduler_lock = asyncio.Lock()
         self._last_selected: dict[str, int] = {}
         self._selection_counter = 0
@@ -102,6 +103,7 @@ class BrowserPoolClient:
 
     async def status(self) -> dict[str, Any]:
         accounts = await self.list_accounts()
+        subaccounts = [item for account in accounts for item in account["subaccounts"]]
         return {
             "mode": "browser_pool",
             "accounts": accounts,
@@ -110,8 +112,15 @@ class BrowserPoolClient:
             "running_jobs": sum(bool(account.get("busy")) for account in accounts),
             "queued_jobs": sum(int(account.get("queued", 0)) for account in accounts),
             "max_parallel": sum(
-                bool(account.get("enabled")) and bool(account.get("logged_in"))
+                bool(account.get("enabled"))
+                and bool(account.get("logged_in"))
+                and any(self._subaccount_eligible(item) for item in account["subaccounts"])
                 for account in accounts
+            ),
+            "subaccounts": len(subaccounts),
+            "enabled_subaccounts": sum(bool(item["enabled"]) for item in subaccounts),
+            "eligible_subaccounts": sum(
+                self._subaccount_eligible(item) for item in subaccounts
             ),
             "logging_in": sum(
                 account.get("login_state")
@@ -138,8 +147,20 @@ class BrowserPoolClient:
                 "login_error": account.get("last_error"),
                 "last_login_at": account.get("last_login_at"),
             }
-            result.append({**account, **runtime})
+            result.append(
+                {
+                    **account,
+                    **runtime,
+                    "subaccounts": self.store.list_subaccounts(account["id"]),
+                }
+            )
         return result
+
+    @staticmethod
+    def _subaccount_eligible(item: dict[str, Any]) -> bool:
+        return bool(item.get("enabled")) and item.get("seedance_access") is True and (
+            item.get("credits") is None or int(item["credits"]) > 0
+        )
 
     async def add_account(
         self,
@@ -247,7 +268,15 @@ class BrowserPoolClient:
             and not status["logged_in"]
         ):
             self._schedule_login(account_id)
-        return status
+        elif status["logged_in"]:
+            try:
+                await self.refresh_subaccounts(account_id, check_access=True)
+            except Exception as exc:
+                self.store.update_account(
+                    account_id,
+                    last_error=f"Subaccount scan failed: {exc.__class__.__name__}: {exc}",
+                )
+        return await self.account_status(account_id)
 
     async def stop_account(self, account_id: str, *, force: bool = False) -> None:
         login_task = self._login_tasks.get(account_id)
@@ -318,6 +347,16 @@ class BrowserPoolClient:
                 last_login_at=int(time.time()),
                 last_error=None,
             )
+            try:
+                discovered = await worker.scan_subaccounts(check_access=True)
+                self.store.upsert_subaccounts(account_id, discovered)
+            except Exception as scan_exc:
+                self.store.update_account(
+                    account_id,
+                    last_error=(
+                        f"Subaccount scan failed: {scan_exc.__class__.__name__}: {scan_exc}"
+                    ),
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -369,6 +408,57 @@ class BrowserPoolClient:
             open_generation_menu=open_generation_menu
         )
 
+    async def refresh_subaccounts(
+        self, account_id: str, *, check_access: bool = True
+    ) -> dict[str, Any]:
+        account = self.store.get_account(account_id)
+        if account is None:
+            raise TikTokUpstreamError(
+                f"Account {account_id!r} does not exist",
+                status_code=404,
+                code="account_not_found",
+            )
+        worker = self._worker(account_id)
+        if worker.load > 0:
+            raise TikTokUpstreamError(
+                f"Account {account_id!r} is busy and cannot switch subaccounts",
+                status_code=409,
+                code="account_busy",
+            )
+        await worker.start()
+        status = await worker.status()
+        if not status["logged_in"]:
+            raise TikTokUpstreamError(
+                f"Account {account_id!r} must be logged in before scanning subaccounts",
+                status_code=401,
+                code="browser_login_required",
+            )
+        discovered = await worker.scan_subaccounts(check_access=check_access)
+        self.store.upsert_subaccounts(account_id, discovered)
+        return await self.account_status(account_id)
+
+    async def set_subaccount_enabled(
+        self, account_id: str, advertiser_id: str, *, enabled: bool
+    ) -> dict[str, Any]:
+        items = self.store.list_subaccounts(account_id)
+        target = next(
+            (item for item in items if item["advertiser_id"] == advertiser_id), None
+        )
+        if target is None:
+            raise TikTokUpstreamError(
+                f"Subaccount {advertiser_id!r} was not discovered for {account_id!r}",
+                status_code=404,
+                code="subaccount_not_found",
+            )
+        if enabled and target.get("seedance_access") is not True:
+            raise TikTokUpstreamError(
+                f"Subaccount {advertiser_id!r} has no verified Seedance 2 access",
+                status_code=409,
+                code="seedance_access_required",
+            )
+        updated = self.store.set_subaccount_enabled(account_id, advertiser_id, enabled)
+        return updated
+
     async def account_status(self, account_id: str) -> dict[str, Any]:
         account = self.store.get_account(account_id)
         if account is None:
@@ -382,14 +472,18 @@ class BrowserPoolClient:
             "running": False,
             "logged_in": False,
             "queued": 0,
-                "busy": False,
-                "url": None,
-                "credits": None,
-                "login_state": account.get("login_state", "not_started"),
-                "login_error": account.get("last_error"),
-                "last_login_at": account.get("last_login_at"),
+            "busy": False,
+            "url": None,
+            "credits": None,
+            "login_state": account.get("login_state", "not_started"),
+            "login_error": account.get("last_error"),
+            "last_login_at": account.get("last_login_at"),
         }
-        return {**account, **runtime}
+        return {
+            **account,
+            **runtime,
+            "subaccounts": self.store.list_subaccounts(account_id),
+        }
 
     async def create_text_video(self, *, prompt: str, model: str, duration: int) -> str:
         return await self._schedule(
@@ -438,35 +532,45 @@ class BrowserPoolClient:
     ) -> str:
         async with self._scheduler_lock:
             statuses = await self.list_accounts()
-            eligible = [
-                status
-                for status in statuses
-                if status["enabled"] and status["running"] and status["logged_in"]
-                and status.get("credits") != 0
-            ]
+            eligible: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            for status in statuses:
+                if not (status["enabled"] and status["running"] and status["logged_in"]):
+                    continue
+                eligible.extend(
+                    (status, subaccount)
+                    for subaccount in status["subaccounts"]
+                    if self._subaccount_eligible(subaccount)
+                )
             if not eligible:
                 raise TikTokUpstreamError(
-                    "No enabled, logged-in browser accounts are available",
+                    "No selected subaccounts with verified Seedance 2 access and credits are available",
                     status_code=503,
                     code="account_pool_unavailable",
                 )
-            total_pending = sum(self._worker(item["id"]).load for item in eligible)
+            eligible_workers = {status["id"] for status, _ in eligible}
+            total_pending = sum(self._worker(account_id).load for account_id in eligible_workers)
             if total_pending >= self.settings.sd2api_pool_max_pending:
                 raise TikTokUpstreamError(
                     "The browser account pool queue is full",
                     status_code=429,
                     code="pool_queue_full",
                 )
-            selected = min(
+            selected_account, selected_subaccount = min(
                 eligible,
-                key=lambda item: (
-                    self._worker(item["id"]).load,
-                    -int(item["credits"]) if isinstance(item.get("credits"), int) else 1,
-                    self._last_selected.get(item["id"], -1),
-                    item["id"],
+                key=lambda pair: (
+                    self._worker(pair[0]["id"]).load,
+                    -int(pair[1]["credits"])
+                    if isinstance(pair[1].get("credits"), int)
+                    else 1,
+                    self._last_selected.get(
+                        f'{pair[0]["id"]}:{pair[1]["advertiser_id"]}', -1
+                    ),
+                    pair[0]["id"],
+                    pair[1]["advertiser_id"],
                 ),
             )
-            account_id = selected["id"]
+            account_id = selected_account["id"]
+            advertiser_id = selected_subaccount["advertiser_id"]
             worker = self._worker(account_id)
             if mode == "image":
                 task_id = await worker.create_image_video(
@@ -474,6 +578,7 @@ class BrowserPoolClient:
                     model=model,
                     duration=duration,
                     image_path=media[0].path,
+                    advertiser_id=advertiser_id,
                 )
             elif mode == "reference":
                 task_id = await worker.create_reference_video(
@@ -481,20 +586,26 @@ class BrowserPoolClient:
                     model=model,
                     duration=duration,
                     media=media,
+                    advertiser_id=advertiser_id,
                 )
             else:
                 task_id = await worker.create_text_video(
                     prompt=prompt,
                     model=model,
                     duration=duration,
+                    advertiser_id=advertiser_id,
                 )
             self._selection_counter += 1
-            self._last_selected[account_id] = self._selection_counter
+            self._last_selected[f"{account_id}:{advertiser_id}"] = self._selection_counter
             self._task_accounts[task_id] = account_id
+            self._task_advertisers[task_id] = advertiser_id
             return task_id
 
     def account_for_task(self, task_id: str) -> str | None:
         return self._task_accounts.get(task_id)
+
+    def advertiser_for_task(self, task_id: str) -> str | None:
+        return self._task_advertisers.get(task_id)
 
     async def check_task(self, task_id: str) -> UpstreamTask:
         account_id = self._task_accounts.get(task_id)
@@ -504,7 +615,20 @@ class BrowserPoolClient:
                 status_code=404,
                 code="task_not_active",
             )
-        return await self._worker(account_id).check_task(task_id)
+        task = await self._worker(account_id).check_task(task_id)
+        advertiser_id = self._task_advertisers.get(task_id)
+        credits = task.raw.get("credits") if task.raw else None
+        if advertiser_id and isinstance(credits, int):
+            try:
+                self.store.update_subaccount(
+                    account_id,
+                    advertiser_id,
+                    credits=credits,
+                    last_checked_at=int(time.time()),
+                )
+            except KeyError:
+                pass
+        return task
 
     async def fetch_video(self, video_url: str, account_id: str | None) -> tuple[bytes, str]:
         if not account_id:

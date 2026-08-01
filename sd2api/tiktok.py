@@ -70,14 +70,15 @@ class TikTokClient:
 
     @property
     def params(self) -> dict[str, str]:
-        device_id = self.settings.tiktok_device_id
-        return {
+        params = {
             "aid": "585599",
             "app_name": "creative_aio_client",
             "device_platform": "web",
-            "did": device_id,
-            "device_id": device_id,
         }
+        device_id = self.settings.session_device_id
+        if device_id:
+            params.update({"did": device_id, "device_id": device_id})
+        return params
 
     @property
     def headers(self) -> dict[str, str]:
@@ -275,4 +276,3 @@ class TikTokClient:
     def _extract_poster_url(value: Any) -> str | None:
         candidate = _deep_find(value, {"PosterUrl", "posterUrl", "coverImage", "cover_image"})
         return str(candidate) if isinstance(candidate, str) and candidate.startswith("http") else None
-

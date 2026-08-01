@@ -89,6 +89,55 @@ def test_credential_vault_and_store_do_not_expose_password(tmp_path: Path) -> No
     }
 
 
+def test_store_tracks_subaccounts_and_preserves_user_selection(tmp_path: Path) -> None:
+    store = TaskStore(str(tmp_path / "subaccounts.db"))
+    store.create_account(account_id="login-a", name="Login A")
+    store.upsert_subaccounts(
+        "login-a",
+        [
+            {
+                "advertiser_id": "7668593711596617729",
+                "name": "symphony-0731-3",
+                "account_type": "partner",
+                "seedance_access": True,
+                "credits": 2000,
+                "active": True,
+            },
+            {
+                "advertiser_id": "7668491362075033608",
+                "name": "Namcoi LLC_a5mq2y",
+                "account_type": "client",
+                "seedance_access": False,
+                "credits": 2000,
+            },
+        ],
+    )
+    selected = store.set_subaccount_enabled(
+        "login-a", "7668593711596617729", True
+    )
+    assert selected["enabled"] is True
+    assert selected["seedance_access"] is True
+
+    store.upsert_subaccounts(
+        "login-a",
+        [
+            {
+                "advertiser_id": "7668593711596617729",
+                "name": "Updated partner name",
+                "account_type": "partner",
+                "seedance_access": True,
+                "credits": 1995,
+            }
+        ],
+    )
+    refreshed = store.list_subaccounts("login-a")
+    partner = next(
+        item for item in refreshed if item["advertiser_id"] == "7668593711596617729"
+    )
+    assert partner["enabled"] is True
+    assert partner["credits"] == 1995
+
+
 @pytest.mark.asyncio
 async def test_temp_mail_client_reads_tiktok_verification_code() -> None:
     requested: list[httpx.Request] = []
@@ -167,7 +216,9 @@ async def test_create_and_check_success() -> None:
             )
         raise AssertionError(f"Unexpected request: {request.method} {request.url}")
 
-    config = Settings(tiktok_cookie="sessionid=test; csrftoken=csrf", tiktok_device_id="device")
+    config = Settings(
+        tiktok_cookie="sessionid=test; csrftoken=csrf; MONITOR_DEVICE_ID=device"
+    )
     client = TikTokClient(config, transport=httpx.MockTransport(handler))
     task_id = await client.create_text_video(prompt="A red ball", model="sora-2", duration=5)
     result = await client.check_task(task_id)
@@ -203,7 +254,7 @@ async def test_check_processing_and_failure() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=next(responses))
 
-    config = Settings(tiktok_cookie="sessionid=test", tiktok_device_id="device")
+    config = Settings(tiktok_cookie="sessionid=test; MONITOR_DEVICE_ID=device")
     client = TikTokClient(config, transport=httpx.MockTransport(handler))
     processing = await client.check_task("task-1")
     failed = await client.check_task("task-1")
@@ -404,6 +455,20 @@ async def test_pool_schedules_concurrent_jobs_across_accounts(tmp_path: Path) ->
     store = TaskStore(str(tmp_path / "pool.db"))
     store.create_account(account_id="a", name="Account A")
     store.create_account(account_id="b", name="Account B")
+    for account_id in ("a", "b"):
+        store.upsert_subaccounts(
+            account_id,
+            [
+                {
+                    "advertiser_id": f"{account_id}-advertiser",
+                    "name": f"Advertiser {account_id.upper()}",
+                    "account_type": "partner",
+                    "seedance_access": True,
+                    "credits": 100,
+                }
+            ],
+        )
+        store.set_subaccount_enabled(account_id, f"{account_id}-advertiser", True)
     config = Settings(
         sd2api_browser_profile=str(tmp_path / "profiles"),
         sd2api_pool_max_pending=10,
@@ -454,6 +519,12 @@ async def test_pool_schedules_concurrent_jobs_across_accounts(tmp_path: Path) ->
 
     assert [task.split("-", 1)[0] for task in tasks] == ["a", "b", "a", "b"]
     assert [pool.account_for_task(task) for task in tasks] == ["a", "b", "a", "b"]
+    assert [pool.advertiser_for_task(task) for task in tasks] == [
+        "a-advertiser",
+        "b-advertiser",
+        "a-advertiser",
+        "b-advertiser",
+    ]
 
     reference_task = await pool.create_reference_video(
         prompt="Use the supplied image and audio",
@@ -469,6 +540,7 @@ async def test_pool_schedules_concurrent_jobs_across_accounts(tmp_path: Path) ->
         "image",
         "audio",
     ]
+    assert worker_a.reference_calls[0]["advertiser_id"] == "a-advertiser"
 
 
 def test_admin_account_routes_without_starting_browser(
@@ -525,3 +597,24 @@ def test_admin_account_routes_without_starting_browser(
     stored = pool_store.get_account("account_secure", include_secret=True)
     assert stored is not None
     assert stored["password_ciphertext"] != "not-stored-in-plain-text"
+
+    pool_store.upsert_subaccounts(
+        "account_secure",
+        [
+            {
+                "advertiser_id": "7668593711596617729",
+                "name": "Partner account",
+                "account_type": "partner",
+                "seedance_access": True,
+                "credits": 2000,
+            }
+        ],
+    )
+    selected = api.patch(
+        "/admin/accounts/account_secure/subaccounts/7668593711596617729",
+        headers=headers,
+        json={"enabled": True},
+    )
+    assert selected.status_code == 200
+    assert selected.json()["enabled"] is True
+    assert selected.json()["credits"] == 2000

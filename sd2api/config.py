@@ -15,7 +15,6 @@ class Settings(BaseSettings):
     )
 
     tiktok_cookie: str = ""
-    tiktok_device_id: str = ""
     tiktok_csrf_token: str = ""
     tiktok_creative_csrf_token: str = ""
     tiktok_fp_id: str = ""
@@ -107,12 +106,18 @@ class Settings(BaseSettings):
                 return cookies[name]
         return self.csrf_token
 
+    @property
+    def session_device_id(self) -> str:
+        cookies = self.cookie_values
+        for name in ("MONITOR_DEVICE_ID", "monitor_device_id", "device_id", "did"):
+            if cookies.get(name):
+                return cookies[name]
+        return ""
+
     def validate_tiktok_auth(self) -> None:
         missing = []
         if not self.tiktok_cookie.strip():
             missing.append("TIKTOK_COOKIE")
-        if not self.tiktok_device_id.strip():
-            missing.append("TIKTOK_DEVICE_ID")
         if missing:
             raise RuntimeError("Missing TikTok configuration: " + ", ".join(missing))
 
