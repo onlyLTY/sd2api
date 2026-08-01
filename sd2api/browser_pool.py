@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 import time
 from typing import Any
+import uuid
 
 from .browser_client import BrowserTikTokClient
 from .config import Settings
@@ -136,17 +137,14 @@ class BrowserPoolClient:
         result: list[dict[str, Any]] = []
         for account in self.store.list_accounts():
             worker = self._workers.get(account["id"])
-            runtime = await worker.status() if worker else {
-                "running": False,
-                "logged_in": False,
-                "queued": 0,
-                "busy": False,
-                "url": None,
-                "credits": None,
-                "login_state": account.get("login_state", "not_started"),
-                "login_error": account.get("last_error"),
-                "last_login_at": account.get("last_login_at"),
-            }
+            try:
+                runtime = await worker.status() if worker else self._stopped_runtime(account)
+            except Exception as exc:
+                runtime = self._stopped_runtime(
+                    account,
+                    state="browser_error",
+                    error=f"{exc.__class__.__name__}: {exc}",
+                )
             result.append(
                 {
                     **account,
@@ -157,6 +155,23 @@ class BrowserPoolClient:
         return result
 
     @staticmethod
+    def _stopped_runtime(
+        account: dict[str, Any], *, state: str | None = None, error: str | None = None
+    ) -> dict[str, Any]:
+        return {
+            "running": False,
+            "logged_in": False,
+            "queued": 0,
+            "busy": False,
+            "url": None,
+            "credits": None,
+            "login_state": state or account.get("login_state", "not_started"),
+            "login_error": error or account.get("last_error"),
+            "last_login_at": account.get("last_login_at"),
+            "active_advertiser_id": None,
+        }
+
+    @staticmethod
     def _subaccount_eligible(item: dict[str, Any]) -> bool:
         return bool(item.get("enabled")) and item.get("seedance_access") is True and (
             item.get("credits") is None or int(item["credits"]) > 0
@@ -165,24 +180,26 @@ class BrowserPoolClient:
     async def add_account(
         self,
         *,
-        account_id: str,
-        name: str,
+        account_id: str | None,
+        name: str | None,
         start: bool,
-        username: str | None = None,
-        password: str | None = None,
-        email_address: str | None = None,
+        username: str,
+        password: str,
         auto_login: bool = True,
     ) -> dict[str, Any]:
-        password_ciphertext = None
-        if username and password:
-            password_ciphertext = self._vault().encrypt(password)
+        if account_id is None:
+            while True:
+                account_id = "account_" + uuid.uuid4().hex[:12]
+                if self.store.get_account(account_id) is None:
+                    break
+        password_ciphertext = self._vault().encrypt(password)
         try:
             self.store.create_account(
                 account_id=account_id,
-                name=name,
+                name=name or username,
                 username=username,
                 password_ciphertext=password_ciphertext,
-                email_address=email_address or username,
+                email_address=username,
                 auto_login=auto_login,
             )
         except Exception as exc:
@@ -205,7 +222,6 @@ class BrowserPoolClient:
         enabled: bool | None = None,
         username: str | None = None,
         password: str | None = None,
-        email_address: str | None = None,
         auto_login: bool | None = None,
     ) -> dict[str, Any]:
         if enabled is False:
@@ -217,12 +233,12 @@ class BrowserPoolClient:
             changes["enabled"] = enabled
         if username is not None:
             changes["username"] = username
+            # TikTok Ads sends the OTP to the same mailbox used to sign in.
+            changes["email_address"] = username
         if password is not None:
             changes["password_ciphertext"] = self._vault().encrypt(password)
             changes["login_state"] = "pending"
             changes["last_error"] = None
-        if email_address is not None:
-            changes["email_address"] = email_address
         if auto_login is not None:
             changes["auto_login"] = auto_login
         if changes:
@@ -259,7 +275,16 @@ class BrowserPoolClient:
                 status_code=409,
                 code="account_disabled",
             )
-        await self._worker(account_id).start()
+        try:
+            await self._worker(account_id).start()
+        except Exception as exc:
+            message = f"Could not start Chromium: {exc.__class__.__name__}: {exc}"
+            self.store.update_account(
+                account_id, login_state="browser_error", last_error=message
+            )
+            raise TikTokUpstreamError(
+                message, status_code=503, code="browser_start_failed"
+            ) from exc
         status = await self.account_status(account_id)
         if (
             self.settings.sd2api_auto_login
@@ -303,7 +328,14 @@ class BrowserPoolClient:
 
     async def focus_account(self, account_id: str) -> dict[str, Any]:
         worker = self._worker(account_id)
-        await worker.focus()
+        try:
+            await worker.focus()
+        except Exception as exc:
+            raise TikTokUpstreamError(
+                f"Could not open Chromium: {exc.__class__.__name__}: {exc}",
+                status_code=503,
+                code="browser_focus_failed",
+            ) from exc
         return await self.account_status(account_id)
 
     async def login_account(self, account_id: str, *, wait: bool = False) -> dict[str, Any]:
@@ -388,7 +420,16 @@ class BrowserPoolClient:
                 worker = self._workers.get(account["id"])
                 if worker is None or worker.load > 0:
                     continue
-                status = await worker.status()
+                try:
+                    status = await worker.status()
+                except Exception as exc:
+                    self.store.update_account(
+                        account["id"],
+                        login_state="browser_error",
+                        last_error=f"Browser status failed: {exc.__class__.__name__}: {exc}",
+                    )
+                    self._schedule_login(account["id"])
+                    continue
                 if not status["logged_in"]:
                     self._schedule_login(account["id"])
 
@@ -425,15 +466,31 @@ class BrowserPoolClient:
                 status_code=409,
                 code="account_busy",
             )
-        await worker.start()
-        status = await worker.status()
+        try:
+            await worker.start()
+            status = await worker.status()
+        except Exception as exc:
+            raise TikTokUpstreamError(
+                f"Could not open Chromium: {exc.__class__.__name__}: {exc}",
+                status_code=503,
+                code="browser_start_failed",
+            ) from exc
         if not status["logged_in"]:
             raise TikTokUpstreamError(
                 f"Account {account_id!r} must be logged in before scanning subaccounts",
                 status_code=401,
                 code="browser_login_required",
             )
-        discovered = await worker.scan_subaccounts(check_access=check_access)
+        try:
+            discovered = await worker.scan_subaccounts(check_access=check_access)
+        except TikTokUpstreamError:
+            raise
+        except Exception as exc:
+            raise TikTokUpstreamError(
+                f"Subaccount scan failed: {exc.__class__.__name__}: {exc}",
+                status_code=502,
+                code="subaccount_scan_failed",
+            ) from exc
         self.store.upsert_subaccounts(account_id, discovered)
         return await self.account_status(account_id)
 
@@ -468,17 +525,14 @@ class BrowserPoolClient:
                 code="account_not_found",
             )
         worker = self._workers.get(account_id)
-        runtime = await worker.status() if worker else {
-            "running": False,
-            "logged_in": False,
-            "queued": 0,
-            "busy": False,
-            "url": None,
-            "credits": None,
-            "login_state": account.get("login_state", "not_started"),
-            "login_error": account.get("last_error"),
-            "last_login_at": account.get("last_login_at"),
-        }
+        try:
+            runtime = await worker.status() if worker else self._stopped_runtime(account)
+        except Exception as exc:
+            runtime = self._stopped_runtime(
+                account,
+                state="browser_error",
+                error=f"{exc.__class__.__name__}: {exc}",
+            )
         return {
             **account,
             **runtime,

@@ -76,18 +76,37 @@ class BrowserTikTokClient:
 
     async def start(self) -> dict[str, Any]:
         async with self._start_lock:
+            if self._context is not None and (
+                self._page is None or self._page.is_closed()
+            ):
+                open_pages = [page for page in self._context.pages if not page.is_closed()]
+                if open_pages:
+                    self._page = open_pages[0]
+                else:
+                    try:
+                        self._page = await self._context.new_page()
+                    except Exception:
+                        # The user may have closed the entire Chromium window.
+                        # Relaunch the same persistent profile below.
+                        self._context = None
+                        self._page = None
+
             if self._context is None:
-                self._playwright = await async_playwright().start()
+                if self._playwright is None:
+                    self._playwright = await async_playwright().start()
                 profile = str(Path(self.profile_path).resolve())
-                self._context = await self._playwright.chromium.launch_persistent_context(
+                context = await self._playwright.chromium.launch_persistent_context(
                     user_data_dir=profile,
                     channel=self.settings.sd2api_browser_channel or None,
                     headless=self.settings.sd2api_browser_headless,
                     viewport={"width": 1280, "height": 900},
                     args=["--disable-blink-features=AutomationControlled"],
                 )
-                self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
-                self._page.set_default_timeout(30_000)
+                self._context = context
+                context.on("close", lambda *_: self._mark_context_closed(context))
+                self._page = context.pages[0] if context.pages else await context.new_page()
+            self._require_page().set_default_timeout(30_000)
+            if self._worker is None or self._worker.done():
                 self._worker = asyncio.create_task(self._worker_loop(), name="sd2api-browser-worker")
             page = self._require_page()
             if not page.url.startswith("https://ads.tiktok.com/"):
@@ -102,16 +121,24 @@ class BrowserTikTokClient:
             except asyncio.CancelledError:
                 pass
             self._worker = None
-        if self._context:
-            await self._context.close()
-            self._context = None
-            self._page = None
-        if self._playwright:
-            await self._playwright.stop()
-            self._playwright = None
+        context, self._context = self._context, None
+        self._page = None
+        if context:
+            try:
+                await context.close()
+            except Exception:
+                pass
+        playwright, self._playwright = self._playwright, None
+        if playwright:
+            try:
+                await playwright.stop()
+            except Exception:
+                pass
 
     async def status(self) -> dict[str, Any]:
         if self._page is None or self._page.is_closed():
+            if self._login_state not in {"login_failed", "not_configured"}:
+                self._set_login_state("browser_closed")
             return {
                 "account_id": self.account_id,
                 "running": False,
@@ -125,7 +152,25 @@ class BrowserTikTokClient:
                 "last_login_at": self._last_login_at,
                 "active_advertiser_id": self._active_advertiser_id,
             }
-        logged_in = await self._is_logged_in(self._page)
+        try:
+            logged_in = await self._is_logged_in(self._page)
+        except Exception:
+            if self._browser_unavailable():
+                self._set_login_state("browser_closed")
+                return {
+                    "account_id": self.account_id,
+                    "running": False,
+                    "logged_in": False,
+                    "url": None,
+                    "queued": self._queue.qsize(),
+                    "busy": self._running_job,
+                    "credits": None,
+                    "login_state": self._login_state,
+                    "login_error": self._login_error,
+                    "last_login_at": self._last_login_at,
+                    "active_advertiser_id": self._active_advertiser_id,
+                }
+            raise
         if logged_in and self._login_state != "logging_in":
             self._set_login_state("logged_in")
         credits = await self._visible_credits(self._page) if logged_in else None
@@ -317,7 +362,11 @@ class BrowserTikTokClient:
                 )
             if not page.url.startswith("https://ads.tiktok.com/creative/creativestudio/"):
                 await page.goto(STUDIO_URL, wait_until="domcontentloaded", timeout=90_000)
-                await page.wait_for_timeout(2_000)
+            # The studio is a SPA and can replace its main frame shortly after
+            # authentication/navigation. Let that redirect settle before
+            # querying the account menu.
+            await page.wait_for_load_state("domcontentloaded", timeout=30_000)
+            await page.wait_for_timeout(2_000)
             discovered = await self._discover_subaccounts(page)
             original = next(
                 (item["advertiser_id"] for item in discovered if item.get("active")), None
@@ -357,6 +406,7 @@ class BrowserTikTokClient:
             await self._switch_subaccount(page, advertiser_id)
 
     async def _open_subaccount_menu(self, page: Page) -> None:
+        await self._ensure_terms_accepted(page)
         labels = page.locator("p").filter(has_text=re.compile(r"^ID:\s*\d{10,}$"))
         for index in range(await labels.count()):
             if await labels.nth(index).is_visible():
@@ -365,7 +415,13 @@ class BrowserTikTokClient:
         for index in range(await triggers.count()):
             trigger = triggers.nth(index)
             if await trigger.is_visible():
-                await trigger.locator("xpath=../../..").click()
+                try:
+                    await trigger.locator("xpath=../../..").click(timeout=10_000)
+                except PlaywrightTimeoutError:
+                    # A one-time terms dialog can appear just after the SPA
+                    # settles and intercept this click.
+                    await self._ensure_terms_accepted(page)
+                    raise RuntimeError("Could not open the TikTok subaccount menu")
                 await page.wait_for_timeout(500)
                 break
         for index in range(await labels.count()):
@@ -493,100 +549,181 @@ class BrowserTikTokClient:
         email_address: str,
         mail_client: TempMailClient,
     ) -> dict[str, Any]:
-        """Log in using stored credentials, pausing for a human CAPTCHA when required."""
+        """Log in while allowing a human to solve CAPTCHA or enter an OTP manually."""
         async with self._login_lock:
-            await self.start()
-            page = self._require_page()
-            if await self._is_logged_in(page):
-                self._last_login_at = int(time.time())
-                self._set_login_state("logged_in")
-                return await self.status()
-
             started_at = time.time()
             deadline = time.monotonic() + self.settings.sd2api_login_timeout
-            self._set_login_state("opening_login")
-            await page.goto(STUDIO_URL, wait_until="domcontentloaded", timeout=90_000)
-            await page.wait_for_timeout(2_000)
-
-            try:
-                self._set_login_state("entering_credentials")
-                await self._open_password_login(page)
-                username_input = await self._wait_for_visible(
-                    page,
-                    (
-                        'input[type="email"]',
-                        'input[name*="email" i]',
-                        'input[name*="username" i]',
-                        'input[autocomplete="username"]',
-                    ),
-                    timeout=30,
-                )
-                await username_input.fill(username)
-
-                password_input = await self._first_visible(
-                    page,
-                    ('input[type="password"]', 'input[autocomplete="current-password"]'),
-                )
-                if password_input is None:
-                    await self._click_login_action(
-                        page, re.compile(r"^(Continue|Next|继续|下一步)$", re.I)
+            browser_restarts = 0
+            while time.monotonic() < deadline:
+                mail_task: asyncio.Task[str] | None = None
+                try:
+                    self._set_login_state(
+                        "recovering_browser" if browser_restarts else "opening_login"
                     )
-                    password_input = await self._wait_for_visible(
-                        page,
-                        ('input[type="password"]', 'input[autocomplete="current-password"]'),
-                        timeout=30,
-                    )
-                await password_input.fill(password)
-                await self._click_login_action(
-                    page, re.compile(r"^(Log in|Sign in|Continue|登录|登入|继续)$", re.I)
-                )
-
-                code_submitted = False
-                while time.monotonic() < deadline:
-                    await page.wait_for_timeout(1_500)
+                    await self.start()
+                    page = self._require_page()
                     if await self._is_logged_in(page):
                         self._last_login_at = int(time.time())
                         self._set_login_state("logged_in")
                         return await self.status()
-                    invalid = await self._login_error_text(page)
-                    if invalid:
-                        raise RuntimeError(invalid)
-                    if await self._captcha_visible(page):
-                        self._set_login_state("captcha_required")
-                        continue
 
-                    code_inputs = await self._visible_code_inputs(page)
-                    if code_inputs and not code_submitted:
-                        if not mail_client.configured:
-                            raise RuntimeError(
-                                "Email verification is required, but cf_temp_mail is not configured"
-                            )
-                        self._set_login_state("waiting_email_code")
-                        try:
-                            code = await mail_client.wait_for_code(
-                                to_address=email_address,
-                                since=started_at,
-                            )
-                        except TempMailError as exc:
-                            raise RuntimeError(str(exc)) from exc
-                        self._set_login_state("submitting_email_code")
-                        await self._fill_code_inputs(code_inputs, code)
-                        await self._click_login_action(
-                            page,
-                            re.compile(
-                                r"^(Verify|Confirm|Continue|Submit|验证|确认|继续|提交)$",
-                                re.I,
-                            ),
+                    # A restored TikTok SPA can render its authenticated shell
+                    # a moment after domcontentloaded. Avoid mistaking that
+                    # transition for a logged-out page.
+                    await page.wait_for_timeout(2_000)
+                    if await self._is_logged_in(page):
+                        self._last_login_at = int(time.time())
+                        self._set_login_state("logged_in")
+                        return await self.status()
+
+                    if not page.url.startswith("https://ads.tiktok.com/"):
+                        await page.goto(
+                            STUDIO_URL, wait_until="domcontentloaded", timeout=90_000
                         )
-                        code_submitted = True
+                        await page.wait_for_timeout(2_000)
+
+                    self._set_login_state("entering_credentials")
+                    await self._open_password_login(page)
+                    try:
+                        username_input = await self._wait_for_visible(
+                            page,
+                            (
+                                'input[type="email"]',
+                                'input[name*="email" i]',
+                                'input[name*="username" i]',
+                                'input[autocomplete="username"]',
+                            ),
+                            timeout=30,
+                        )
+                    except RuntimeError:
+                        if await self._is_logged_in(page):
+                            self._last_login_at = int(time.time())
+                            self._set_login_state("logged_in")
+                            return await self.status()
+                        raise
+                    await username_input.fill(username)
+
+                    password_input = await self._first_visible(
+                        page,
+                        ('input[type="password"]', 'input[autocomplete="current-password"]'),
+                    )
+                    if password_input is None:
+                        await self._click_login_action(
+                            page, re.compile(r"^(Continue|Next|继续|下一步)$", re.I)
+                        )
+                        password_input = await self._wait_for_visible(
+                            page,
+                            ('input[type="password"]', 'input[autocomplete="current-password"]'),
+                            timeout=30,
+                        )
+                    await password_input.fill(password)
+                    await self._click_login_action(
+                        page,
+                        re.compile(r"^(Log in|Sign in|Continue|登录|登入|继续)$", re.I),
+                    )
+
+                    code_submitted = False
+                    automatic_mail_failed: str | None = None
+                    while time.monotonic() < deadline:
+                        # Do not block on cf_temp_mail: the user can still type
+                        # and submit the code manually while polling continues.
+                        await asyncio.sleep(1.0)
+                        if page.is_closed() or self._context is None:
+                            raise RuntimeError("Chromium was closed during login")
+                        if await self._is_logged_in(page):
+                            self._last_login_at = int(time.time())
+                            self._set_login_state("logged_in")
+                            return await self.status()
+                        invalid = await self._login_error_text(page)
+                        if invalid:
+                            raise RuntimeError(invalid)
+                        if await self._captcha_visible(page):
+                            self._set_login_state("captcha_required")
+                            continue
+
+                        code_inputs = await self._visible_code_inputs(page)
+                        if code_inputs and not code_submitted:
+                            if (
+                                mail_client.configured
+                                and mail_task is None
+                                and automatic_mail_failed is None
+                            ):
+                                mail_task = asyncio.create_task(
+                                    mail_client.wait_for_code(
+                                        to_address=email_address,
+                                        since=started_at,
+                                    ),
+                                    name=f"sd2api-mail-code-{self.account_id}",
+                                )
+                            if mail_task is not None and mail_task.done():
+                                try:
+                                    code = mail_task.result()
+                                except TempMailError as exc:
+                                    automatic_mail_failed = str(exc)
+                                    mail_task = None
+                                else:
+                                    self._set_login_state("submitting_email_code")
+                                    await self._fill_code_inputs(code_inputs, code)
+                                    try:
+                                        await self._click_login_action(
+                                            page,
+                                            re.compile(
+                                                r"^(Verify|Confirm|Continue|Submit|验证|确认|继续|提交)$",
+                                                re.I,
+                                            ),
+                                        )
+                                    except RuntimeError:
+                                        # Some OTP forms submit immediately when
+                                        # their final digit is filled.
+                                        if await self._visible_code_inputs(page):
+                                            raise
+                                    code_submitted = True
+                                    mail_task = None
+                                    continue
+
+                            if automatic_mail_failed:
+                                self._set_login_state(
+                                    "waiting_email_code_manual", automatic_mail_failed
+                                )
+                            elif mail_client.configured:
+                                self._set_login_state("waiting_email_code")
+                            else:
+                                self._set_login_state(
+                                    "waiting_email_code_manual",
+                                    "cf_temp_mail is not configured; enter the email code manually",
+                                )
+                            continue
+
+                        # A disappearing code form may mean that the user
+                        # submitted the OTP manually. Keep checking the page.
+                        self._set_login_state("waiting_for_login")
+
+                    raise RuntimeError(
+                        f"TikTok login did not finish within {self.settings.sd2api_login_timeout} seconds"
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if (
+                        self._browser_unavailable() or self._transient_page_error(exc)
+                    ) and browser_restarts < 3:
+                        browser_restarts += 1
+                        self._set_login_state("recovering_browser", str(exc))
+                        await asyncio.sleep(0.5)
                         continue
-                    self._set_login_state("waiting_for_login")
-                raise RuntimeError(
-                    f"TikTok login did not finish within {self.settings.sd2api_login_timeout} seconds"
-                )
-            except Exception as exc:
-                self._set_login_state("login_failed", str(exc))
-                raise
+                    self._set_login_state("login_failed", str(exc))
+                    raise
+                finally:
+                    if mail_task is not None and not mail_task.done():
+                        mail_task.cancel()
+                        await asyncio.gather(mail_task, return_exceptions=True)
+
+            message = (
+                f"TikTok login did not finish within "
+                f"{self.settings.sd2api_login_timeout} seconds"
+            )
+            self._set_login_state("login_failed", message)
+            raise RuntimeError(message)
 
     async def diagnostics(self, *, open_generation_menu: bool = False) -> dict[str, Any]:
         """Return visible page labels without reading browser authentication storage."""
@@ -721,6 +858,7 @@ class BrowserTikTokClient:
         await page.wait_for_timeout(3_000)
         if not await self._is_logged_in(page):
             raise RuntimeError("TikTok session is no longer logged in")
+        await self._ensure_terms_accepted(page)
         if job.advertiser_id:
             await self.select_subaccount(job.advertiser_id)
             if page.url.split("?", 1)[0] != target_url.split("?", 1)[0]:
@@ -1175,7 +1313,50 @@ class BrowserTikTokClient:
                 value = (await candidate.inner_text()).strip()
                 if value.isdigit():
                     return int(value)
+        # TikTok's newer studio shell renders the credit balance as plain text
+        # inside the top navigation rather than as the button's accessible name.
+        navigation = page.locator("nav:visible, header:visible")
+        for index in range(await navigation.count()):
+            text = await navigation.nth(index).inner_text()
+            for line in text.splitlines():
+                value = line.strip().replace(",", "")
+                if re.fullmatch(r"\d{1,9}", value):
+                    return int(value)
         return None
+
+    @staticmethod
+    async def _ensure_terms_accepted(page: Page) -> None:
+        disclaimers = page.locator('[class*="ai-disclaimer"]:visible')
+        for index in range(await disclaimers.count()):
+            if await disclaimers.nth(index).is_visible():
+                raise TikTokUpstreamError(
+                    "TikTok Creative GenAI Terms require one-time acceptance in Chromium; "
+                    "open/focus this account, review the terms, click Accept, then retry",
+                    status_code=409,
+                    code="terms_acceptance_required",
+                )
+
+    def _mark_context_closed(self, context: BrowserContext) -> None:
+        if self._context is context:
+            self._context = None
+            self._page = None
+            if self._login_state not in {"login_failed", "not_configured"}:
+                self._set_login_state("browser_closed")
+
+    def _browser_unavailable(self) -> bool:
+        return self._context is None or self._page is None or self._page.is_closed()
+
+    @staticmethod
+    def _transient_page_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return any(
+            token in message
+            for token in (
+                "frame was detached",
+                "execution context was destroyed",
+                "target page, context or browser has been closed",
+            )
+        )
 
     def _require_page(self) -> Page:
         if self._page is None or self._page.is_closed():

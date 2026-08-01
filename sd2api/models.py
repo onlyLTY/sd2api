@@ -193,19 +193,14 @@ class UpstreamTask(BaseModel):
 
 
 class AccountCreateRequest(BaseModel):
-    id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
-    name: str = Field(min_length=1, max_length=128)
-    username: str | None = Field(default=None, min_length=1, max_length=320)
-    password: SecretStr | None = None
-    email_address: str | None = Field(default=None, min_length=3, max_length=320)
+    # id/name remain optional for API clients that want stable identifiers, but
+    # the admin UI intentionally lets the service generate them.
+    id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    username: str = Field(min_length=3, max_length=320)
+    password: SecretStr
     auto_login: bool = True
     start: bool = True
-
-    @model_validator(mode="after")
-    def credentials_are_complete(self) -> "AccountCreateRequest":
-        if (self.username is None) != (self.password is None):
-            raise ValueError("username and password must be supplied together")
-        return self
 
 
 class AccountUpdateRequest(BaseModel):
@@ -213,7 +208,6 @@ class AccountUpdateRequest(BaseModel):
     enabled: bool | None = None
     username: str | None = Field(default=None, min_length=1, max_length=320)
     password: SecretStr | None = None
-    email_address: str | None = Field(default=None, min_length=3, max_length=320)
     auto_login: bool | None = None
 
 

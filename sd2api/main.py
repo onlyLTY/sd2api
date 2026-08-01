@@ -267,8 +267,7 @@ async def add_pool_account(body: AccountCreateRequest) -> dict[str, Any]:
         name=body.name,
         start=body.start,
         username=body.username,
-        password=body.password.get_secret_value() if body.password else None,
-        email_address=body.email_address,
+        password=body.password.get_secret_value(),
         auto_login=body.auto_login,
     )
 
@@ -286,7 +285,6 @@ async def update_pool_account(account_id: str, body: AccountUpdateRequest) -> di
         enabled=body.enabled,
         username=body.username,
         password=body.password.get_secret_value() if body.password else None,
-        email_address=body.email_address,
         auto_login=body.auto_login,
     )
 

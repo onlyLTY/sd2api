@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import re
 import time
 from datetime import datetime
@@ -112,16 +113,25 @@ class TempMailClient:
     @staticmethod
     def _extract_code(item: dict[str, Any]) -> str | None:
         direct = str(item.get("verificationCode") or item.get("verification_code") or "")
-        match = re.search(r"(?<!\d)(\d{4,8})(?!\d)", direct)
+        match = re.search(r"(?<![A-Z0-9])([A-Z0-9]{4,8})(?![A-Z0-9])", direct, re.I)
         if match:
             return match.group(1)
-        text = " ".join(
+        raw = " ".join(
             str(item.get(key) or "")
             for key in ("subject", "textBody", "text_body", "htmlBody", "html_body")
         )
-        match = re.search(
-            r"(?:verification|security|login|确认|验证|验证码)[^\d]{0,30}(\d{4,8})",
-            text,
-            re.I,
+        text = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", raw)))
+        patterns = (
+            # Current TikTok for Business mail: "... page. SPNRZX Your
+            # verification code is valid ..."
+            r"\b([A-Z0-9]{4,8})\b\s+Your verification code\b",
+            r"login verification page[\s.:：-]*\b([A-Z0-9]{4,8})\b",
+            # Common forward forms in English and Chinese.
+            r"(?:verification|security|login)\s+code(?:\s+is)?[\s:：-]*\b([A-Z0-9]{4,8})\b",
+            r"(?:确认|验证|验证码)[^A-Z0-9]{0,30}\b([A-Z0-9]{4,8})\b",
         )
-        return match.group(1) if match else None
+        for pattern in patterns:
+            match = re.search(pattern, text, re.I)
+            if match:
+                return match.group(1)
+        return None

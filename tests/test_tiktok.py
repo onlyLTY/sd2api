@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from sd2api.config import Settings
+from sd2api.browser_client import BrowserTikTokClient
 from sd2api.browser_pool import BrowserPoolClient
 from sd2api.models import UpstreamTask
 from sd2api.security import CredentialError, CredentialVault
@@ -180,6 +181,190 @@ def test_temp_mail_client_extracts_code_from_chinese_message() -> None:
         }
     )
     assert code == "482731"
+
+
+def test_temp_mail_client_extracts_alphanumeric_tiktok_html_code() -> None:
+    code = TempMailClient._extract_code(
+        {
+            "subject": "TikTok for Business login verification",
+            "htmlBody": """
+                <p>Enter this code on the login verification page.</p>
+                <strong>SPNRZX</strong>
+                <p>Your verification code is valid for 10 minutes.</p>
+            """,
+        }
+    )
+    assert code == "SPNRZX"
+
+
+@pytest.mark.asyncio
+async def test_login_detects_manual_success_while_mail_polling(tmp_path: Path) -> None:
+    class FakePage:
+        url = "https://ads.tiktok.com/login"
+
+        @staticmethod
+        def is_closed() -> bool:
+            return False
+
+        @staticmethod
+        async def wait_for_timeout(value: int) -> None:
+            pass
+
+    class FakeInput:
+        async def fill(self, value: str) -> None:
+            pass
+
+    class PendingMail:
+        configured = True
+        cancelled = False
+
+        async def wait_for_code(self, **kwargs) -> str:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.cancelled = True
+            return "NEVER"
+
+    class ManualLoginClient(BrowserTikTokClient):
+        def __init__(self) -> None:
+            super().__init__(
+                Settings(sd2api_browser_profile=str(tmp_path / "profile")),
+                account_id="manual-login",
+            )
+            self._page = FakePage()  # type: ignore[assignment]
+            self._context = object()  # type: ignore[assignment]
+            self.login_checks = 0
+
+        async def start(self) -> dict:
+            return {}
+
+        async def status(self) -> dict:
+            return {"logged_in": True, "login_state": self._login_state}
+
+        async def _is_logged_in(self, page) -> bool:
+            self.login_checks += 1
+            return self.login_checks >= 4
+
+        async def _open_password_login(self, page) -> None:
+            pass
+
+        async def _wait_for_visible(self, page, selectors, *, timeout):
+            return FakeInput()
+
+        async def _first_visible(self, page, selectors):
+            return FakeInput()
+
+        async def _click_login_action(self, page, pattern) -> None:
+            pass
+
+        async def _login_error_text(self, page) -> str | None:
+            return None
+
+        async def _captcha_visible(self, page) -> bool:
+            return False
+
+        async def _visible_code_inputs(self, page) -> list:
+            return [FakeInput()]
+
+    mail = PendingMail()
+    client = ManualLoginClient()
+    result = await client.login(
+        username="login@example.com",
+        password="secret",
+        email_address="login@example.com",
+        mail_client=mail,  # type: ignore[arg-type]
+    )
+    assert result["logged_in"] is True
+    assert client._login_state == "logged_in"
+    assert mail.cancelled is True
+
+
+@pytest.mark.asyncio
+async def test_start_reopens_a_closed_browser_page(tmp_path: Path) -> None:
+    class ClosedPage:
+        @staticmethod
+        def is_closed() -> bool:
+            return True
+
+    class OpenPage:
+        url = "https://ads.tiktok.com/creative/creativestudio/image-to-video"
+        default_timeout = 0
+
+        @staticmethod
+        def is_closed() -> bool:
+            return False
+
+        def set_default_timeout(self, value: int) -> None:
+            self.default_timeout = value
+
+    class OpenContext:
+        pages: list = []
+        closed = False
+
+        async def new_page(self):
+            page = OpenPage()
+            self.pages = [page]
+            return page
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class FakePlaywright:
+        async def stop(self) -> None:
+            pass
+
+    class RecoveryClient(BrowserTikTokClient):
+        async def status(self) -> dict:
+            return {"running": True}
+
+    client = RecoveryClient(
+        Settings(sd2api_browser_profile=str(tmp_path / "profile")),
+        account_id="recovery",
+    )
+    context = OpenContext()
+    client._context = context  # type: ignore[assignment]
+    client._page = ClosedPage()  # type: ignore[assignment]
+    client._playwright = FakePlaywright()  # type: ignore[assignment]
+
+    result = await client.start()
+    assert result["running"] is True
+    assert isinstance(client._page, OpenPage)
+    assert client._page.default_timeout == 30_000
+    await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_credits_fallback_reads_new_navigation_text() -> None:
+    class Locator:
+        def __init__(self, values: list[str]) -> None:
+            self.values = values
+            self.index = 0
+
+        async def count(self) -> int:
+            return len(self.values)
+
+        def nth(self, index: int):
+            item = Locator(self.values)
+            item.index = index
+            return item
+
+        async def is_visible(self) -> bool:
+            return True
+
+        async def inner_text(self) -> str:
+            return self.values[self.index]
+
+    class Page:
+        @staticmethod
+        def get_by_role(role, name):
+            return Locator([])
+
+        @staticmethod
+        def locator(selector):
+            assert selector == "nav:visible, header:visible"
+            return Locator(["English\n1975\nsymphony-0731-3"])
+
+    assert await BrowserTikTokClient._visible_credits(Page()) == 1975
 
 
 @pytest.mark.asyncio
@@ -566,7 +751,11 @@ def test_admin_account_routes_without_starting_browser(
     created = api.post(
         "/admin/accounts",
         headers=headers,
-        json={"id": "account_001", "name": "Main account", "start": False},
+        json={
+            "username": "primary@example.com",
+            "password": "primary-password",
+            "start": False,
+        },
     )
     listed = api.get("/admin/accounts", headers=headers)
     status = api.get("/admin/pool/status", headers=headers)
@@ -579,24 +768,26 @@ def test_admin_account_routes_without_starting_browser(
             "name": "Secure account",
             "username": "login@example.com",
             "password": "not-stored-in-plain-text",
-            "email_address": "codes@example.com",
             "start": False,
         },
     )
 
     assert created.status_code == 200
-    assert created.json()["id"] == "account_001"
+    assert created.json()["id"].startswith("account_")
+    assert created.json()["name"] == "primary@example.com"
     assert created.json()["running"] is False
-    assert listed.json()["data"][0]["name"] == "Main account"
+    assert listed.json()["data"][0]["name"] == "primary@example.com"
     assert status.json()["max_parallel"] == 0
     assert dashboard.status_code == 200
     assert "TikTok Ads 账号池" in dashboard.text
+    assert 'name="email_address"' not in dashboard.text
     assert secured.status_code == 200
     assert secured.json()["credentials_configured"] is True
     assert "password_ciphertext" not in secured.json()
     stored = pool_store.get_account("account_secure", include_secret=True)
     assert stored is not None
     assert stored["password_ciphertext"] != "not-stored-in-plain-text"
+    assert stored["email_address"] == "login@example.com"
 
     pool_store.upsert_subaccounts(
         "account_secure",

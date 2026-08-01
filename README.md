@@ -115,11 +115,11 @@ ssh -L 8765:127.0.0.1:8765 -L 6080:127.0.0.1:6080 user@your-vps
 - noVNC：`http://127.0.0.1:6080/vnc.html?autoconnect=1&resize=scale`
 - API 文档：`http://127.0.0.1:8765/docs`
 
-推荐在账号池面板中添加账号，填写 TikTok Ads 账号、密码和接码邮箱。密码经 Fernet 加密后才写入 SQLite，管理 API 和面板不会回传密码或密文。容器启动、账号掉线或点击“登录”时会自动执行账号密码登录，并通过 `cf_temp_mail` 的 `GET /api/emails?to_address=...` 获取本次登录产生的邮件验证码。
+推荐在账号池面板中添加账号，只需填写 TikTok Ads 登录邮箱和密码。登录邮箱同时用于接收验证码，内部账号 ID 自动生成；加入号池后可在“编辑”中设置备注名称。密码经 Fernet 加密后才写入 SQLite，管理 API 和面板不会回传密码或密文。容器启动、账号掉线或点击“登录”时会自动执行账号密码登录，并通过 `cf_temp_mail` 的 `GET /api/emails?to_address=...` 获取本次登录产生的邮件验证码（支持纯数字及字母数字验证码）。
 
 登录成功后程序会发现该登录身份下的全部 Client/Partner 子账号，并逐个检查 Dreamina Seedance 2.0 是否可选以及当前 Credits。子账号默认不加入生成池；管理员在面板中勾选一个或多个“SD2 可用”的子账号后才会参与调度。重新扫描会更新名称、权限和 Credits，但保留已有勾选结果。
 
-图形验证码属于 TikTok 的交互式安全验证：程序会把账号状态标记为 `captcha_required` 并保持对应浏览器页面，管理员通过 noVNC 完成验证后，登录状态机会自动继续邮箱接码和后续登录。项目不包含验证码破解或绕过逻辑。
+图形验证码属于 TikTok 的交互式安全验证：程序会把账号状态标记为 `captcha_required` 并保持对应浏览器页面，管理员通过 noVNC 完成验证后，登录状态机会自动继续邮箱接码和后续登录。自动接码在后台并行进行，管理员仍可手动输入验证码；只要页面进入已登录状态，程序会立即确认成功。登录过程中关闭页面或 Chromium 后，程序最多自动重建三次并复用同一持久化 Profile。项目不包含验证码破解或绕过逻辑。
 
 也可以通过 API 添加账号：
 
@@ -127,7 +127,7 @@ ssh -L 8765:127.0.0.1:8765 -L 6080:127.0.0.1:6080 user@your-vps
 curl -X POST http://127.0.0.1:8765/admin/accounts \
   -H "Authorization: Bearer $SD2API_ADMIN_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"id":"account_001","name":"Main account","username":"login@example.com","password":"your-password","email_address":"login@example.com","auto_login":true,"start":true}'
+  -d '{"username":"login@example.com","password":"your-password","auto_login":true,"start":true}'
 ```
 
 为避免密码进入 shell history，实际部署优先使用账号池面板。继续添加 `account_002`、`account_003` 即可；noVNC 底部任务栏用于切换窗口，也可以调用聚焦端点：
