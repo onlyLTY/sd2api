@@ -6,10 +6,12 @@ import json
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime, timezone
+from typing import Any
 import wave
 
 import httpx
 import pytest
+from curl_cffi.requests import AsyncSession as CurlAsyncSession
 from fastapi.testclient import TestClient
 from PIL import Image
 
@@ -17,6 +19,7 @@ from sd2api.config import Settings
 from sd2api.browser_client import BrowserTikTokClient
 from sd2api.browser_pool import BrowserPoolClient
 from sd2api.models import UpstreamTask
+from sd2api.protocol import ProtocolSession, ProtocolTikTokClient, _sign_gateway_request
 from sd2api.security import CredentialError, CredentialVault
 from sd2api.store import TaskStore
 from sd2api.temp_mail import TempMailClient
@@ -966,6 +969,437 @@ async def test_upload_manager_rejects_private_image_url(tmp_path: Path) -> None:
     assert error.value.code == "image_url_blocked"
 
 
+def protocol_session() -> ProtocolSession:
+    return ProtocolSession.from_dict(
+        {
+            "version": 1,
+            "captured_at": 1,
+            "device_id": "device-123",
+            "fp_id": "0123456789abcdef0123456789abcdef",
+            "sec_ch_ua": '"Chromium";v="151", "Not=A?Brand";v="99"',
+            "sec_ch_ua_mobile": "?0",
+            "sec_ch_ua_platform": '"Windows"',
+            "user_agent": "Protocol Test Browser",
+            "cookies": [
+                {
+                    "name": "sessionid",
+                    "value": "session-value",
+                    "domain": ".tiktok.com",
+                    "path": "/",
+                },
+                {
+                    "name": "csrftoken",
+                    "value": "csrf-value",
+                    "domain": ".tiktok.com",
+                    "path": "/",
+                },
+                {
+                    "name": "s_aio_client_id",
+                    "value": "old-advertiser",
+                    "domain": ".tiktok.com",
+                    "path": "/",
+                },
+            ],
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_protocol_real_client_uses_chrome_impersonation_backend() -> None:
+    client = ProtocolTikTokClient(
+        Settings(), protocol_session(), account_id="account-a"
+    )
+    raw = await client._get_client()
+    assert isinstance(raw, CurlAsyncSession)
+    assert raw.impersonate == "chrome"
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_protocol_client_uses_isolated_subaccount_cookie_and_login_headers() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"BaseResp": {"StatusCode": 0}, "account": {"aioClientID": "123456789012"}},
+        )
+
+    client = ProtocolTikTokClient(
+        Settings(),
+        protocol_session(),
+        account_id="account-a",
+        advertiser_id="123456789012",
+        transport=httpx.MockTransport(handler),
+    )
+    await client.validate()
+    await client.close()
+
+    request = requests[0]
+    assert "device_id" not in request.url.params
+    assert request.headers["x-csrftoken"] == "csrf-value"
+    assert request.headers["x-fp-id"] == "0123456789abcdef0123456789abcdef"
+    assert request.headers["sec-ch-ua"] == '"Chromium";v="151", "Not=A?Brand";v="99"'
+    assert request.headers["sec-ch-ua-mobile"] == "?0"
+    assert request.headers["sec-ch-ua-platform"] == '"Windows"'
+    assert request.headers["user-agent"] == "Protocol Test Browser"
+    assert request.headers["x-creative-source"] == "CreativeStudio/MiniApp/ImageToVideo"
+    assert "s_aio_client_id=123456789012" in request.headers["cookie"]
+    assert "old-advertiser" not in request.headers["cookie"]
+
+
+@pytest.mark.asyncio
+async def test_protocol_status_two_is_running_until_zero_with_vid() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "code": 0,
+                "data": {
+                    "draft_infos": [
+                        {
+                            "taskId": "task-running",
+                            "draftTaskStatus": 2,
+                            "renderTaskStatus": 2,
+                            "vid": "",
+                            "generateErrorCode": None,
+                            "generateErrorMessage": None,
+                        }
+                    ]
+                },
+            },
+        )
+
+    client = ProtocolTikTokClient(
+        Settings(),
+        protocol_session(),
+        account_id="account-a",
+        advertiser_id="123456789012",
+        transport=httpx.MockTransport(handler),
+    )
+    result = await client.check_task("task-running")
+    await client.close()
+    assert result.status == "running"
+    assert result.progress == 50
+    assert result.error_code is None
+
+
+def test_protocol_video_url_ignores_empty_preview_and_prefers_original() -> None:
+    payload = {
+        "previewLink": "",
+        "videoInfo": {
+            "VideoInfos": [
+                {"MainUrl": "https://cdn.example/360.mp4", "VideoMeta": {"Size": "10"}},
+                {"MainUrl": "https://cdn.example/720.mp4", "VideoMeta": {"Size": "20"}},
+            ],
+            "OriginalVideoInfo": {"MainUrl": "https://cdn.example/original.mp4"},
+        },
+    }
+    assert (
+        ProtocolTikTokClient._extract_video_url(payload)
+        == "https://cdn.example/original.mp4"
+    )
+
+
+def test_upload_gateway_sigv4_is_derived_from_sts_token() -> None:
+    path, headers = _sign_gateway_request(
+        method="GET",
+        path="/creative/creativestudio/upload-proxy",
+        params={"Action": "ApplyImageUpload", "Version": "2018-08-01"},
+        token={
+            "AccessKeyID": "access",
+            "SecretAccessKey": "secret",
+            "SessionToken": "session-token",
+            "CurrentTime": "2026-08-02T00:00:00Z",
+        },
+        service="imagex",
+    )
+    assert path.endswith("Action=ApplyImageUpload&Version=2018-08-01")
+    assert headers["X-Amz-Date"] == "20260802T000000Z"
+    assert headers["x-amz-security-token"] == "session-token"
+    assert "Credential=access/20260802/i18n/imagex/aws4_request" in headers["Authorization"]
+
+
+@pytest.mark.asyncio
+async def test_protocol_image_upload_apply_transfer_commit(tmp_path: Path) -> None:
+    image = tmp_path / "reference.png"
+    image.write_bytes(png_bytes())
+    stages: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/cue/upload/token"):
+            stages.append("token")
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "AccessKeyID": "access",
+                        "SecretAccessKey": "secret",
+                        "SessionToken": "session-token",
+                        "CurrentTime": "2026-08-02T00:00:00Z",
+                    },
+                },
+            )
+        if request.url.path.endswith("/upload-proxy") and request.method == "GET":
+            stages.append("apply")
+            assert request.url.params["Action"] == "ApplyImageUpload"
+            assert request.headers["authorization"].startswith("AWS4-HMAC-SHA256")
+            return httpx.Response(
+                200,
+                json={
+                    "Result": {
+                        "UploadAddress": {
+                            "UploadHosts": ["upload.example.com"],
+                            "SessionKey": "session-key",
+                            "StoreInfos": [
+                                {
+                                    "StoreUri": "tos-sg/image-object",
+                                    "Auth": "storage-signature",
+                                }
+                            ],
+                        }
+                    }
+                },
+            )
+        if request.url.host == "upload.example.com":
+            stages.append("transfer")
+            assert request.headers["authorization"] == "storage-signature"
+            assert len(request.headers["content-crc32"]) == 8
+            return httpx.Response(200, json={"code": 2000, "data": {"crc32": "ok"}})
+        if request.url.path.endswith("/upload-proxy") and request.method == "POST":
+            stages.append("commit")
+            assert request.url.params["Action"] == "CommitImageUpload"
+            assert json.loads(request.content)["SessionKey"] == "session-key"
+            return httpx.Response(
+                200,
+                json={"Result": {"Results": [{"ImageUri": "tos-sg/image-object"}]}},
+            )
+        raise AssertionError(f"Unexpected request {request.method} {request.url}")
+
+    client = ProtocolTikTokClient(
+        Settings(),
+        protocol_session(),
+        account_id="account-a",
+        advertiser_id="123456789012",
+        transport=httpx.MockTransport(handler),
+    )
+    result = await client.upload_media(StagedMedia(kind="image", path=str(image)))
+    await client.close()
+    assert stages == ["token", "apply", "transfer", "commit"]
+    assert result.image_uri == "tos-sg/image-object"
+    assert result.image_url and result.image_url.startswith("https://")
+
+
+@pytest.mark.asyncio
+async def test_protocol_multipart_transfer_uses_isolated_parts_and_finish(
+    tmp_path: Path,
+) -> None:
+    media = tmp_path / "large.mp4"
+    media.write_bytes(b"m" * (2 * 1024 * 1024 + 123))
+    phases: list[str] = []
+    parts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        phase = request.url.params.get("phase")
+        if phase == "init":
+            phases.append("init")
+            return httpx.Response(
+                200, json={"code": 2000, "data": {"uploadid": "upload-1"}}
+            )
+        if phase == "transfer":
+            phases.append("transfer")
+            parts.append(int(request.url.params["part_number"]))
+            assert request.headers["authorization"] == "storage-signature"
+            return httpx.Response(200, json={"code": 2000})
+        if phase == "finish":
+            phases.append("finish")
+            body = request.content.decode()
+            assert [item.split(":", 1)[0] for item in body.split(",")] == [
+                "1",
+                "2",
+                "3",
+            ]
+            return httpx.Response(200, json={"code": 2000, "data": {"vid": "v1"}})
+        raise AssertionError(f"Unexpected request {request.method} {request.url}")
+
+    client = ProtocolTikTokClient(
+        Settings(
+            sd2api_protocol_direct_upload_bytes=256 * 1024,
+            sd2api_protocol_slice_bytes=1024 * 1024,
+        ),
+        protocol_session(),
+        account_id="account-a",
+        advertiser_id="123456789012",
+        transport=httpx.MockTransport(handler),
+    )
+    result = await client._transfer_file(
+        media,
+        {
+            "host": "upload.example.com",
+            "oid": "video-object",
+            "signature": "storage-signature",
+            "headers": {},
+        },
+    )
+    await client.close()
+    assert phases == ["init", "transfer", "transfer", "transfer", "finish"]
+    assert parts == [1, 2, 3]
+    assert result["data"]["vid"] == "v1"
+
+
+@pytest.mark.asyncio
+async def test_protocol_reference_request_uses_image_video_audio_mentions(
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/i2v/gen_r2v_video"):
+            captured.update(json.loads(request.content))
+            return httpx.Response(200, json={"code": 0, "data": {"taskId": "r2v-task"}})
+        raise AssertionError(f"Unexpected request {request.method} {request.url}")
+
+    client = ProtocolTikTokClient(
+        Settings(),
+        protocol_session(),
+        account_id="account-a",
+        advertiser_id="123456789012",
+        transport=httpx.MockTransport(handler),
+    )
+    uploaded = iter(
+        [
+            type("Media", (), {"kind": "image", "image_url": "https://img/1", "vid": None, "poster_url": None})(),
+            type("Media", (), {"kind": "video", "image_url": None, "vid": "video-1", "poster_url": "https://poster/1"})(),
+            type("Media", (), {"kind": "audio", "image_url": None, "vid": "audio-1", "poster_url": None})(),
+        ]
+    )
+
+    async def fake_upload(media: StagedMedia):
+        return next(uploaded)
+
+    client.upload_media = fake_upload  # type: ignore[method-assign]
+    task_id = await client.create_reference_video(
+        prompt="Use all references",
+        model="seedance-2.0",
+        duration=5,
+        media=[
+            StagedMedia(kind="image", path=str(tmp_path / "a.png")),
+            StagedMedia(kind="video", path=str(tmp_path / "b.mp4")),
+            StagedMedia(kind="audio", path=str(tmp_path / "c.wav")),
+        ],
+    )
+    await client.close()
+    assert task_id == "r2v-task"
+    assert captured["images"] == ["https://img/1"]
+    assert captured["mentions"] == [
+        {"type": 1, "id": "https://img/1"},
+        {"type": 2, "id": "video-1"},
+        {"type": 101, "id": "audio-1"},
+    ]
+    assert captured["model"] == "2000004"
+    assert json.loads(captured["settings"])["aiModel"] == "2000004"
+
+
+@pytest.mark.asyncio
+async def test_protocol_mode_specific_model_ids(tmp_path: Path) -> None:
+    image = tmp_path / "reference.png"
+    image.write_bytes(png_bytes())
+    requests: list[tuple[str, dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append((request.url.path, body))
+        return httpx.Response(200, json={"code": 0, "data": {"taskId": "task"}})
+
+    client = ProtocolTikTokClient(
+        Settings(),
+        protocol_session(),
+        account_id="account-a",
+        advertiser_id="123456789012",
+        transport=httpx.MockTransport(handler),
+    )
+
+    async def fake_upload(media: StagedMedia):
+        return type(
+            "Media",
+            (),
+            {
+                "kind": media.kind,
+                "image_url": "https://img/reference",
+                "vid": None,
+                "poster_url": None,
+            },
+        )()
+
+    client.upload_media = fake_upload  # type: ignore[method-assign]
+    await client.create_text_video(prompt="text", model="seedance-2.5", duration=5)
+    await client.create_image_video(
+        prompt="image", model="seedance-2.5", duration=5, image_path=str(image)
+    )
+    await client.create_reference_video(
+        prompt="reference",
+        model="seedance-2.5",
+        duration=5,
+        media=[StagedMedia(kind="image", path=str(image))],
+    )
+    await client.close()
+
+    assert [body["model"] for _, body in requests] == [
+        "5000007",
+        "4000008",
+        "2000008",
+    ]
+    assert [json.loads(body["settings"])["aiModel"] for _, body in requests] == [
+        "5000007",
+        "4000008",
+        "2000008",
+    ]
+
+
+def test_protocol_session_derives_device_id_from_browser_cookie() -> None:
+    session = ProtocolSession.from_dict(
+        {
+            "cookies": [
+                {
+                    "name": "MONITOR_WEB_ID",
+                    "value": "7612345678901234567",
+                    "domain": ".tiktok.com",
+                    "path": "/",
+                }
+            ],
+            "user_agent": "Browser",
+        }
+    )
+    assert session.device_id == "7612345678901234567"
+
+
+@pytest.mark.asyncio
+async def test_protocol_generation_rejects_session_without_fp_id() -> None:
+    session = ProtocolSession.from_dict(
+        {
+            "cookies": [
+                {
+                    "name": "sessionid",
+                    "value": "session-value",
+                    "domain": ".tiktok.com",
+                    "path": "/",
+                }
+            ],
+            "user_agent": "Browser",
+        }
+    )
+    client = ProtocolTikTokClient(
+        Settings(), session, account_id="account-a", advertiser_id="advertiser-a"
+    )
+    with pytest.raises(TikTokUpstreamError) as error:
+        await client.create_text_video(
+            prompt="text", model="seedance-2.0", duration=5
+        )
+    assert error.value.code == "protocol_fp_id_missing"
+
+
 @pytest.mark.asyncio
 async def test_pool_schedules_concurrent_jobs_across_accounts(tmp_path: Path) -> None:
     store = TaskStore(str(tmp_path / "pool.db"))
@@ -1057,6 +1491,119 @@ async def test_pool_schedules_concurrent_jobs_across_accounts(tmp_path: Path) ->
         "audio",
     ]
     assert worker_a.reference_calls[0]["advertiser_id"] == "a-advertiser"
+
+
+@pytest.mark.asyncio
+async def test_protocol_pool_balances_concurrency_across_same_login_subaccounts(
+    tmp_path: Path,
+) -> None:
+    pool = BrowserPoolClient(
+        Settings(sd2api_database=str(tmp_path / "protocol-pool.db")),
+        TaskStore(str(tmp_path / "protocol-pool.db")),
+    )
+    account = {
+        "id": "login-a",
+        "enabled": True,
+        "running": True,
+        "logged_in": True,
+        "session_available": True,
+        "queued": 0,
+        "busy": False,
+        "subaccounts": [
+            {
+                "advertiser_id": "sub-a",
+                "enabled": True,
+                "seedance_access": True,
+                "credits": 100,
+            },
+            {
+                "advertiser_id": "sub-b",
+                "enabled": True,
+                "seedance_access": True,
+                "credits": 100,
+            },
+        ],
+    }
+
+    async def fake_list_accounts() -> list[dict[str, Any]]:
+        return [account]
+
+    class FakeProtocol:
+        def __init__(self, advertiser_id: str) -> None:
+            self.advertiser_id = advertiser_id
+            self.load = 0
+            self.calls = 0
+
+        async def create_text_video(self, **kwargs: Any) -> str:
+            self.calls += 1
+            self.load += 1
+            return f"{self.advertiser_id}-task-{self.calls}"
+
+    clients = {name: FakeProtocol(name) for name in ("sub-a", "sub-b")}
+    pool.list_accounts = fake_list_accounts  # type: ignore[method-assign]
+    pool._protocol_client = (  # type: ignore[method-assign]
+        lambda _account_id, advertiser_id=None: clients[str(advertiser_id)]
+    )
+
+    tasks = await asyncio.gather(
+        *(
+            pool.create_text_video(
+                prompt=f"same-login-{index}", model="seedance-2.0", duration=5
+            )
+            for index in range(4)
+        )
+    )
+
+    assert [task.split("-task", 1)[0] for task in tasks] == [
+        "sub-a",
+        "sub-b",
+        "sub-a",
+        "sub-b",
+    ]
+    assert clients["sub-a"].load == clients["sub-b"].load == 2
+    status = await pool.status()
+    assert status["max_parallel"] == 2
+
+
+@pytest.mark.asyncio
+async def test_protocol_pool_refreshes_subaccount_credits_after_terminal_task(
+    tmp_path: Path,
+) -> None:
+    store = TaskStore(str(tmp_path / "credit-pool.db"))
+    pool = BrowserPoolClient(Settings(), store)
+    pool._task_accounts["task-1"] = "login-a"
+    pool._task_advertisers["task-1"] = "sub-a"
+    updates: dict[str, Any] = {}
+
+    class FakeProtocol:
+        async def check_task(self, task_id: str) -> UpstreamTask:
+            return UpstreamTask(
+                id=task_id,
+                status="succeeded",
+                progress=100,
+                video_id="vid",
+                video_url="https://cdn.example/video.mp4",
+            )
+
+        async def account_capabilities(self) -> dict[str, Any]:
+            return {"credits": 95}
+
+    store.get_account = (  # type: ignore[method-assign]
+        lambda _account_id: {"session_available": True}
+    )
+
+    def capture_update(_account_id: str, _advertiser_id: str, **changes: Any):
+        updates.update(changes)
+
+    store.update_subaccount = capture_update  # type: ignore[method-assign]
+    pool._protocol_client = (  # type: ignore[method-assign]
+        lambda _account_id, _advertiser_id=None: FakeProtocol()
+    )
+
+    task = await pool.check_task("task-1")
+    assert task.status == "succeeded"
+    assert updates["credits"] == 95
+    assert isinstance(updates["last_checked_at"], int)
 
 
 def test_admin_account_routes_without_starting_browser(

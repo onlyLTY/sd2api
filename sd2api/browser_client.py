@@ -7,6 +7,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import parse_qs, urlparse
 
 from playwright.async_api import (
     BrowserContext,
@@ -53,10 +54,11 @@ class BrowserJob:
 
 
 class BrowserTikTokClient:
-    """TikTok client that drives a dedicated persistent Chromium profile.
+    """Chromium login bootstrap and legacy UI-generation fallback.
 
-    The profile owns its authentication state. This class intentionally never
-    reads cookies, localStorage, or the browser profile files.
+    After a successful login the pool exports a narrowly scoped, encrypted
+    protocol session. The browser profile remains the recoverable source of
+    truth for re-login, while normal generation can run without Chromium.
     """
 
     def __init__(
@@ -358,6 +360,185 @@ class BrowserTikTokClient:
     async def focus(self) -> None:
         await self.start()
         await self._require_page().bring_to_front()
+
+    async def export_protocol_session(self) -> dict[str, Any]:
+        """Capture the TikTok web session needed by the protocol client.
+
+        The caller must encrypt the returned value before persistence. Only
+        cookies applicable to the configured TikTok origin and the public web
+        device identifier are included; passwords and browser profile files
+        are never read.
+        """
+        context = self._context
+        page = self._require_page()
+        if context is None or not await self._is_logged_in(page):
+            raise TikTokUpstreamError(
+                "TikTok Ads must be logged in before exporting the protocol session",
+                status_code=401,
+                code="browser_login_required",
+            )
+        observed: dict[str, str] = {
+            "device_id": "",
+            "fp_id": "",
+            "sec_ch_ua": "",
+            "sec_ch_ua_mobile": "",
+            "sec_ch_ua_platform": "",
+        }
+
+        def observe_request(request: Any) -> None:
+            try:
+                query = parse_qs(urlparse(request.url).query)
+                for name in ("device_id", "did", "web_id", "webid"):
+                    candidate = str((query.get(name) or [""])[0]).strip()
+                    if len(candidate) >= 8:
+                        observed["device_id"] = candidate
+                        break
+                fp_id = str(request.headers.get("x-fp-id") or "").strip()
+                if fp_id:
+                    observed["fp_id"] = fp_id
+                    observed["sec_ch_ua"] = str(
+                        request.headers.get("sec-ch-ua") or ""
+                    )
+                    observed["sec_ch_ua_mobile"] = str(
+                        request.headers.get("sec-ch-ua-mobile") or ""
+                    )
+                    observed["sec_ch_ua_platform"] = str(
+                        request.headers.get("sec-ch-ua-platform") or ""
+                    )
+            except Exception:
+                # Network observation is a best-effort supplement to browser
+                # storage; it must never make a successful login fail.
+                pass
+
+        page.on("request", observe_request)
+
+        async def read_browser_state() -> dict[str, Any]:
+            value = await page.evaluate(
+                """
+                () => {
+                  const wanted = new Set([
+                    "webid", "web_id", "deviceid", "device_id", "did",
+                    "monitorwebid", "monitor_web_id", "monitordeviceid",
+                    "monitor_device_id"
+                  ].map((key) => key.replace(/[^a-z0-9]/gi, "").toLowerCase()));
+                  const valid = (value) => {
+                    const text = String(value == null ? "" : value).trim();
+                    return text.length >= 8 && text.length <= 128 ? text : "";
+                  };
+                  const find = (value, depth = 0) => {
+                    if (!value || depth > 5 || typeof value !== "object") return "";
+                    for (const [key, child] of Object.entries(value)) {
+                      const normalized = key.replace(/[^a-z0-9]/gi, "").toLowerCase();
+                      if (wanted.has(normalized) && typeof child !== "object") {
+                        const candidate = valid(child);
+                        if (candidate) return candidate;
+                      }
+                    }
+                    for (const child of Object.values(value)) {
+                      const candidate = find(child, depth + 1);
+                      if (candidate) return candidate;
+                    }
+                    return "";
+                  };
+                  const scanStorage = (storage) => {
+                    for (let index = 0; index < storage.length; index += 1) {
+                      const key = storage.key(index) || "";
+                      const raw = storage.getItem(key) || "";
+                      const normalized = key.replace(/[^a-z0-9]/gi, "").toLowerCase();
+                      if (wanted.has(normalized)) {
+                        const candidate = valid(raw);
+                        if (candidate) return candidate;
+                      }
+                      try {
+                        const candidate = find(JSON.parse(raw));
+                        if (candidate) return candidate;
+                      } catch (_) {}
+                    }
+                    return "";
+                  };
+                  const scanUrl = (raw) => {
+                    try {
+                      const url = new URL(raw, location.href);
+                      for (const key of ["device_id", "did", "web_id", "webid"]) {
+                        const candidate = valid(url.searchParams.get(key));
+                        if (candidate) return candidate;
+                      }
+                    } catch (_) {}
+                    return "";
+                  };
+                  let deviceId = scanStorage(localStorage) || scanStorage(sessionStorage);
+                  if (!deviceId) {
+                    for (const entry of performance.getEntriesByType("resource")) {
+                      deviceId = scanUrl(entry.name);
+                      if (deviceId) break;
+                    }
+                  }
+                  if (!deviceId) deviceId = scanUrl(location.href);
+                  if (!deviceId) {
+                    const cookies = Object.fromEntries(document.cookie.split(";").map((item) => {
+                      const position = item.indexOf("=");
+                      return position < 0
+                        ? [item.trim(), ""]
+                        : [item.slice(0, position).trim(), item.slice(position + 1)];
+                    }));
+                    deviceId = find(cookies);
+                  }
+                  return {
+                    device_id: deviceId,
+                    user_agent: navigator.userAgent || "Mozilla/5.0"
+                  };
+                }
+                """
+            )
+            return value if isinstance(value, dict) else {}
+
+        try:
+            browser_state = await read_browser_state()
+            if not browser_state.get("device_id") or not observed["fp_id"]:
+                # A fresh Studio navigation triggers the bootstrap requests
+                # which contain the public web device ID and fingerprint ID.
+                await page.goto(STUDIO_URL, wait_until="domcontentloaded", timeout=90_000)
+                for _ in range(30):
+                    await page.wait_for_timeout(500)
+                    browser_state = await read_browser_state()
+                    if (
+                        (browser_state.get("device_id") or observed["device_id"])
+                        and observed["fp_id"]
+                    ):
+                        break
+        finally:
+            page.remove_listener("request", observe_request)
+        if not isinstance(browser_state, dict):
+            browser_state = {}
+        cookies = await context.cookies([self.settings.tiktok_base_url])
+        device_id = str(browser_state.get("device_id") or observed["device_id"] or "")
+        if not device_id:
+            wanted_cookie_names = {
+                "monitor_device_id", "monitor_web_id", "web_id", "webid",
+                "device_id", "did",
+            }
+            device_id = next(
+                (
+                    str(item.get("value") or "")
+                    for item in cookies
+                    if str(item.get("name") or "").lower() in wanted_cookie_names
+                    and item.get("value")
+                ),
+                "",
+            )
+        return {
+            "version": 3,
+            "captured_at": int(time.time()),
+            "cookies": [dict(item) for item in cookies],
+            "device_id": device_id,
+            "user_agent": str(
+                browser_state.get("user_agent") or self.settings.tiktok_user_agent
+            ),
+            "fp_id": observed["fp_id"],
+            "sec_ch_ua": observed["sec_ch_ua"],
+            "sec_ch_ua_mobile": observed["sec_ch_ua_mobile"],
+            "sec_ch_ua_platform": observed["sec_ch_ua_platform"],
+        }
 
     async def scan_subaccounts(self, *, check_access: bool = True) -> list[dict[str, Any]]:
         """Discover accounts and capabilities through TikTok's JSON control APIs."""
@@ -1186,7 +1367,14 @@ class BrowserTikTokClient:
         current = visible[-1]
         current_text = (await current.inner_text()).strip()
         if target not in current_text:
-            await current.click()
+            try:
+                await current.click(timeout=5_000)
+            except PlaywrightTimeoutError:
+                # The generated-assets overview can briefly overlap the
+                # composer after switching subaccounts. The control itself is
+                # already visible and enabled, so a DOM-level click is safe.
+                await page.keyboard.press("Escape")
+                await current.click(force=True)
             options = page.get_by_text(target, exact=True)
             candidates = [
                 options.nth(index)

@@ -97,7 +97,9 @@ class TaskStore:
                     auto_login INTEGER NOT NULL DEFAULT 1,
                     login_state TEXT NOT NULL DEFAULT 'not_configured',
                     last_login_at INTEGER,
-                    last_login_attempt INTEGER
+                    last_login_attempt INTEGER,
+                    session_ciphertext TEXT,
+                    session_updated_at INTEGER
                 )
                 """
             )
@@ -112,6 +114,8 @@ class TaskStore:
                 "login_state": "TEXT NOT NULL DEFAULT 'not_configured'",
                 "last_login_at": "INTEGER",
                 "last_login_attempt": "INTEGER",
+                "session_ciphertext": "TEXT",
+                "session_updated_at": "INTEGER",
             }
             for name, declaration in migrations.items():
                 if name not in account_columns:
@@ -307,8 +311,10 @@ class TaskStore:
         result["credentials_configured"] = bool(
             result.get("username") and result.get("password_ciphertext")
         )
+        result["session_available"] = bool(result.get("session_ciphertext"))
         if not include_secret:
             result.pop("password_ciphertext", None)
+            result.pop("session_ciphertext", None)
         return result
 
     def get_account(
@@ -341,6 +347,8 @@ class TaskStore:
             "login_state",
             "last_login_at",
             "last_login_attempt",
+            "session_ciphertext",
+            "session_updated_at",
         }
         invalid = set(changes) - allowed
         if invalid:
@@ -373,6 +381,12 @@ class TaskStore:
             "password_ciphertext": str(account["password_ciphertext"]),
             "email_address": str(account.get("email_address") or account["username"]),
         }
+
+    def account_session(self, account_id: str) -> str | None:
+        account = self.get_account(account_id, include_secret=True)
+        if not account or not account.get("session_ciphertext"):
+            return None
+        return str(account["session_ciphertext"])
 
     def delete_account(self, account_id: str) -> bool:
         with self._lock, self._connect() as connection:

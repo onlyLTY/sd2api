@@ -33,6 +33,17 @@ class Settings(BaseSettings):
     sd2api_browser_autostart: bool = False
     sd2api_pool_max_pending: int = Field(default=500, ge=1, le=100000)
     sd2api_pool_start_concurrency: int = Field(default=3, ge=1, le=50)
+    sd2api_protocol_upload_concurrency: int = Field(default=3, ge=1, le=16)
+    sd2api_protocol_direct_upload_bytes: int = Field(
+        default=5 * 1024 * 1024,
+        ge=256 * 1024,
+        le=64 * 1024 * 1024,
+    )
+    sd2api_protocol_slice_bytes: int = Field(
+        default=3 * 1024 * 1024,
+        ge=1024 * 1024,
+        le=32 * 1024 * 1024,
+    )
     sd2api_credential_key: str = ""
     sd2api_auto_login: bool = True
     sd2api_auto_accept_terms: bool = False

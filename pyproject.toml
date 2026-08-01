@@ -9,6 +9,7 @@ description = "TikTok Symphony Seedance web adapter with Seedance and OpenAI-com
 requires-python = ">=3.11"
 dependencies = [
   "cryptography>=45,<47",
+  "curl-cffi>=0.13,<1",
   "fastapi>=0.116,<1",
   "httpx>=0.28,<1",
   "pillow>=11,<13",

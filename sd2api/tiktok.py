@@ -196,11 +196,17 @@ class TikTokClient:
         video_id = _first(draft, ("vid", "videoId", "video_id", "watermarkVid"))
         video_url = self._extract_video_url(draft)
         poster_url = self._extract_poster_url(draft)
-        failed = draft_status in (2, "2", "FAILED", "failed") or render_status in (
-            2,
-            "2",
-            "FAILED",
-            "failed",
+        error_code = _first(draft, ("generateErrorCode", "renderErrorCode", "errorCode"))
+        error_message = _first(
+            draft,
+            ("generateErrorMessage", "renderErrorMessage", "errorMessage", "message"),
+        )
+        failed_values = {-1, "-1", 3, "3", "FAILED", "failed", "FAIL", "fail"}
+        failed = (
+            error_code not in (None, "", 0, "0")
+            or bool(error_message)
+            or draft_status in failed_values
+            or render_status in failed_values
         )
         succeeded = (
             draft_status in (0, "0", "SUCCESS", "success")
@@ -216,11 +222,6 @@ class TikTokClient:
         else:
             status, progress = "running", 50
 
-        error_code = _first(draft, ("generateErrorCode", "renderErrorCode", "errorCode"))
-        error_message = _first(
-            draft,
-            ("generateErrorMessage", "renderErrorMessage", "errorMessage", "message"),
-        )
         result = UpstreamTask(
             id=task_id,
             status=status,
@@ -256,21 +257,28 @@ class TikTokClient:
 
     @staticmethod
     def _extract_video_url(value: Any) -> str | None:
-        candidate = _deep_find(
-            value,
-            {
-                "MainUrl",
-                "MainHTTPUrl",
-                "BackupUrl",
-                "BackupHTTPUrl",
-                "video_url",
-                "videoUrl",
-                "previewLink",
-                "encode_url",
-                "src",
-            },
+        keys = (
+            "MainUrl", "mainUrl", "MainHTTPUrl", "mainHTTPUrl", "BackupUrl",
+            "backupUrl", "BackupHTTPUrl", "backupHTTPUrl", "video_url",
+            "videoUrl", "previewLink", "encode_url", "src",
         )
-        return str(candidate) if isinstance(candidate, str) and candidate.startswith("http") else None
+
+        def find_http(node: Any) -> str | None:
+            if isinstance(node, dict):
+                for key in keys:
+                    candidate = node.get(key)
+                    if isinstance(candidate, str) and candidate.startswith("http"):
+                        return candidate
+                for child in node.values():
+                    if result := find_http(child):
+                        return result
+            elif isinstance(node, list):
+                for child in node:
+                    if result := find_http(child):
+                        return result
+            return None
+
+        return find_http(value)
 
     @staticmethod
     def _extract_poster_url(value: Any) -> str | None:

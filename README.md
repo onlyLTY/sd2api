@@ -5,7 +5,7 @@
 - Seedance / ModelArk 风格：`/api/v3/contents/generations/tasks`
 - OpenAI Videos 风格：`/v1/videos`
 
-网页端实测基线：Dreamina Seedance 2.0、文生视频、单图图生视频与 Reference to video、5 秒；创建成功后异步轮询，最终返回可读取的 TikTok CDN MP4。每次 5 秒测试消耗 5 点，实际完成时间取决于 TikTok 队列。
+协议端实测基线：Dreamina Seedance 2.0 的文生视频、单图图生视频、2 图 + 视频 + 音频的 Reference to video，均使用 5 秒任务完成了素材上传、创建、轮询和原始 MP4 下载。Chromium 只在登录、图形验证码和条款确认时启动；登录完成后生成服务不依赖浏览器 UI。每次 5 秒测试消耗 5 点，实际完成时间取决于 TikTok 队列。
 
 > 这是对 TikTok 网页内部接口的非官方适配器。接口、内部模型 ID 和鉴权字段可能随网页更新而变化。只应用于你有权访问的账号，并遵守 TikTok 的服务条款。`sora-2` 在本项目中只是 OpenAI SDK 兼容别名，实际调用的是账号内的 Dreamina Seedance 2.0，不是 OpenAI 的 Sora 服务。
 
@@ -15,7 +15,7 @@
 
 - 文生视频，Seedance 2.0（已实测）
 - 单张首帧图生视频，Seedance 2.0（已实测）
-- Reference to video：多图片、视频、音频混合参考
+- Reference to video：多图片、视频、音频混合参考（已实测）
 - OpenAI multipart 多文件上传，以及 OpenAI/Seedance 的远程 URL 和图片/音频 data URL
 - Seedance 2.5 内部模型映射（未在本账号实测）
 - 4–15 秒时长
@@ -23,10 +23,10 @@
 - OpenAI 兼容状态对象和 MP4 流式下载
 - SQLite 任务持久化
 - 可选 Bearer API Key
-- 登录账号浏览器 Profile 隔离与中央调度
+- 登录账号浏览器 Profile 隔离、加密协议会话与中央调度
 - 自动发现 Client/Partner 子账号，并由用户选择哪些加入生成池
 - 逐子账号显示 Seedance 2 权限、Credits 和检查错误
-- 不同登录账号并行、同一登录账号下的子账号串行切换
+- 每个子账号独立 CookieJar；同一登录账号下多个已启用子账号也可并发
 
 暂未支持：
 
@@ -43,15 +43,7 @@ python -m pip install -e ".[test]"
 Copy-Item .env.example .env
 ```
 
-编辑 `.env`。在浏览器开发者工具的 Network 中找到一次成功的
-`create_generate_task` 请求，手动复制以下值：
-
-- 完整 `Cookie` 请求头到 `TIKTOK_COOKIE`
-- 如果请求里存在且无法从 Cookie 自动识别，再填写 `x-csrftoken`、`x-creative-csrf-token` 和 `x-fp-id`
-
-`device_id` 不需要也不能单独配置：浏览器池模式由 Chromium 登录会话自行维护；旧的 direct 模式只会尝试从 Cookie 中的会话设备字段自动派生。
-
-不要把 `.env` 发给别人或提交到版本库。浏览器会话过期后需要重新复制。
+推荐设置 `SD2API_MODE=browser_pool`，再通过 `/admin` 添加 TikTok Ads 登录邮箱和密码。程序会在 Chromium 中完成账号密码和邮箱验证码步骤，只把图形验证码交给管理员；登录成功后自动捕获 Cookie、CSRF、fp ID、Client Hints 和 device ID，加密写入 SQLite 并关闭 Chromium。用户不需要查看或填写 Cookie、fp ID、device ID，也不要把 `.env` 发给别人或提交到版本库。
 
 启动：
 
@@ -61,7 +53,7 @@ uvicorn sd2api.main:app --host 127.0.0.1 --port 8765
 
 接口文档：`http://127.0.0.1:8765/docs`
 
-### 不导出 Cookie：持久化浏览器模式
+### 旧 UI 浏览器模式
 
 在 `.env` 中设置：
 
@@ -71,13 +63,13 @@ SD2API_BROWSER_CHANNEL=
 SD2API_BROWSER_PROFILE=.browser-profile
 ```
 
-服务启动后调用 `POST /browser/start`，程序会打开 Playwright 自带的独立 Chromium。只需在这个窗口登录 TikTok Ads；登录状态由 Chromium 自己保存在 `.browser-profile`，适配器不会读取或导出 Cookie。之后 `/v1/videos` 和 Seedance 端点会把任务加入队列并依次操作网页。
+`SD2API_MODE=browser` 保留为 UI 自动化回退模式：调用 `POST /browser/start` 后，任务会依次操作网页。新部署应使用 `browser_pool`，它在登录后将会话加密保存，扫描、上传、生成、轮询和下载都直接调用协议，不受生成页 DOM 变化影响。
 
 浏览器模式的限制：任务串行执行，容易受到网页 UI 更新影响，吞吐量低于直接 HTTP 模式。开发结束后可在该 Chromium 窗口登出；如需彻底移除本地会话，应先停止服务，再手动删除 `.browser-profile`。
 
 ## Docker / VPS 多账号池
 
-Docker 模式在一个容器中运行 API、Chromium、Xvfb 和 noVNC。每个 TikTok Ads 账号使用独立目录 `/data/profiles/{account_id}`，账号注册信息和任务记录存放在 SQLite。无需导出 Cookie。
+Docker 模式在一个容器中运行 API、按需 Chromium、Xvfb 和 noVNC。每个 TikTok Ads 登录账号使用独立 Profile；账号凭据、加密协议会话、子账号选择和任务记录存放在 SQLite。Chromium 登录完成后自动关闭，正常生成时不会常驻，也无需导出 Cookie。
 
 准备配置：
 
@@ -117,7 +109,9 @@ ssh -L 8765:127.0.0.1:8765 -L 6080:127.0.0.1:6080 user@your-vps
 
 推荐在账号池面板中添加账号，只需填写 TikTok Ads 登录邮箱和密码。登录邮箱同时用于接收验证码，内部账号 ID 自动生成；加入号池后可在“编辑”中设置备注名称。密码经 Fernet 加密后才写入 SQLite，管理 API 和面板不会回传密码或密文。容器启动、账号掉线或点击“登录”时会自动执行账号密码登录，并通过 `cf_temp_mail` 的 `GET /api/emails?to_address=...` 获取本次登录产生的邮件验证码（支持纯数字及字母数字验证码）。
 
-登录成功后程序通过 TikTok 的结构化 JSON 接口读取全部 Client/Partner 子账号、Dreamina Seedance 2.0 权限、用户层级与 Credits，不再展开账号菜单或操作模型下拉框。切换账号时只写入 TikTok 前端本身使用的公开账号上下文 `s_aio_client_id`，程序不会读取、导出或要求用户配置登录 Cookie。子账号默认不加入生成池；管理员在面板中勾选一个或多个“SD2 可用”的子账号后才会参与调度。重新扫描会更新名称、权限和 Credits，但保留已有勾选结果。
+登录成功后程序保存加密协议会话，并通过 TikTok 的结构化 JSON 接口读取全部 Client/Partner 子账号、Dreamina Seedance 2.0 权限、用户层级与 Credits，不再展开账号菜单或操作模型下拉框。每个子账号使用独立 CookieJar 和公开账号上下文 `s_aio_client_id`；Cookie、CSRF、fp ID、Client Hints 和 device ID 都从登录会话自动获得，不对管理 API 或用户配置暴露。子账号默认不加入生成池；管理员在面板中勾选一个或多个“SD2 可用”的子账号后才会参与调度。重新扫描会更新名称、权限和 Credits，但保留已有勾选结果。
+
+协议请求由 `curl_cffi` 使用 Chrome TLS/HTTP2 指纹发送；素材上传支持 ImageX/VOD 直传和分片，不需要后台保留 Chromium 进程。会话密文只使用 `SD2API_CREDENTIAL_KEY`（或回退的 Admin Key）解密，管理 API 永远不会返回 Cookie、密码或密文。
 
 图形验证码属于 TikTok 的交互式安全验证：程序会把账号状态标记为 `captcha_required` 并保持对应浏览器页面，管理员通过 noVNC 完成验证后，登录状态机会自动继续邮箱接码和后续登录。自动接码在后台并行进行，管理员仍可手动输入验证码；只要页面进入已登录状态，程序会立即确认成功。登录过程中关闭页面或 Chromium 后，程序最多自动重建三次并复用同一持久化 Profile。项目不包含验证码破解或绕过逻辑。
 
@@ -150,16 +144,16 @@ curl http://127.0.0.1:8765/admin/pool/status \
 
 ### 并发规则
 
-- 一个登录账号同一时间执行一个网页生成任务；其下多个子账号会在任务开始前自动切换，但不会在同一个 Chromium Profile 中并发操作。
-- 不同账号并行执行；10 个在线账号的理论安全并发为 10。
-- 同一登录账号勾选 5 个子账号不会把安全并发从 1 提升到 5；如需并行，必须使用不同登录 Profile。
+- 协议模式不切换网页上下文；每个已启用子账号都有隔离的 CookieJar，可与同一登录账号下的其他子账号并发。
+- `max_parallel` 为当前在线且可用的子账号数；例如一个登录账号启用 5 个有权限的子账号，可并行分配到这 5 个上下文。
+- 素材上传在每个协议客户端内受 `SD2API_PROTOCOL_UPLOAD_CONCURRENCY` 限制；大文件超过 `SD2API_PROTOCOL_DIRECT_UPLOAD_BYTES` 后按 `SD2API_PROTOCOL_SLICE_BYTES` 分片。
 - 调度器按当前负载最小优先分配；同负载时优先 credits 较多的账号，再做轮转。
 - 页面可见 credits 为 0 的账号不会接收新任务；无法读取余额时仍可参与调度。
 - `SD2API_POOL_MAX_PENDING` 限制全池等待与运行任务总量，超限返回 HTTP 429。
-- 容器重启时最多同时启动 `SD2API_POOL_START_CONCURRENCY` 个浏览器，避免大量账号瞬间抢占 CPU 和内存。
+- 容器重启时最多并发验证 `SD2API_POOL_START_CONCURRENCY` 个账号；有效协议会话不会启动浏览器，只有缺失或过期时才拉起对应 Chromium。
 - 已经在 TikTok 页面提交的任务不会自动换号重试，避免重复扣点；账号离线时只会停止接收新任务。
 - 有运行或排队任务的账号不能被停用、停止或删除，管理 API 会返回 HTTP 409。
-- 容器重建不会丢失账号登录 Profile 和已落库任务，但不要在生成过程中重启容器。
+- 容器重建不会丢失账号登录 Profile、加密协议会话和已落库任务；已提交任务可在重启后继续查询。
 
 删除账号管理记录不会删除对应 Profile，响应中的 `profile_retained` 会明确标记这一点。需要彻底移除登录态时，应先停止账号，再由管理员单独清理相应的 volume 目录。
 

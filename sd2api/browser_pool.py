@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from pathlib import Path
 import time
 from typing import Any
@@ -10,6 +11,7 @@ import uuid
 from .browser_client import BrowserTikTokClient
 from .config import Settings
 from .models import UpstreamTask
+from .protocol import ProtocolSession, ProtocolTikTokClient
 from .security import CredentialError, CredentialVault
 from .store import TaskStore
 from .temp_mail import TempMailClient
@@ -24,6 +26,8 @@ class BrowserPoolClient:
         self.settings = settings
         self.store = store
         self._workers: dict[str, BrowserTikTokClient] = {}
+        self._protocol_clients: dict[tuple[str, str | None], ProtocolTikTokClient] = {}
+        self._started_accounts: set[str] = set()
         self._task_accounts: dict[str, str] = {}
         self._task_advertisers: dict[str, str] = {}
         self._scheduler_lock = asyncio.Lock()
@@ -42,6 +46,55 @@ class BrowserPoolClient:
             poll_seconds=self.settings.sd2api_temp_mail_poll_seconds,
             timeout_seconds=self.settings.sd2api_temp_mail_timeout,
         )
+
+    def _protocol_session(self, account_id: str) -> ProtocolSession | None:
+        ciphertext = self.store.account_session(account_id)
+        if not ciphertext:
+            return None
+        try:
+            value = json.loads(self._vault().decrypt(ciphertext))
+            if not isinstance(value, dict):
+                raise ValueError("Session payload is not an object")
+            return ProtocolSession.from_dict(value)
+        except (CredentialError, ValueError, json.JSONDecodeError) as exc:
+            raise TikTokUpstreamError(
+                f"Stored protocol session is unreadable: {exc}",
+                status_code=500,
+                code="protocol_session_invalid",
+            ) from exc
+
+    def _protocol_client(
+        self, account_id: str, advertiser_id: str | None = None
+    ) -> ProtocolTikTokClient:
+        key = (account_id, advertiser_id)
+        client = self._protocol_clients.get(key)
+        if client is not None:
+            return client
+        session = self._protocol_session(account_id)
+        if session is None:
+            raise TikTokUpstreamError(
+                f"Account {account_id!r} has no captured protocol session",
+                status_code=401,
+                code="protocol_login_required",
+            )
+        client = ProtocolTikTokClient(
+            self.settings,
+            session,
+            account_id=account_id,
+            advertiser_id=advertiser_id,
+        )
+        self._protocol_clients[key] = client
+        return client
+
+    async def _close_protocol_clients(self, account_id: str | None = None) -> None:
+        selected = [
+            (key, client)
+            for key, client in self._protocol_clients.items()
+            if account_id is None or key[0] == account_id
+        ]
+        for key, _ in selected:
+            self._protocol_clients.pop(key, None)
+        await asyncio.gather(*(client.close() for _, client in selected), return_exceptions=True)
 
     def _profile_path(self, account_id: str) -> str:
         root = Path(self.settings.sd2api_browser_profile).resolve()
@@ -75,6 +128,24 @@ class BrowserPoolClient:
             )
             self._workers[account_id] = worker
         return worker
+
+    async def _capture_protocol_session(
+        self, account_id: str, worker: BrowserTikTokClient
+    ) -> ProtocolSession:
+        exported = await worker.export_protocol_session()
+        session = ProtocolSession.from_dict(exported)
+        ciphertext = self._vault().encrypt(
+            json.dumps(session.to_dict(), ensure_ascii=False, separators=(",", ":"))
+        )
+        await self._close_protocol_clients(account_id)
+        self.store.update_account(
+            account_id,
+            session_ciphertext=ciphertext,
+            session_updated_at=int(time.time()),
+            login_state="logged_in",
+            last_error=None,
+        )
+        return session
 
     async def start(self) -> dict[str, Any]:
         accounts = [account for account in self.store.list_accounts() if account["enabled"]]
@@ -113,6 +184,8 @@ class BrowserPoolClient:
         workers = list(self._workers.values())
         await asyncio.gather(*(worker.stop() for worker in workers), return_exceptions=True)
         self._workers.clear()
+        await self._close_protocol_clients()
+        self._started_accounts.clear()
 
     async def status(self) -> dict[str, Any]:
         accounts = await self.list_accounts()
@@ -122,12 +195,24 @@ class BrowserPoolClient:
             "accounts": accounts,
             "total": len(accounts),
             "logged_in": sum(bool(account.get("logged_in")) for account in accounts),
-            "running_jobs": sum(bool(account.get("busy")) for account in accounts),
+            "running_jobs": sum(int(account.get("queued", 0)) for account in accounts),
             "queued_jobs": sum(int(account.get("queued", 0)) for account in accounts),
             "max_parallel": sum(
-                bool(account.get("enabled"))
-                and bool(account.get("logged_in"))
-                and any(self._subaccount_eligible(item) for item in account["subaccounts"])
+                (
+                    sum(
+                        self._subaccount_eligible(item)
+                        for item in account["subaccounts"]
+                    )
+                    if account.get("session_available")
+                    else int(
+                        any(
+                            self._subaccount_eligible(item)
+                            for item in account["subaccounts"]
+                        )
+                    )
+                )
+                if account.get("enabled") and account.get("logged_in")
+                else 0
                 for account in accounts
             ),
             "subaccounts": len(subaccounts),
@@ -150,13 +235,41 @@ class BrowserPoolClient:
         for account in self.store.list_accounts():
             worker = self._workers.get(account["id"])
             try:
-                runtime = await worker.status() if worker else self._stopped_runtime(account)
+                if worker:
+                    runtime = await worker.status()
+                elif (
+                    account["id"] in self._started_accounts
+                    and account.get("session_available")
+                ):
+                    protocol_load = sum(
+                        client.load
+                        for (owner, _), client in self._protocol_clients.items()
+                        if owner == account["id"]
+                    )
+                    runtime = {
+                        "running": True,
+                        "browser_running": False,
+                        "backend": "protocol",
+                        "logged_in": True,
+                        "queued": protocol_load,
+                        "busy": protocol_load > 0,
+                        "url": None,
+                        "credits": None,
+                        "login_state": "logged_in",
+                        "login_error": account.get("last_error"),
+                        "last_login_at": account.get("last_login_at"),
+                        "active_advertiser_id": None,
+                    }
+                else:
+                    runtime = self._stopped_runtime(account)
             except Exception as exc:
                 runtime = self._stopped_runtime(
                     account,
                     state="browser_error",
                     error=f"{exc.__class__.__name__}: {exc}",
                 )
+            runtime.setdefault("browser_running", bool(worker))
+            runtime.setdefault("backend", "browser" if worker else "stopped")
             result.append(
                 {
                     **account,
@@ -172,6 +285,8 @@ class BrowserPoolClient:
     ) -> dict[str, Any]:
         return {
             "running": False,
+            "browser_running": False,
+            "backend": "stopped",
             "logged_in": False,
             "queued": 0,
             "busy": False,
@@ -257,13 +372,19 @@ class BrowserPoolClient:
             changes["username"] = username
             # TikTok Ads sends the OTP to the same mailbox used to sign in.
             changes["email_address"] = username
+            changes["session_ciphertext"] = None
+            changes["session_updated_at"] = None
         if password is not None:
             changes["password_ciphertext"] = self._vault().encrypt(password)
             changes["login_state"] = "pending"
             changes["last_error"] = None
+            changes["session_ciphertext"] = None
+            changes["session_updated_at"] = None
         if auto_login is not None:
             changes["auto_login"] = auto_login
         if changes:
+            if "session_ciphertext" in changes:
+                await self._close_protocol_clients(account_id)
             try:
                 self.store.update_account(account_id, **changes)
             except KeyError as exc:
@@ -297,6 +418,64 @@ class BrowserPoolClient:
                 status_code=409,
                 code="account_disabled",
             )
+        self._started_accounts.add(account_id)
+        if account.get("session_available"):
+            try:
+                session = self._protocol_session(account_id)
+                if session is not None and (
+                    not session.device_id
+                    or not session.fp_id
+                    or not session.sec_ch_ua
+                ):
+                    # One-time migration for sessions captured by older builds.
+                    # Reuse the persistent authenticated profile; no password,
+                    # CAPTCHA, or email code should be required.
+                    worker = self._worker(account_id)
+                    await worker.start()
+                    browser_status = await worker.status()
+                    for _ in range(30):
+                        if browser_status["logged_in"]:
+                            break
+                        await asyncio.sleep(0.5)
+                        browser_status = await worker.status()
+                    if not browser_status["logged_in"]:
+                        raise TikTokUpstreamError(
+                            "The saved browser profile must sign in once to capture its web identity",
+                            status_code=401,
+                            code="protocol_identity_missing",
+                        )
+                    session = await self._capture_protocol_session(account_id, worker)
+                    if not session.fp_id:
+                        raise TikTokUpstreamError(
+                            "TikTok did not expose a web fingerprint ID during session capture",
+                            status_code=409,
+                            code="protocol_fp_id_missing",
+                        )
+                    await worker.stop()
+                    self._workers.pop(account_id, None)
+                await self._protocol_client(account_id).validate()
+                self.store.update_account(
+                    account_id,
+                    login_state="logged_in",
+                    last_error=None,
+                )
+                await self.refresh_subaccounts(account_id, check_access=True)
+                return await self.account_status(account_id)
+            except TikTokUpstreamError as exc:
+                if exc.code != "tiktok_authentication_error":
+                    self.store.update_account(
+                        account_id,
+                        last_error=f"Protocol validation failed: {exc}",
+                    )
+                    return await self.account_status(account_id)
+                await self._close_protocol_clients(account_id)
+                self.store.update_account(
+                    account_id,
+                    session_ciphertext=None,
+                    session_updated_at=None,
+                    login_state="pending",
+                    last_error="Stored TikTok session expired; re-login required",
+                )
         try:
             await self._worker(account_id).start()
         except Exception as exc:
@@ -317,6 +496,10 @@ class BrowserPoolClient:
             self._schedule_login(account_id)
         elif status["logged_in"]:
             try:
+                worker = self._worker(account_id)
+                await self._capture_protocol_session(account_id, worker)
+                await worker.stop()
+                self._workers.pop(account_id, None)
                 await self.refresh_subaccounts(account_id, check_access=True)
             except Exception as exc:
                 self.store.update_account(
@@ -338,6 +521,19 @@ class BrowserPoolClient:
             await asyncio.gather(login_task, return_exceptions=True)
             self._login_tasks.pop(account_id, None)
         worker = self._workers.pop(account_id, None)
+        protocol_load = sum(
+            client.load
+            for (owner, _), client in self._protocol_clients.items()
+            if owner == account_id
+        )
+        if protocol_load > 0 and not force:
+            if worker:
+                self._workers[account_id] = worker
+            raise TikTokUpstreamError(
+                f"Account {account_id!r} still has active protocol tasks",
+                status_code=409,
+                code="account_busy",
+            )
         if worker:
             if worker.load > 0 and not force:
                 self._workers[account_id] = worker
@@ -347,6 +543,8 @@ class BrowserPoolClient:
                     code="account_busy",
                 )
             await worker.stop()
+        await self._close_protocol_clients(account_id)
+        self._started_accounts.discard(account_id)
 
     async def focus_account(self, account_id: str) -> dict[str, Any]:
         worker = self._worker(account_id)
@@ -378,6 +576,7 @@ class BrowserPoolClient:
 
     async def _run_login(self, account_id: str) -> None:
         try:
+            self._started_accounts.add(account_id)
             credentials = self.store.account_credentials(account_id)
             if credentials is None:
                 raise CredentialError("This account has no stored username and password")
@@ -402,8 +601,10 @@ class BrowserPoolClient:
                 last_error=None,
             )
             try:
-                discovered = await worker.scan_subaccounts(check_access=True)
-                self.store.upsert_subaccounts(account_id, discovered)
+                await self._capture_protocol_session(account_id, worker)
+                await worker.stop()
+                self._workers.pop(account_id, None)
+                await self.refresh_subaccounts(account_id, check_access=True)
             except Exception as scan_exc:
                 self.store.update_account(
                     account_id,
@@ -439,6 +640,29 @@ class BrowserPoolClient:
                     and account.get("credentials_configured")
                 ):
                     continue
+                if account.get("session_available") and account["id"] in self._started_accounts:
+                    try:
+                        client = self._protocol_client(account["id"])
+                        if client.load == 0:
+                            await client.validate()
+                        continue
+                    except TikTokUpstreamError as exc:
+                        if exc.code != "tiktok_authentication_error":
+                            self.store.update_account(
+                                account["id"],
+                                last_error=f"Protocol status failed: {exc}",
+                            )
+                            continue
+                        await self._close_protocol_clients(account["id"])
+                        self.store.update_account(
+                            account["id"],
+                            session_ciphertext=None,
+                            session_updated_at=None,
+                            login_state="pending",
+                            last_error="TikTok session expired; re-login required",
+                        )
+                        self._schedule_login(account["id"])
+                        continue
                 worker = self._workers.get(account["id"])
                 if worker is None or worker.load > 0:
                     continue
@@ -488,30 +712,48 @@ class BrowserPoolClient:
                 status_code=404,
                 code="account_not_found",
             )
-        worker = self._worker(account_id)
-        if worker.load > 0:
+        active_load = sum(
+            client.load
+            for (owner, _), client in self._protocol_clients.items()
+            if owner == account_id
+        )
+        if active_load > 0:
             raise TikTokUpstreamError(
-                f"Account {account_id!r} is busy and cannot switch subaccounts",
+                f"Account {account_id!r} is busy and cannot refresh subaccounts",
                 status_code=409,
                 code="account_busy",
             )
         try:
-            await worker.start()
-            status = await worker.status()
-        except Exception as exc:
-            raise TikTokUpstreamError(
-                f"Could not open Chromium: {exc.__class__.__name__}: {exc}",
-                status_code=503,
-                code="browser_start_failed",
-            ) from exc
-        if not status["logged_in"]:
-            raise TikTokUpstreamError(
-                f"Account {account_id!r} must be logged in before scanning subaccounts",
-                status_code=401,
-                code="browser_login_required",
-            )
-        try:
-            discovered = await worker.scan_subaccounts(check_access=check_access)
+            root_client = self._protocol_client(account_id)
+            discovered = await root_client.discover_subaccounts()
+            if check_access:
+                async def inspect(item: dict[str, Any]) -> dict[str, Any]:
+                    checked = dict(item)
+                    try:
+                        advertiser_id = str(item["advertiser_id"])
+                        capability = await self._protocol_client(
+                            account_id, advertiser_id
+                        ).account_capabilities()
+                        if capability["advertiser_id"] != advertiser_id:
+                            raise RuntimeError(
+                                "TikTok returned a different subaccount context"
+                            )
+                        checked.update(
+                            credits=capability["credits"],
+                            seedance_access=capability["seedance_access"],
+                            last_error=None,
+                            last_checked_at=int(time.time()),
+                        )
+                    except Exception as exc:
+                        checked.update(
+                            credits=None,
+                            seedance_access=False,
+                            last_error=f"{exc.__class__.__name__}: {exc}",
+                            last_checked_at=int(time.time()),
+                        )
+                    return checked
+
+                discovered = list(await asyncio.gather(*(inspect(item) for item in discovered)))
         except TikTokUpstreamError:
             raise
         except Exception as exc:
@@ -556,7 +798,32 @@ class BrowserPoolClient:
             )
         worker = self._workers.get(account_id)
         try:
-            runtime = await worker.status() if worker else self._stopped_runtime(account)
+            if worker:
+                runtime = await worker.status()
+                runtime.setdefault("browser_running", True)
+                runtime.setdefault("backend", "browser")
+            elif account_id in self._started_accounts and account.get("session_available"):
+                protocol_load = sum(
+                    client.load
+                    for (owner, _), client in self._protocol_clients.items()
+                    if owner == account_id
+                )
+                runtime = {
+                    "running": True,
+                    "browser_running": False,
+                    "backend": "protocol",
+                    "logged_in": True,
+                    "queued": protocol_load,
+                    "busy": protocol_load > 0,
+                    "url": None,
+                    "credits": None,
+                    "login_state": "logged_in",
+                    "login_error": account.get("last_error"),
+                    "last_login_at": account.get("last_login_at"),
+                    "active_advertiser_id": None,
+                }
+            else:
+                runtime = self._stopped_runtime(account)
         except Exception as exc:
             runtime = self._stopped_runtime(
                 account,
@@ -631,8 +898,15 @@ class BrowserPoolClient:
                     status_code=503,
                     code="account_pool_unavailable",
                 )
-            eligible_workers = {status["id"] for status, _ in eligible}
-            total_pending = sum(self._worker(account_id).load for account_id in eligible_workers)
+            def pair_load(pair: tuple[dict[str, Any], dict[str, Any]]) -> int:
+                status, subaccount = pair
+                if status.get("session_available"):
+                    return self._protocol_client(
+                        status["id"], subaccount["advertiser_id"]
+                    ).load
+                return self._worker(status["id"]).load
+
+            total_pending = sum(pair_load(pair) for pair in eligible)
             if total_pending >= self.settings.sd2api_pool_max_pending:
                 raise TikTokUpstreamError(
                     "The browser account pool queue is full",
@@ -642,7 +916,7 @@ class BrowserPoolClient:
             selected_account, selected_subaccount = min(
                 eligible,
                 key=lambda pair: (
-                    self._worker(pair[0]["id"]).load,
+                    pair_load(pair),
                     -int(pair[1]["credits"])
                     if isinstance(pair[1].get("credits"), int)
                     else 1,
@@ -655,30 +929,48 @@ class BrowserPoolClient:
             )
             account_id = selected_account["id"]
             advertiser_id = selected_subaccount["advertiser_id"]
-            worker = self._worker(account_id)
-            if mode == "image":
-                task_id = await worker.create_image_video(
-                    prompt=prompt,
-                    model=model,
-                    duration=duration,
-                    image_path=media[0].path,
-                    advertiser_id=advertiser_id,
-                )
-            elif mode == "reference":
-                task_id = await worker.create_reference_video(
-                    prompt=prompt,
-                    model=model,
-                    duration=duration,
-                    media=media,
-                    advertiser_id=advertiser_id,
-                )
+            protocol_mode = bool(selected_account.get("session_available"))
+            if protocol_mode:
+                target: Any = self._protocol_client(account_id, advertiser_id)
             else:
-                task_id = await worker.create_text_video(
-                    prompt=prompt,
-                    model=model,
-                    duration=duration,
-                    advertiser_id=advertiser_id,
-                )
+                target = self._worker(account_id)
+            try:
+                if mode == "image":
+                    kwargs: dict[str, Any] = {
+                        "prompt": prompt,
+                        "model": model,
+                        "duration": duration,
+                        "image_path": media[0].path,
+                    }
+                    if not protocol_mode:
+                        kwargs["advertiser_id"] = advertiser_id
+                    task_id = await target.create_image_video(**kwargs)
+                elif mode == "reference":
+                    kwargs = {
+                        "prompt": prompt,
+                        "model": model,
+                        "duration": duration,
+                        "media": media,
+                    }
+                    if not protocol_mode:
+                        kwargs["advertiser_id"] = advertiser_id
+                    task_id = await target.create_reference_video(**kwargs)
+                else:
+                    kwargs = {
+                        "prompt": prompt,
+                        "model": model,
+                        "duration": duration,
+                    }
+                    if not protocol_mode:
+                        kwargs["advertiser_id"] = advertiser_id
+                    task_id = await target.create_text_video(**kwargs)
+            finally:
+                if protocol_mode:
+                    upload_root = Path(self.settings.sd2api_upload_dir).resolve()
+                    for item in media:
+                        path = Path(item.path).resolve()
+                        if path.is_relative_to(upload_root):
+                            path.unlink(missing_ok=True)
             self._selection_counter += 1
             self._last_selected[f"{account_id}:{advertiser_id}"] = self._selection_counter
             self._task_accounts[task_id] = account_id
@@ -692,16 +984,39 @@ class BrowserPoolClient:
         return self._task_advertisers.get(task_id)
 
     async def check_task(self, task_id: str) -> UpstreamTask:
-        account_id = self._task_accounts.get(task_id)
+        record = self.store.get(task_id)
+        account_id = self._task_accounts.get(task_id) or (
+            record.account_id if record else None
+        )
         if account_id is None:
             raise TikTokUpstreamError(
                 f"Pool task {task_id!r} is not active in this process",
                 status_code=404,
                 code="task_not_active",
             )
-        task = await self._worker(account_id).check_task(task_id)
-        advertiser_id = self._task_advertisers.get(task_id)
+        advertiser_id = self._task_advertisers.get(task_id) or (
+            record.advertiser_id if record else None
+        )
+        account = self.store.get_account(account_id)
+        protocol_client: ProtocolTikTokClient | None = None
+        if account and account.get("session_available"):
+            protocol_client = self._protocol_client(account_id, advertiser_id)
+            task = await protocol_client.check_task(task_id)
+        else:
+            task = await self._worker(account_id).check_task(task_id)
         credits = task.raw.get("credits") if task.raw else None
+        if (
+            advertiser_id
+            and protocol_client is not None
+            and task.status in {"succeeded", "failed"}
+            and not isinstance(credits, int)
+        ):
+            try:
+                credits = (await protocol_client.account_capabilities())["credits"]
+            except Exception:
+                # Credit refresh is informational and must not turn a valid
+                # task result into an API failure.
+                credits = None
         if advertiser_id and isinstance(credits, int):
             try:
                 self.store.update_subaccount(
@@ -721,4 +1036,17 @@ class BrowserPoolClient:
                 status_code=409,
                 code="task_account_missing",
             )
+        record = next(
+            (
+                item
+                for item in self.store.list(limit=100, account_id=account_id)
+                if item.video_url == video_url
+            ),
+            None,
+        )
+        account = self.store.get_account(account_id)
+        if account and account.get("session_available"):
+            return await self._protocol_client(
+                account_id, record.advertiser_id if record else None
+            ).fetch_video(video_url)
         return await self._worker(account_id).fetch_video(video_url)

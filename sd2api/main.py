@@ -126,8 +126,8 @@ def not_found(task_id: str) -> HTTPException:
     return HTTPException(status_code=404, detail=f"Video task {task_id!r} was not found")
 
 
-async def refresh(record: TaskRecord) -> TaskRecord:
-    if record.status in {"succeeded", "failed"} and record.video_url:
+async def refresh(record: TaskRecord, *, force: bool = False) -> TaskRecord:
+    if not force and record.status in {"succeeded", "failed"} and record.video_url:
         return record
     upstream = await client.check_task(record.id)
     return store.update(
@@ -372,6 +372,8 @@ async def admin_config_status() -> dict[str, Any]:
         "temp_mail_base_url": settings.sd2api_temp_mail_base_url,
         "login_timeout": settings.sd2api_login_timeout,
         "relogin_interval": settings.sd2api_relogin_interval,
+        "protocol_transport": "curl_cffi/chrome",
+        "protocol_upload_concurrency": settings.sd2api_protocol_upload_concurrency,
     }
 
 
@@ -731,7 +733,11 @@ async def download_openai_video(video_id: str) -> Response:
     record = store.get(video_id)
     if record is None:
         raise not_found(video_id)
-    record = await refresh(record)
+    record = await refresh(
+        record,
+        force=isinstance(client, BrowserPoolClient)
+        and not record.id.startswith("browser_"),
+    )
     if record.status != "succeeded":
         raise HTTPException(status_code=409, detail=f"Video is {openai_status(record.status)}")
     if not record.video_url:
