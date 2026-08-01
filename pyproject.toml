@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "TikTok Symphony Seedance web adapter with Seedance and OpenAI-compatible video APIs"
 requires-python = ">=3.11"
 dependencies = [
+  "cryptography>=45,<47",
   "fastapi>=0.116,<1",
   "httpx>=0.28,<1",
   "pillow>=11,<13",
@@ -25,6 +26,9 @@ test = [
 
 [tool.setuptools.packages.find]
 include = ["sd2api*"]
+
+[tool.setuptools.package-data]
+sd2api = ["static/*.html"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -8,11 +8,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from playwright.async_api import BrowserContext, Page, Playwright, async_playwright
+from playwright.async_api import BrowserContext, Frame, Page, Playwright, async_playwright
 
 from .config import Settings
 from .models import UpstreamTask
 from .tiktok import T2V_MODELS, TikTokUpstreamError
+from .temp_mail import TempMailClient, TempMailError
 from .uploads import StagedMedia
 
 
@@ -57,7 +58,11 @@ class BrowserTikTokClient:
         self._worker: asyncio.Task[None] | None = None
         self._tasks: dict[str, UpstreamTask] = {}
         self._start_lock = asyncio.Lock()
+        self._login_lock = asyncio.Lock()
         self._running_job = False
+        self._login_state = "not_logged_in"
+        self._login_error: str | None = None
+        self._last_login_at: int | None = None
 
     async def start(self) -> dict[str, Any]:
         async with self._start_lock:
@@ -105,8 +110,13 @@ class BrowserTikTokClient:
                 "queued": self._queue.qsize(),
                 "busy": self._running_job,
                 "credits": None,
+                "login_state": self._login_state,
+                "login_error": self._login_error,
+                "last_login_at": self._last_login_at,
             }
         logged_in = await self._is_logged_in(self._page)
+        if logged_in and self._login_state != "logging_in":
+            self._set_login_state("logged_in")
         credits = await self._visible_credits(self._page) if logged_in else None
         return {
             "running": True,
@@ -116,6 +126,9 @@ class BrowserTikTokClient:
             "busy": self._running_job,
             "account_id": self.account_id,
             "credits": credits,
+            "login_state": self._login_state,
+            "login_error": self._login_error,
+            "last_login_at": self._last_login_at,
         }
 
     @property
@@ -250,6 +263,109 @@ class BrowserTikTokClient:
     async def focus(self) -> None:
         await self.start()
         await self._require_page().bring_to_front()
+
+    async def login(
+        self,
+        *,
+        username: str,
+        password: str,
+        email_address: str,
+        mail_client: TempMailClient,
+    ) -> dict[str, Any]:
+        """Log in using stored credentials, pausing for a human CAPTCHA when required."""
+        async with self._login_lock:
+            await self.start()
+            page = self._require_page()
+            if await self._is_logged_in(page):
+                self._last_login_at = int(time.time())
+                self._set_login_state("logged_in")
+                return await self.status()
+
+            started_at = time.time()
+            deadline = time.monotonic() + self.settings.sd2api_login_timeout
+            self._set_login_state("opening_login")
+            await page.goto(STUDIO_URL, wait_until="domcontentloaded", timeout=90_000)
+            await page.wait_for_timeout(2_000)
+
+            try:
+                self._set_login_state("entering_credentials")
+                await self._open_password_login(page)
+                username_input = await self._wait_for_visible(
+                    page,
+                    (
+                        'input[type="email"]',
+                        'input[name*="email" i]',
+                        'input[name*="username" i]',
+                        'input[autocomplete="username"]',
+                    ),
+                    timeout=30,
+                )
+                await username_input.fill(username)
+
+                password_input = await self._first_visible(
+                    page,
+                    ('input[type="password"]', 'input[autocomplete="current-password"]'),
+                )
+                if password_input is None:
+                    await self._click_login_action(
+                        page, re.compile(r"^(Continue|Next|继续|下一步)$", re.I)
+                    )
+                    password_input = await self._wait_for_visible(
+                        page,
+                        ('input[type="password"]', 'input[autocomplete="current-password"]'),
+                        timeout=30,
+                    )
+                await password_input.fill(password)
+                await self._click_login_action(
+                    page, re.compile(r"^(Log in|Sign in|Continue|登录|登入|继续)$", re.I)
+                )
+
+                code_submitted = False
+                while time.monotonic() < deadline:
+                    await page.wait_for_timeout(1_500)
+                    if await self._is_logged_in(page):
+                        self._last_login_at = int(time.time())
+                        self._set_login_state("logged_in")
+                        return await self.status()
+                    invalid = await self._login_error_text(page)
+                    if invalid:
+                        raise RuntimeError(invalid)
+                    if await self._captcha_visible(page):
+                        self._set_login_state("captcha_required")
+                        continue
+
+                    code_inputs = await self._visible_code_inputs(page)
+                    if code_inputs and not code_submitted:
+                        if not mail_client.configured:
+                            raise RuntimeError(
+                                "Email verification is required, but cf_temp_mail is not configured"
+                            )
+                        self._set_login_state("waiting_email_code")
+                        try:
+                            code = await mail_client.wait_for_code(
+                                to_address=email_address,
+                                since=started_at,
+                            )
+                        except TempMailError as exc:
+                            raise RuntimeError(str(exc)) from exc
+                        self._set_login_state("submitting_email_code")
+                        await self._fill_code_inputs(code_inputs, code)
+                        await self._click_login_action(
+                            page,
+                            re.compile(
+                                r"^(Verify|Confirm|Continue|Submit|验证|确认|继续|提交)$",
+                                re.I,
+                            ),
+                        )
+                        code_submitted = True
+                        continue
+                    self._set_login_state("waiting_for_login")
+                raise RuntimeError(
+                    f"TikTok login did not finish within {self.settings.sd2api_login_timeout} seconds"
+                )
+            except Exception as exc:
+                self._set_login_state("login_failed", str(exc))
+                raise
 
     async def diagnostics(self, *, open_generation_menu: bool = False) -> dict[str, Any]:
         """Return visible page labels without reading browser authentication storage."""
@@ -636,6 +752,156 @@ class BrowserTikTokClient:
             video = videos.nth(index)
             if await video.get_attribute("src") == source:
                 return await video.get_attribute("poster")
+        return None
+
+    def _set_login_state(self, state: str, error: str | None = None) -> None:
+        self._login_state = state
+        self._login_error = error
+
+    @staticmethod
+    def _search_frames(page: Page) -> list[Frame]:
+        return list(page.frames)
+
+    @classmethod
+    async def _first_visible(cls, page: Page, selectors: tuple[str, ...]):
+        for frame in cls._search_frames(page):
+            for selector in selectors:
+                locator = frame.locator(selector)
+                for index in range(await locator.count()):
+                    candidate = locator.nth(index)
+                    if await candidate.is_visible():
+                        return candidate
+        return None
+
+    @classmethod
+    async def _wait_for_visible(
+        cls,
+        page: Page,
+        selectors: tuple[str, ...],
+        *,
+        timeout: int,
+    ):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            candidate = await cls._first_visible(page, selectors)
+            if candidate is not None:
+                return candidate
+            await page.wait_for_timeout(500)
+        raise RuntimeError(f"Could not find a visible login field matching {selectors!r}")
+
+    @classmethod
+    async def _open_password_login(cls, page: Page) -> None:
+        patterns = (
+            re.compile(r"Use (?:phone|email|username)", re.I),
+            re.compile(r"Log in with (?:email|username)", re.I),
+            re.compile(r"Email / Username", re.I),
+            re.compile(r"邮箱|用户名|账号密码"),
+        )
+        for frame in cls._search_frames(page):
+            for pattern in patterns:
+                candidate = frame.get_by_text(pattern)
+                for index in range(await candidate.count()):
+                    item = candidate.nth(index)
+                    if await item.is_visible():
+                        await item.click()
+                        await page.wait_for_timeout(750)
+                        return
+
+    @classmethod
+    async def _click_login_action(cls, page: Page, pattern: re.Pattern[str]) -> None:
+        for frame in cls._search_frames(page):
+            buttons = frame.get_by_role("button", name=pattern)
+            for index in range(await buttons.count()):
+                button = buttons.nth(index)
+                if await button.is_visible() and await button.is_enabled():
+                    await button.click()
+                    return
+        submit = await cls._first_visible(page, ('button[type="submit"]', 'input[type="submit"]'))
+        if submit is None:
+            raise RuntimeError(f"Could not find a login action matching {pattern.pattern!r}")
+        await submit.click()
+
+    @classmethod
+    async def _captcha_visible(cls, page: Page) -> bool:
+        for frame in cls._search_frames(page):
+            if "captcha" in frame.url.lower():
+                return True
+            candidates = frame.locator(
+                '[class*="captcha" i]:visible, [id*="captcha" i]:visible, '
+                'iframe[src*="captcha" i]:visible'
+            )
+            if await candidates.count():
+                return True
+            try:
+                text = (await frame.locator("body").inner_text()).lower()
+            except Exception:
+                continue
+            if any(
+                token in text
+                for token in (
+                    "drag the slider",
+                    "select 2 objects",
+                    "complete the verification",
+                    "security verification",
+                    "安全验证",
+                    "请完成验证",
+                    "拖动滑块",
+                    "图形验证码",
+                )
+            ):
+                return True
+        return False
+
+    @classmethod
+    async def _visible_code_inputs(cls, page: Page) -> list[Any]:
+        selectors = (
+            'input[autocomplete="one-time-code"]',
+            'input[name*="code" i]',
+            'input[placeholder*="code" i]',
+            'input[placeholder*="验证码"]',
+            'input[inputmode="numeric"]',
+        )
+        result: list[Any] = []
+        for frame in cls._search_frames(page):
+            for selector in selectors:
+                inputs = frame.locator(selector)
+                for index in range(await inputs.count()):
+                    item = inputs.nth(index)
+                    if await item.is_visible() and item not in result:
+                        result.append(item)
+                if result:
+                    return result
+        return result
+
+    @staticmethod
+    async def _fill_code_inputs(inputs: list[Any], code: str) -> None:
+        if len(inputs) == 1:
+            await inputs[0].fill(code)
+            return
+        if len(inputs) < len(code):
+            raise RuntimeError("TikTok verification form has fewer fields than the received code")
+        for field, digit in zip(inputs, code, strict=False):
+            await field.fill(digit)
+
+    @classmethod
+    async def _login_error_text(cls, page: Page) -> str | None:
+        patterns = (
+            "incorrect password",
+            "invalid password",
+            "account doesn't exist",
+            "too many attempts",
+            "密码错误",
+            "账号不存在",
+            "尝试次数过多",
+        )
+        for frame in cls._search_frames(page):
+            try:
+                text = (await frame.locator("body").inner_text()).lower()
+            except Exception:
+                continue
+            for pattern in patterns:
+                if pattern in text:
+                    return f"TikTok login rejected the account: {pattern}"
         return None
 
     @staticmethod

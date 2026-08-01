@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+import time
 from typing import Any
 
 from .browser_client import BrowserTikTokClient
 from .config import Settings
 from .models import UpstreamTask
+from .security import CredentialError, CredentialVault
 from .store import TaskStore
+from .temp_mail import TempMailClient
 from .tiktok import TikTokUpstreamError
 from .uploads import StagedMedia
 
@@ -23,6 +26,19 @@ class BrowserPoolClient:
         self._scheduler_lock = asyncio.Lock()
         self._last_selected: dict[str, int] = {}
         self._selection_counter = 0
+        self._login_tasks: dict[str, asyncio.Task[None]] = {}
+        self._monitor_task: asyncio.Task[None] | None = None
+
+    def _vault(self) -> CredentialVault:
+        return CredentialVault(self.settings.credential_master_key)
+
+    def _mail_client(self) -> TempMailClient:
+        return TempMailClient(
+            base_url=self.settings.sd2api_temp_mail_base_url,
+            api_key=self.settings.sd2api_temp_mail_api_key,
+            poll_seconds=self.settings.sd2api_temp_mail_poll_seconds,
+            timeout_seconds=self.settings.sd2api_temp_mail_timeout,
+        )
 
     def _profile_path(self, account_id: str) -> str:
         root = Path(self.settings.sd2api_browser_profile).resolve()
@@ -64,9 +80,22 @@ class BrowserPoolClient:
             for account, result in zip(accounts, results, strict=True)
             if isinstance(result, Exception)
         }
+        if self._monitor_task is None:
+            self._monitor_task = asyncio.create_task(
+                self._login_monitor_loop(), name="sd2api-account-login-monitor"
+            )
         return {"mode": "browser_pool", "accounts": await self.list_accounts(), "errors": errors}
 
     async def stop(self) -> None:
+        if self._monitor_task:
+            self._monitor_task.cancel()
+            await asyncio.gather(self._monitor_task, return_exceptions=True)
+            self._monitor_task = None
+        login_tasks = list(self._login_tasks.values())
+        for task in login_tasks:
+            task.cancel()
+        await asyncio.gather(*login_tasks, return_exceptions=True)
+        self._login_tasks.clear()
         workers = list(self._workers.values())
         await asyncio.gather(*(worker.stop() for worker in workers), return_exceptions=True)
         self._workers.clear()
@@ -84,6 +113,14 @@ class BrowserPoolClient:
                 bool(account.get("enabled")) and bool(account.get("logged_in"))
                 for account in accounts
             ),
+            "logging_in": sum(
+                account.get("login_state")
+                in {"opening_login", "entering_credentials", "waiting_for_login", "waiting_email_code", "submitting_email_code"}
+                for account in accounts
+            ),
+            "captcha_required": sum(
+                account.get("login_state") == "captcha_required" for account in accounts
+            ),
         }
 
     async def list_accounts(self) -> list[dict[str, Any]]:
@@ -97,13 +134,36 @@ class BrowserPoolClient:
                 "busy": False,
                 "url": None,
                 "credits": None,
+                "login_state": account.get("login_state", "not_started"),
+                "login_error": account.get("last_error"),
+                "last_login_at": account.get("last_login_at"),
             }
             result.append({**account, **runtime})
         return result
 
-    async def add_account(self, *, account_id: str, name: str, start: bool) -> dict[str, Any]:
+    async def add_account(
+        self,
+        *,
+        account_id: str,
+        name: str,
+        start: bool,
+        username: str | None = None,
+        password: str | None = None,
+        email_address: str | None = None,
+        auto_login: bool = True,
+    ) -> dict[str, Any]:
+        password_ciphertext = None
+        if username and password:
+            password_ciphertext = self._vault().encrypt(password)
         try:
-            self.store.create_account(account_id=account_id, name=name)
+            self.store.create_account(
+                account_id=account_id,
+                name=name,
+                username=username,
+                password_ciphertext=password_ciphertext,
+                email_address=email_address or username,
+                auto_login=auto_login,
+            )
         except Exception as exc:
             if self.store.get_account(account_id) is not None:
                 raise TikTokUpstreamError(
@@ -117,7 +177,15 @@ class BrowserPoolClient:
         return await self.account_status(account_id)
 
     async def update_account(
-        self, account_id: str, *, name: str | None = None, enabled: bool | None = None
+        self,
+        account_id: str,
+        *,
+        name: str | None = None,
+        enabled: bool | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        email_address: str | None = None,
+        auto_login: bool | None = None,
     ) -> dict[str, Any]:
         if enabled is False:
             await self.stop_account(account_id)
@@ -126,6 +194,16 @@ class BrowserPoolClient:
             changes["name"] = name
         if enabled is not None:
             changes["enabled"] = enabled
+        if username is not None:
+            changes["username"] = username
+        if password is not None:
+            changes["password_ciphertext"] = self._vault().encrypt(password)
+            changes["login_state"] = "pending"
+            changes["last_error"] = None
+        if email_address is not None:
+            changes["email_address"] = email_address
+        if auto_login is not None:
+            changes["auto_login"] = auto_login
         if changes:
             try:
                 self.store.update_account(account_id, **changes)
@@ -161,9 +239,28 @@ class BrowserPoolClient:
                 code="account_disabled",
             )
         await self._worker(account_id).start()
-        return await self.account_status(account_id)
+        status = await self.account_status(account_id)
+        if (
+            self.settings.sd2api_auto_login
+            and account.get("auto_login")
+            and account.get("credentials_configured")
+            and not status["logged_in"]
+        ):
+            self._schedule_login(account_id)
+        return status
 
     async def stop_account(self, account_id: str, *, force: bool = False) -> None:
+        login_task = self._login_tasks.get(account_id)
+        if login_task and not login_task.done():
+            if not force:
+                raise TikTokUpstreamError(
+                    f"Account {account_id!r} is currently logging in",
+                    status_code=409,
+                    code="account_login_busy",
+                )
+            login_task.cancel()
+            await asyncio.gather(login_task, return_exceptions=True)
+            self._login_tasks.pop(account_id, None)
         worker = self._workers.pop(account_id, None)
         if worker:
             if worker.load > 0 and not force:
@@ -179,6 +276,82 @@ class BrowserPoolClient:
         worker = self._worker(account_id)
         await worker.focus()
         return await self.account_status(account_id)
+
+    async def login_account(self, account_id: str, *, wait: bool = False) -> dict[str, Any]:
+        task = self._schedule_login(account_id)
+        if wait:
+            await task
+        return await self.account_status(account_id)
+
+    def _schedule_login(self, account_id: str) -> asyncio.Task[None]:
+        current = self._login_tasks.get(account_id)
+        if current and not current.done():
+            return current
+        task = asyncio.create_task(
+            self._run_login(account_id), name=f"sd2api-login-{account_id}"
+        )
+        self._login_tasks[account_id] = task
+        return task
+
+    async def _run_login(self, account_id: str) -> None:
+        try:
+            credentials = self.store.account_credentials(account_id)
+            if credentials is None:
+                raise CredentialError("This account has no stored username and password")
+            password = self._vault().decrypt(credentials["password_ciphertext"])
+            self.store.update_account(
+                account_id,
+                login_state="logging_in",
+                last_login_attempt=int(time.time()),
+                last_error=None,
+            )
+            worker = self._worker(account_id)
+            result = await worker.login(
+                username=credentials["username"],
+                password=password,
+                email_address=credentials["email_address"],
+                mail_client=self._mail_client(),
+            )
+            self.store.update_account(
+                account_id,
+                login_state=str(result.get("login_state") or "logged_in"),
+                last_login_at=int(time.time()),
+                last_error=None,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            try:
+                self.store.update_account(
+                    account_id,
+                    login_state="login_failed",
+                    last_error=f"{exc.__class__.__name__}: {exc}",
+                )
+            except KeyError:
+                pass
+        finally:
+            current = self._login_tasks.get(account_id)
+            if current is asyncio.current_task():
+                self._login_tasks.pop(account_id, None)
+
+    async def _login_monitor_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.settings.sd2api_relogin_interval)
+            if not self.settings.sd2api_auto_login:
+                continue
+            for account in self.store.list_accounts():
+                if not (
+                    account["enabled"]
+                    and account.get("auto_login")
+                    and account.get("credentials_configured")
+                ):
+                    continue
+                worker = self._workers.get(account["id"])
+                if worker is None or worker.load > 0:
+                    continue
+                status = await worker.status()
+                if not status["logged_in"]:
+                    self._schedule_login(account["id"])
 
     async def diagnostics(
         self, *, account_id: str | None = None, open_generation_menu: bool = False
@@ -212,6 +385,9 @@ class BrowserPoolClient:
                 "busy": False,
                 "url": None,
                 "credits": None,
+                "login_state": account.get("login_state", "not_started"),
+                "login_error": account.get("last_error"),
+                "last_login_at": account.get("last_login_at"),
         }
         return {**account, **runtime}
 

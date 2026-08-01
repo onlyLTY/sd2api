@@ -5,6 +5,7 @@ import base64
 import json
 from io import BytesIO
 from pathlib import Path
+from datetime import datetime, timezone
 import wave
 
 import httpx
@@ -15,7 +16,9 @@ from PIL import Image
 from sd2api.config import Settings
 from sd2api.browser_pool import BrowserPoolClient
 from sd2api.models import UpstreamTask
+from sd2api.security import CredentialError, CredentialVault
 from sd2api.store import TaskStore
+from sd2api.temp_mail import TempMailClient
 from sd2api.tiktok import TikTokClient, TikTokUpstreamError
 from sd2api.uploads import StagedMedia, UploadManager
 
@@ -59,6 +62,75 @@ def test_store_round_trip(tmp_path: Path) -> None:
     assert account["enabled"] is True
     assert store.update_account("account-a", enabled=False)["enabled"] is False
     assert store.list_accounts()[0]["id"] == "account-a"
+
+
+def test_credential_vault_and_store_do_not_expose_password(tmp_path: Path) -> None:
+    vault = CredentialVault("a-long-admin-key-for-tests")
+    encrypted = vault.encrypt("correct horse battery staple")
+    assert encrypted != "correct horse battery staple"
+    assert vault.decrypt(encrypted) == "correct horse battery staple"
+    with pytest.raises(CredentialError):
+        CredentialVault("a-different-long-test-key").decrypt(encrypted)
+
+    store = TaskStore(str(tmp_path / "credentials.db"))
+    account = store.create_account(
+        account_id="secure",
+        name="Secure account",
+        username="user@example.com",
+        password_ciphertext=encrypted,
+        email_address="codes@example.com",
+    )
+    assert account["credentials_configured"] is True
+    assert "password_ciphertext" not in account
+    assert store.account_credentials("secure") == {
+        "username": "user@example.com",
+        "password_ciphertext": encrypted,
+        "email_address": "codes@example.com",
+    }
+
+
+@pytest.mark.asyncio
+async def test_temp_mail_client_reads_tiktok_verification_code() -> None:
+    requested: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    {
+                        "id": "mail-1",
+                        "sender": "TikTok Business <notice@tiktok.com>",
+                        "subject": "Your verification code",
+                        "receivedAt": datetime.now(timezone.utc).isoformat(),
+                        "verificationCode": "654321",
+                    }
+                ]
+            },
+        )
+
+    client = TempMailClient(
+        base_url="https://mail.example",
+        api_key="mail-secret",
+        poll_seconds=0.01,
+        timeout_seconds=1,
+        transport=httpx.MockTransport(handler),
+    )
+    code = await client.wait_for_code(to_address="login@example.com", since=0)
+    assert code == "654321"
+    assert requested[0].url.params["to_address"] == "login@example.com"
+    assert requested[0].headers["authorization"] == "Bearer mail-secret"
+
+
+def test_temp_mail_client_extracts_code_from_chinese_message() -> None:
+    code = TempMailClient._extract_code(
+        {
+            "subject": "TikTok 登录验证",
+            "textBody": "你的验证码是 482731，请勿向他人透露。",
+        }
+    )
+    assert code == "482731"
 
 
 @pytest.mark.asyncio
@@ -406,7 +478,10 @@ def test_admin_account_routes_without_starting_browser(
 
     pool_store = TaskStore(str(tmp_path / "admin.db"))
     pool = BrowserPoolClient(
-        Settings(sd2api_browser_profile=str(tmp_path / "profiles")),
+        Settings(
+            sd2api_browser_profile=str(tmp_path / "profiles"),
+            sd2api_admin_key="test-admin-key-at-least-16-characters",
+        ),
         pool_store,
     )
     monkeypatch.setattr(main, "store", pool_store)
@@ -423,9 +498,30 @@ def test_admin_account_routes_without_starting_browser(
     )
     listed = api.get("/admin/accounts", headers=headers)
     status = api.get("/admin/pool/status", headers=headers)
+    dashboard = api.get("/admin")
+    secured = api.post(
+        "/admin/accounts",
+        headers=headers,
+        json={
+            "id": "account_secure",
+            "name": "Secure account",
+            "username": "login@example.com",
+            "password": "not-stored-in-plain-text",
+            "email_address": "codes@example.com",
+            "start": False,
+        },
+    )
 
     assert created.status_code == 200
     assert created.json()["id"] == "account_001"
     assert created.json()["running"] is False
     assert listed.json()["data"][0]["name"] == "Main account"
     assert status.json()["max_parallel"] == 0
+    assert dashboard.status_code == 200
+    assert "TikTok Ads 账号池" in dashboard.text
+    assert secured.status_code == 200
+    assert secured.json()["credentials_configured"] is True
+    assert "password_ciphertext" not in secured.json()
+    stored = pool_store.get_account("account_secure", include_secret=True)
+    assert stored is not None
+    assert stored["password_ciphertext"] != "not-stored-in-plain-text"

@@ -34,6 +34,14 @@ class Settings(BaseSettings):
     sd2api_browser_autostart: bool = False
     sd2api_pool_max_pending: int = Field(default=500, ge=1, le=100000)
     sd2api_pool_start_concurrency: int = Field(default=3, ge=1, le=50)
+    sd2api_credential_key: str = ""
+    sd2api_auto_login: bool = True
+    sd2api_login_timeout: int = Field(default=600, ge=60, le=3600)
+    sd2api_relogin_interval: int = Field(default=300, ge=30, le=86400)
+    sd2api_temp_mail_base_url: str = ""
+    sd2api_temp_mail_api_key: str = ""
+    sd2api_temp_mail_poll_seconds: float = Field(default=3.0, ge=1, le=30)
+    sd2api_temp_mail_timeout: int = Field(default=180, ge=30, le=900)
     sd2api_upload_dir: str = "uploads"
     sd2api_upload_max_bytes: int = Field(
         default=200 * 1024 * 1024,
@@ -56,6 +64,10 @@ class Settings(BaseSettings):
         le=100 * 1024 * 1024,
     )
     sd2api_upload_max_pixels: int = Field(default=40_000_000, ge=1_000_000, le=200_000_000)
+
+    @property
+    def credential_master_key(self) -> str:
+        return self.sd2api_credential_key or self.sd2api_admin_key
 
     @property
     def cookie_values(self) -> dict[str, str]:

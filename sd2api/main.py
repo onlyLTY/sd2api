@@ -4,12 +4,14 @@ import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 import logging
+from pathlib import Path
 from typing import Any, Literal
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse
 from pydantic import ValidationError
 from starlette.datastructures import UploadFile
 
@@ -18,6 +20,7 @@ from .browser_client import BrowserTikTokClient
 from .browser_pool import BrowserPoolClient
 from .models import (
     AccountCreateRequest,
+    AccountLoginRequest,
     AccountUpdateRequest,
     AudioURLContent,
     ImageURLContent,
@@ -200,6 +203,11 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/admin", include_in_schema=False)
+async def admin_dashboard() -> FileResponse:
+    return FileResponse(Path(__file__).with_name("static") / "admin.html")
+
+
 @app.post("/browser/start", dependencies=[Depends(require_admin_key)])
 async def start_browser() -> dict[str, Any]:
     if not isinstance(client, (BrowserTikTokClient, BrowserPoolClient)):
@@ -256,6 +264,10 @@ async def add_pool_account(body: AccountCreateRequest) -> dict[str, Any]:
         account_id=body.id,
         name=body.name,
         start=body.start,
+        username=body.username,
+        password=body.password.get_secret_value() if body.password else None,
+        email_address=body.email_address,
+        auto_login=body.auto_login,
     )
 
 
@@ -270,6 +282,10 @@ async def update_pool_account(account_id: str, body: AccountUpdateRequest) -> di
         account_id,
         name=body.name,
         enabled=body.enabled,
+        username=body.username,
+        password=body.password.get_secret_value() if body.password else None,
+        email_address=body.email_address,
+        auto_login=body.auto_login,
     )
 
 
@@ -297,6 +313,31 @@ async def stop_pool_account(account_id: str) -> dict[str, bool]:
 @app.post("/admin/accounts/{account_id}/focus", dependencies=[Depends(require_admin_key)])
 async def focus_pool_account(account_id: str) -> dict[str, Any]:
     return await require_pool().focus_account(account_id)
+
+
+@app.post(
+    "/admin/accounts/{account_id}/login",
+    dependencies=[Depends(require_admin_key)],
+)
+async def login_pool_account(
+    account_id: str, body: AccountLoginRequest
+) -> dict[str, Any]:
+    return await require_pool().login_account(account_id, wait=body.wait)
+
+
+@app.get("/admin/config/status", dependencies=[Depends(require_admin_key)])
+async def admin_config_status() -> dict[str, Any]:
+    return {
+        "mode": settings.sd2api_mode,
+        "auto_login": settings.sd2api_auto_login,
+        "credential_encryption": bool(settings.credential_master_key),
+        "temp_mail_configured": bool(
+            settings.sd2api_temp_mail_base_url and settings.sd2api_temp_mail_api_key
+        ),
+        "temp_mail_base_url": settings.sd2api_temp_mail_base_url,
+        "login_timeout": settings.sd2api_login_timeout,
+        "relogin_interval": settings.sd2api_relogin_interval,
+    }
 
 
 @app.get("/admin/pool/status", dependencies=[Depends(require_admin_key)])

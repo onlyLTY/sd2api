@@ -82,12 +82,15 @@ Docker 模式在一个容器中运行 API、Chromium、Xvfb 和 noVNC。每个 T
 cp .env.docker.example .env.docker
 ```
 
-至少修改这三个密码：
+至少修改这些值：
 
 ```dotenv
 SD2API_API_KEY=调用视频 API 的长随机密钥
 SD2API_ADMIN_KEY=管理账号池的另一条长随机密钥
 NOVNC_PASSWORD=noVNC 登录密码
+SD2API_CREDENTIAL_KEY=用于加密账号密码的长期随机密钥
+SD2API_TEMP_MAIL_BASE_URL=https://你的-cf_temp_mail-worker
+SD2API_TEMP_MAIL_API_KEY=cf_temp_mail 的 API_SECRET
 ```
 
 启动：
@@ -105,19 +108,24 @@ ssh -L 8765:127.0.0.1:8765 -L 6080:127.0.0.1:6080 user@your-vps
 
 然后打开：
 
+- 账号池面板：`http://127.0.0.1:8765/admin`
 - noVNC：`http://127.0.0.1:6080/vnc.html?autoconnect=1&resize=scale`
 - API 文档：`http://127.0.0.1:8765/docs`
 
-添加第一个账号：
+推荐在账号池面板中添加账号，填写 TikTok Ads 账号、密码和接码邮箱。密码经 Fernet 加密后才写入 SQLite，管理 API 和面板不会回传密码或密文。容器启动、账号掉线或点击“登录”时会自动执行账号密码登录，并通过 `cf_temp_mail` 的 `GET /api/emails?to_address=...` 获取本次登录产生的邮件验证码。
+
+图形验证码属于 TikTok 的交互式安全验证：程序会把账号状态标记为 `captcha_required` 并保持对应浏览器页面，管理员通过 noVNC 完成验证后，登录状态机会自动继续邮箱接码和后续登录。项目不包含验证码破解或绕过逻辑。
+
+也可以通过 API 添加账号：
 
 ```bash
 curl -X POST http://127.0.0.1:8765/admin/accounts \
   -H "Authorization: Bearer $SD2API_ADMIN_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"id":"account_001","name":"Main account","start":true}'
+  -d '{"id":"account_001","name":"Main account","username":"login@example.com","password":"your-password","email_address":"login@example.com","auto_login":true,"start":true}'
 ```
 
-noVNC 桌面会出现这个账号的 Chromium 窗口。在窗口中完成 TikTok Ads 登录。继续添加 `account_002`、`account_003` 即可；底部任务栏用于切换窗口，也可以调用聚焦端点：
+为避免密码进入 shell history，实际部署优先使用账号池面板。继续添加 `account_002`、`account_003` 即可；noVNC 底部任务栏用于切换窗口，也可以调用聚焦端点：
 
 ```bash
 curl -X POST http://127.0.0.1:8765/admin/accounts/account_002/focus \
@@ -131,7 +139,7 @@ curl http://127.0.0.1:8765/admin/pool/status \
   -H "Authorization: Bearer $SD2API_ADMIN_KEY"
 ```
 
-返回值包含每个账号的 `enabled`、`running`、`logged_in`、`credits`、`busy` 和 `queued`，以及账号池的 `max_parallel`。任务与账号分配可通过 `GET /admin/tasks` 查询。
+返回值包含每个账号的 `enabled`、`running`、`logged_in`、`login_state`、`credits`、`busy` 和 `queued`，以及账号池的 `max_parallel`、`logging_in` 和 `captcha_required`。任务与账号分配可通过 `GET /admin/tasks` 查询。
 
 ### 并发规则
 

@@ -86,10 +86,34 @@ class TaskStore:
                     enabled INTEGER NOT NULL DEFAULT 1,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
-                    last_error TEXT
+                    last_error TEXT,
+                    username TEXT,
+                    password_ciphertext TEXT,
+                    email_address TEXT,
+                    auto_login INTEGER NOT NULL DEFAULT 1,
+                    login_state TEXT NOT NULL DEFAULT 'not_configured',
+                    last_login_at INTEGER,
+                    last_login_attempt INTEGER
                 )
                 """
             )
+            account_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(accounts)").fetchall()
+            }
+            migrations = {
+                "username": "TEXT",
+                "password_ciphertext": "TEXT",
+                "email_address": "TEXT",
+                "auto_login": "INTEGER NOT NULL DEFAULT 1",
+                "login_state": "TEXT NOT NULL DEFAULT 'not_configured'",
+                "last_login_at": "INTEGER",
+                "last_login_attempt": "INTEGER",
+            }
+            for name, declaration in migrations.items():
+                if name not in account_columns:
+                    connection.execute(
+                        f"ALTER TABLE accounts ADD COLUMN {name} {declaration}"
+                    )
 
     @staticmethod
     def _decode(row: sqlite3.Row) -> TaskRecord:
@@ -215,51 +239,93 @@ class TaskStore:
             result = connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return result.rowcount > 0
 
-    def create_account(self, *, account_id: str, name: str) -> dict[str, Any]:
+    def create_account(
+        self,
+        *,
+        account_id: str,
+        name: str,
+        username: str | None = None,
+        password_ciphertext: str | None = None,
+        email_address: str | None = None,
+        auto_login: bool = True,
+    ) -> dict[str, Any]:
         now = int(time.time())
+        login_state = "pending" if username and password_ciphertext else "not_configured"
         with self._lock, self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO accounts (id, name, enabled, created_at, updated_at)
-                VALUES (?, ?, 1, ?, ?)
+                INSERT INTO accounts (
+                    id, name, enabled, created_at, updated_at, username,
+                    password_ciphertext, email_address, auto_login, login_state
+                ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (account_id, name, now, now),
+                (
+                    account_id,
+                    name,
+                    now,
+                    now,
+                    username,
+                    password_ciphertext,
+                    email_address,
+                    int(auto_login),
+                    login_state,
+                ),
             )
         account = self.get_account(account_id)
         if account is None:
             raise RuntimeError("Failed to create account")
         return account
 
-    def get_account(self, account_id: str) -> dict[str, Any] | None:
+    @staticmethod
+    def _decode_account(row: sqlite3.Row, *, include_secret: bool = False) -> dict[str, Any]:
+        result = dict(row)
+        result["enabled"] = bool(result["enabled"])
+        result["auto_login"] = bool(result.get("auto_login", 1))
+        result["credentials_configured"] = bool(
+            result.get("username") and result.get("password_ciphertext")
+        )
+        if not include_secret:
+            result.pop("password_ciphertext", None)
+        return result
+
+    def get_account(
+        self, account_id: str, *, include_secret: bool = False
+    ) -> dict[str, Any] | None:
         with self._lock, self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM accounts WHERE id = ?", (account_id,)
             ).fetchone()
         if row is None:
             return None
-        result = dict(row)
-        result["enabled"] = bool(result["enabled"])
-        return result
+        return self._decode_account(row, include_secret=include_secret)
 
     def list_accounts(self) -> list[dict[str, Any]]:
         with self._lock, self._connect() as connection:
             rows = connection.execute(
                 "SELECT * FROM accounts ORDER BY created_at ASC, id ASC"
             ).fetchall()
-        result = []
-        for row in rows:
-            account = dict(row)
-            account["enabled"] = bool(account["enabled"])
-            result.append(account)
-        return result
+        return [self._decode_account(row) for row in rows]
 
     def update_account(self, account_id: str, **changes: Any) -> dict[str, Any]:
-        allowed = {"name", "enabled", "last_error"}
+        allowed = {
+            "name",
+            "enabled",
+            "last_error",
+            "username",
+            "password_ciphertext",
+            "email_address",
+            "auto_login",
+            "login_state",
+            "last_login_at",
+            "last_login_attempt",
+        }
         invalid = set(changes) - allowed
         if invalid:
             raise ValueError(f"Unsupported account fields: {sorted(invalid)}")
         if "enabled" in changes:
             changes["enabled"] = int(bool(changes["enabled"]))
+        if "auto_login" in changes:
+            changes["auto_login"] = int(bool(changes["auto_login"]))
         changes["updated_at"] = int(time.time())
         encoded = dict(changes)
         encoded["id"] = account_id
@@ -274,6 +340,16 @@ class TaskStore:
         if account is None:
             raise KeyError(account_id)
         return account
+
+    def account_credentials(self, account_id: str) -> dict[str, str] | None:
+        account = self.get_account(account_id, include_secret=True)
+        if not account or not account.get("username") or not account.get("password_ciphertext"):
+            return None
+        return {
+            "username": str(account["username"]),
+            "password_ciphertext": str(account["password_ciphertext"]),
+            "email_address": str(account.get("email_address") or account["username"]),
+        }
 
     def delete_account(self, account_id: str) -> bool:
         with self._lock, self._connect() as connection:
