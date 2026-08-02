@@ -32,7 +32,7 @@
 
 - OpenAI `file_id` 和严格的首帧+尾帧模式
 - 取消已经提交到 TikTok 的任务（DELETE 只删除本地记录）
-- 强制分辨率或画幅；网页的文生视频请求当前没有暴露这些参数
+- 自定义分辨率或画幅；网页生成请求当前没有暴露这些参数
 
 ## 安装
 
@@ -157,6 +157,27 @@ curl http://127.0.0.1:8765/admin/pool/status \
 
 删除账号管理记录不会删除对应 Profile，响应中的 `profile_retained` 会明确标记这一点。需要彻底移除登录态时，应先停止账号，再由管理员单独清理相应的 volume 目录。
 
+## 生成参数说明
+
+以下结论来自 2026-08-02 对当前 TikTok Symphony Creative Studio 页面、实际创建请求和 T2V/I2V/R2V 成功任务的交叉验证。TikTok 内部网页接口可能更新，升级后应重新核对。
+
+| 能力 | Seedance 风格字段 | OpenAI 风格字段 | 当前行为 |
+|---|---|---|---|
+| 模型 | `model` | `model` | `seedance-2.0` 已实测；`sora-2` 只是它的 OpenAI 兼容别名。代码包含 Seedance 2.5 映射，但当前账号网页没有展示 2.5，因此未实测且仍取决于账号权限。网页还展示 `Video 1.5 Pro`，本适配器不支持。 |
+| 时长 | `duration` | `seconds` | **真实生效**。支持 4–15 秒的任意整数，步长 1；会写入 TikTok 请求正文和 `settings`。当前页面显示 Seedance 2.0 的预估 Credits 与秒数相同，例如 4 秒为 4 Credits、15 秒为 15 Credits。 |
+| 分辨率 | `resolution` | `size` | **不控制上游**。TikTok 页面没有分辨率控件，请求也不包含这些字段。当前适配器只保存并回显它们，方便兼容 SDK。 |
+| 画幅 | `ratio` | 包含在 `size` 的宽高方向中 | **不控制上游**。页面没有画幅控件，请求不包含该字段。 |
+| 随机种子 | `seed` | 无 | TikTok 页面没有对应控件；当前仅作为兼容字段接收，不会发给上游。 |
+| 固定镜头 | `camera_fixed` | 无 | Seedance 2.0 没有相机控制开关；页面所示 Camera control 属于另一个 `Video 1.5 Pro` 模型。当前字段不会发给上游。需要固定镜头时只能写进 prompt。 |
+| 水印 | `watermark` | 无 | 页面没有生成水印开关。TikTok 同时返回原始 VID 与 watermark VID，适配器固定下载原始 VID；字段不会发给上游。 |
+| 音频生成 | `generate_audio` | 无 | Seedance 2.0 在页面中标注 `Includes audio`，但没有开关；是否包含音频由模型决定，该字段不能启用或禁用音频。R2V 仍可上传参考音频。 |
+| 提示词增强 | 无 | 无 | 当前网页请求固定发送 `useEnhancePrompt=false`；适配器没有暴露开关。 |
+| 首尾帧 | `role=first_frame/last_frame` | `input_reference` 仅单图 | 网页支持 First frame only 和 First and last frame；当前适配器只实现单首帧。首尾帧双图请求会返回 HTTP 501。 |
+
+当前实测的三类任务都返回了 `720 × 1280` 的原始视频：T2V 即使请求记录中写入 `ratio=16:9`，以及 I2V/R2V 即使 OpenAI 请求写入 `size=1280x720`，最终仍为竖屏 `720 × 1280`。其中 I2V 输入图是 `1254 × 1254` 方图，也没有改变输出画幅。因此，在 TikTok 网页增加相应控件并确认协议字段之前，应把输出视为固定的竖屏 720p；不要依赖 `ratio`、`resolution` 或 `size` 改变结果。
+
+分辨率/画幅兼容字段仍会出现在任务响应中，它们表示调用方提交的记录值，不代表实际 MP4 尺寸。下载端点优先返回 TikTok 的 original video（本轮实测为 `720 × 1280`），而不是 360p/480p/540p 转码版本。
+
 ## Seedance 风格调用
 
 ```powershell
@@ -165,8 +186,6 @@ $body = @{
   model = "seedance-2.0"
   content = @(@{ type = "text"; text = "一颗红球在白色桌面上缓慢滚动，固定镜头" })
   duration = 5
-  ratio = "adaptive"
-  resolution = "720p"
 } | ConvertTo-Json -Depth 5
 
 $task = Invoke-RestMethod `
@@ -283,7 +302,7 @@ video = client.videos.create(
 print(video.id, video.status)
 ```
 
-OpenAI 官方只列出部分固定时长；本适配器为了暴露 Seedance 网页能力，把 `seconds` 扩展为 4–15 的任意整数。
+OpenAI 官方只列出部分固定时长；本适配器为了暴露 Seedance 网页能力，把 `seconds` 扩展为 4–15 的任意整数。`size` 保留用于 OpenAI SDK 兼容，但如上表所述，它当前不会改变 TikTok 输出尺寸。
 
 ## 状态映射
 

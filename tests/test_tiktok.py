@@ -18,7 +18,7 @@ from PIL import Image
 from sd2api.config import Settings
 from sd2api.browser_client import BrowserTikTokClient
 from sd2api.browser_pool import BrowserPoolClient
-from sd2api.models import UpstreamTask
+from sd2api.models import OpenAICreateVideoRequest, SeedanceCreateRequest, UpstreamTask
 from sd2api.protocol import ProtocolSession, ProtocolTikTokClient, _sign_gateway_request
 from sd2api.security import CredentialError, CredentialVault
 from sd2api.store import TaskStore
@@ -1356,6 +1356,29 @@ async def test_protocol_mode_specific_model_ids(tmp_path: Path) -> None:
         "4000008",
         "2000008",
     ]
+    display_only = {
+        "ratio",
+        "resolution",
+        "size",
+        "seed",
+        "camera_fixed",
+        "watermark",
+        "generate_audio",
+    }
+    for _, body in requests:
+        assert display_only.isdisjoint(body)
+        assert display_only.isdisjoint(json.loads(body["settings"]))
+
+
+def test_parameter_schema_marks_display_only_fields_as_not_forwarded() -> None:
+    seedance_schema = SeedanceCreateRequest.model_json_schema()["properties"]
+    openai_schema = OpenAICreateVideoRequest.model_json_schema()["properties"]
+    assert "not forwarded" in seedance_schema["ratio"]["description"]
+    assert "not forwarded" in seedance_schema["resolution"]["description"]
+    assert "not forwarded" in seedance_schema["seed"]["description"]
+    assert "not forwarded" in openai_schema["size"]["description"]
+    assert seedance_schema["duration"]["minimum"] == 4
+    assert seedance_schema["duration"]["maximum"] == 15
 
 
 def test_protocol_session_derives_device_id_from_browser_cookie() -> None:

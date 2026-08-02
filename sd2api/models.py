@@ -39,15 +39,43 @@ SeedanceContent = TextContent | SeedanceMediaContent
 class SeedanceCreateRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
-    model: str = "seedance-2.0"
-    content: list[SeedanceContent]
-    duration: int = Field(default=5, ge=4, le=15)
-    ratio: str = "adaptive"
-    resolution: str = "720p"
-    seed: int | None = None
-    camera_fixed: bool = False
-    watermark: bool = False
-    generate_audio: bool = False
+    model: str = Field(
+        default="seedance-2.0",
+        description="Seedance model alias. seedance-2.0 is verified; 2.5 requires upstream account access.",
+    )
+    content: list[SeedanceContent] = Field(
+        description="Text plus optional first-frame or multimodal reference media."
+    )
+    duration: int = Field(
+        default=5,
+        ge=4,
+        le=15,
+        description="Effective TikTok duration in whole seconds; every integer from 4 through 15 is supported.",
+    )
+    ratio: str = Field(
+        default="adaptive",
+        description="Compatibility metadata only; TikTok currently exposes no aspect-ratio control and this value is not forwarded.",
+    )
+    resolution: str = Field(
+        default="720p",
+        description="Compatibility metadata only; TikTok currently returns a 720p original and this value is not forwarded.",
+    )
+    seed: int | None = Field(
+        default=None,
+        description="Compatibility field only; TikTok Creative Studio does not expose a seed and this value is not forwarded.",
+    )
+    camera_fixed: bool = Field(
+        default=False,
+        description="Compatibility field only; Seedance 2.0 exposes no camera-control switch and this value is not forwarded.",
+    )
+    watermark: bool = Field(
+        default=False,
+        description="Compatibility field only; the adapter downloads the original non-watermark VID and this value is not forwarded.",
+    )
+    generate_audio: bool = Field(
+        default=False,
+        description="Compatibility field only; Seedance 2.0 audio is model-controlled with no web toggle and this value is not forwarded.",
+    )
 
     @model_validator(mode="after")
     def validate_content(self) -> "SeedanceCreateRequest":
@@ -153,9 +181,18 @@ class OpenAICreateVideoRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     prompt: str = Field(min_length=1, max_length=32000)
-    model: str = "sora-2"
-    seconds: int | str = 4
-    size: Literal["720x1280", "1280x720", "1024x1792", "1792x1024"] = "720x1280"
+    model: str = Field(
+        default="sora-2",
+        description="OpenAI-compatible alias for TikTok Dreamina Seedance 2.0; it is not OpenAI Sora.",
+    )
+    seconds: int | str = Field(
+        default=4,
+        description="Effective TikTok duration in whole seconds from 4 through 15.",
+    )
+    size: Literal["720x1280", "1280x720", "1024x1792", "1792x1024"] = Field(
+        default="720x1280",
+        description="OpenAI compatibility metadata only; it is stored and returned but not forwarded to TikTok.",
+    )
     input_reference: OpenAIImageReference | None = None
     references: list[SeedanceMediaContent] = Field(default_factory=list)
 
