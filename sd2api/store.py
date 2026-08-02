@@ -34,6 +34,18 @@ class TaskRecord:
     raw: dict[str, Any] | None = None
 
 
+@dataclass(slots=True)
+class EventRecord:
+    id: int
+    created_at: int
+    level: str
+    category: str
+    message: str
+    account_id: str | None = None
+    task_id: str | None = None
+    details: dict[str, Any] | None = None
+
+
 class TaskStore:
     def __init__(self, path: str) -> None:
         self.path = str(Path(path))
@@ -139,12 +151,36 @@ class TaskStore:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at INTEGER NOT NULL,
+                    level TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    account_id TEXT,
+                    task_id TEXT,
+                    details TEXT
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS events_created_at_idx "
+                "ON events(created_at DESC, id DESC)"
+            )
 
     @staticmethod
     def _decode(row: sqlite3.Row) -> TaskRecord:
         values = dict(row)
         values["raw"] = json.loads(values["raw"]) if values.get("raw") else None
         return TaskRecord(**values)
+
+    @staticmethod
+    def _decode_event(row: sqlite3.Row) -> EventRecord:
+        values = dict(row)
+        values["details"] = json.loads(values["details"]) if values.get("details") else None
+        return EventRecord(**values)
 
     def create(
         self,
@@ -239,6 +275,8 @@ class TaskStore:
         after: str | None = None,
         order: str = "desc",
         account_id: str | None = None,
+        status: str | None = None,
+        search: str | None = None,
     ) -> list[TaskRecord]:
         direction = "ASC" if order == "asc" else "DESC"
         params: list[Any] = []
@@ -252,6 +290,16 @@ class TaskStore:
         if account_id:
             conditions.append("account_id = ?")
             params.append(account_id)
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        if search:
+            conditions.append(
+                "(id LIKE ? OR prompt LIKE ? OR model LIKE ? OR account_id LIKE ? "
+                "OR advertiser_id LIKE ?)"
+            )
+            pattern = f"%{search}%"
+            params.extend([pattern] * 5)
         where = "WHERE " + " AND ".join(conditions) if conditions else ""
         params.append(limit)
         with self._lock, self._connect() as connection:
@@ -260,6 +308,91 @@ class TaskStore:
                 params,
             ).fetchall()
         return [self._decode(row) for row in rows]
+
+    def add_event(
+        self,
+        *,
+        level: str,
+        category: str,
+        message: str,
+        account_id: str | None = None,
+        task_id: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> EventRecord:
+        created_at = int(time.time())
+        encoded_details = (
+            json.dumps(details, ensure_ascii=False, separators=(",", ":"))
+            if details
+            else None
+        )
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO events (
+                    created_at, level, category, message, account_id, task_id, details
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    created_at,
+                    level,
+                    category,
+                    message,
+                    account_id,
+                    task_id,
+                    encoded_details,
+                ),
+            )
+            event_id = int(cursor.lastrowid)
+            row = connection.execute(
+                "SELECT * FROM events WHERE id = ?", (event_id,)
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("Could not read the event after insertion")
+        return self._decode_event(row)
+
+    def task_counts(self) -> dict[str, int]:
+        counts = {"total": 0, "queued": 0, "running": 0, "succeeded": 0, "failed": 0}
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT status, COUNT(*) AS count FROM tasks GROUP BY status"
+            ).fetchall()
+        for row in rows:
+            status = str(row["status"])
+            value = int(row["count"])
+            counts[status] = value
+            counts["total"] += value
+        return counts
+
+    def list_events(
+        self,
+        *,
+        limit: int = 200,
+        level: str | None = None,
+        category: str | None = None,
+        search: str | None = None,
+    ) -> list[EventRecord]:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if level:
+            conditions.append("level = ?")
+            params.append(level)
+        if category:
+            conditions.append("category = ?")
+            params.append(category)
+        if search:
+            conditions.append(
+                "(message LIKE ? OR account_id LIKE ? OR task_id LIKE ? OR details LIKE ?)"
+            )
+            pattern = f"%{search}%"
+            params.extend([pattern] * 4)
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+        params.append(limit)
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM events {where} ORDER BY created_at DESC, id DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [self._decode_event(row) for row in rows]
 
     def delete(self, task_id: str) -> bool:
         with self._lock, self._connect() as connection:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -38,6 +39,7 @@ from .uploads import StagedMedia, UploadManager
 logger = logging.getLogger("sd2api")
 store = TaskStore(settings.sd2api_database)
 uploads = UploadManager(settings)
+admin_static_dir = Path(__file__).with_name("static")
 client: TikTokClient | BrowserTikTokClient | BrowserPoolClient
 if settings.sd2api_mode.lower() == "browser_pool":
     client = BrowserPoolClient(settings, store)
@@ -47,8 +49,31 @@ else:
     client = TikTokClient(settings)
 
 
+def audit_event(
+    level: str,
+    category: str,
+    message: str,
+    *,
+    account_id: str | None = None,
+    task_id: str | None = None,
+    details: dict[str, Any] | None = None,
+) -> None:
+    try:
+        store.add_event(
+            level=level,
+            category=category,
+            message=message,
+            account_id=account_id,
+            task_id=task_id,
+            details=details,
+        )
+    except Exception:
+        logger.exception("Could not persist admin event")
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    audit_event("info", "system", "sd2api 服务已启动")
     if isinstance(client, (BrowserTikTokClient, BrowserPoolClient)) and settings.sd2api_browser_autostart:
         try:
             await client.start()
@@ -59,6 +84,7 @@ async def lifespan(_: FastAPI):
     finally:
         if isinstance(client, (BrowserTikTokClient, BrowserPoolClient)):
             await client.stop()
+        audit_event("info", "system", "sd2api 服务已停止")
 
 
 app = FastAPI(
@@ -269,7 +295,12 @@ def require_api_key(request: Request) -> None:
         return
     authorization = request.headers.get("authorization", "")
     supplied = authorization[7:] if authorization.lower().startswith("bearer ") else ""
-    if not supplied or not secrets.compare_digest(supplied, expected):
+    candidates = [expected]
+    if settings.sd2api_admin_key and settings.sd2api_admin_key != expected:
+        candidates.append(settings.sd2api_admin_key)
+    if not supplied or not any(
+        secrets.compare_digest(supplied, candidate) for candidate in candidates
+    ):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
@@ -285,6 +316,12 @@ def require_admin_key(request: Request) -> None:
 
 @app.exception_handler(TikTokUpstreamError)
 async def handle_upstream_error(request: Request, exc: TikTokUpstreamError) -> JSONResponse:
+    audit_event(
+        "error",
+        "system",
+        "TikTok 上游请求失败",
+        details={"code": exc.code, "message": str(exc), "path": request.url.path},
+    )
     return JSONResponse(
         status_code=exc.status_code,
         content={
@@ -324,7 +361,7 @@ async def refresh(record: TaskRecord, *, force: bool = False) -> TaskRecord:
     if not force and record.status in {"succeeded", "failed"} and record.video_url:
         return record
     upstream = await client.check_task(record.id)
-    return store.update(
+    updated = store.update(
         record.id,
         status=upstream.status,
         progress=upstream.progress,
@@ -335,6 +372,57 @@ async def refresh(record: TaskRecord, *, force: bool = False) -> TaskRecord:
         error_message=upstream.error_message,
         raw=upstream.raw,
     )
+    if updated.status != record.status:
+        if updated.status == "succeeded":
+            audit_event(
+                "success",
+                "video",
+                "视频生成完成",
+                account_id=updated.account_id,
+                task_id=updated.id,
+            )
+        elif updated.status == "failed":
+            audit_event(
+                "error",
+                "video",
+                "视频生成失败",
+                account_id=updated.account_id,
+                task_id=updated.id,
+                details={
+                    "error_code": updated.error_code,
+                    "error_message": updated.error_message,
+                },
+            )
+        elif updated.status == "running":
+            audit_event(
+                "info",
+                "video",
+                "视频开始生成",
+                account_id=updated.account_id,
+                task_id=updated.id,
+            )
+    return updated
+
+
+def upstream_model_name(model: str) -> str:
+    normalized = model.strip().lower().replace("_", "-")
+    if normalized in {
+        "sora-2",
+        "sora2",
+        "seedance-2.0",
+        "seedance-2-0",
+        "dreamina-seedance-2.0",
+        "dreamina-seedance-2-0",
+    }:
+        return "seedance-2.0"
+    if normalized in {
+        "seedance-2.5",
+        "seedance-2-5",
+        "dreamina-seedance-2.5",
+        "dreamina-seedance-2-5",
+    }:
+        return "seedance-2.5"
+    return model
 
 
 def openai_status(status: str) -> str:
@@ -401,7 +489,19 @@ async def healthz() -> dict[str, str]:
 
 @app.get("/admin", include_in_schema=False)
 async def admin_dashboard() -> FileResponse:
-    return FileResponse(Path(__file__).with_name("static") / "admin.html")
+    return FileResponse(admin_static_dir / "admin.html")
+
+
+@app.get("/admin/assets/admin.css", include_in_schema=False)
+async def admin_styles() -> FileResponse:
+    return FileResponse(admin_static_dir / "admin.css", media_type="text/css")
+
+
+@app.get("/admin/assets/admin.js", include_in_schema=False)
+async def admin_script() -> FileResponse:
+    return FileResponse(
+        admin_static_dir / "admin.js", media_type="application/javascript"
+    )
 
 
 @app.post("/browser/start", dependencies=[Depends(require_admin_key)])
@@ -464,7 +564,7 @@ async def list_pool_accounts() -> dict[str, Any]:
 
 @app.post("/admin/accounts", dependencies=[Depends(require_admin_key)])
 async def add_pool_account(body: AccountCreateRequest) -> dict[str, Any]:
-    return await require_pool().add_account(
+    result = await require_pool().add_account(
         account_id=body.id,
         name=body.name,
         start=body.start,
@@ -472,6 +572,14 @@ async def add_pool_account(body: AccountCreateRequest) -> dict[str, Any]:
         password=body.password.get_secret_value(),
         auto_login=body.auto_login,
     )
+    audit_event(
+        "info",
+        "account",
+        "账号已加入号池",
+        account_id=result.get("id"),
+        details={"start": body.start, "auto_login": body.auto_login},
+    )
+    return result
 
 
 @app.get("/admin/accounts/{account_id}", dependencies=[Depends(require_admin_key)])
@@ -481,7 +589,7 @@ async def get_pool_account(account_id: str) -> dict[str, Any]:
 
 @app.patch("/admin/accounts/{account_id}", dependencies=[Depends(require_admin_key)])
 async def update_pool_account(account_id: str, body: AccountUpdateRequest) -> dict[str, Any]:
-    return await require_pool().update_account(
+    result = await require_pool().update_account(
         account_id,
         name=body.name,
         enabled=body.enabled,
@@ -489,11 +597,14 @@ async def update_pool_account(account_id: str, body: AccountUpdateRequest) -> di
         password=body.password.get_secret_value() if body.password else None,
         auto_login=body.auto_login,
     )
+    audit_event("info", "account", "账号设置已更新", account_id=account_id)
+    return result
 
 
 @app.delete("/admin/accounts/{account_id}", dependencies=[Depends(require_admin_key)])
 async def delete_pool_account(account_id: str) -> dict[str, Any]:
     await require_pool().delete_account(account_id)
+    audit_event("warning", "account", "账号已从号池移除", account_id=account_id)
     return {
         "id": account_id,
         "deleted": True,
@@ -503,12 +614,15 @@ async def delete_pool_account(account_id: str) -> dict[str, Any]:
 
 @app.post("/admin/accounts/{account_id}/start", dependencies=[Depends(require_admin_key)])
 async def start_pool_account(account_id: str) -> dict[str, Any]:
-    return await require_pool().start_account(account_id)
+    result = await require_pool().start_account(account_id)
+    audit_event("info", "account", "账号已启动", account_id=account_id)
+    return result
 
 
 @app.post("/admin/accounts/{account_id}/stop", dependencies=[Depends(require_admin_key)])
 async def stop_pool_account(account_id: str) -> dict[str, bool]:
     await require_pool().stop_account(account_id)
+    audit_event("warning", "account", "账号已停止", account_id=account_id)
     return {"stopped": True}
 
 
@@ -524,7 +638,9 @@ async def focus_pool_account(account_id: str) -> dict[str, Any]:
 async def login_pool_account(
     account_id: str, body: AccountLoginRequest
 ) -> dict[str, Any]:
-    return await require_pool().login_account(account_id, wait=body.wait)
+    result = await require_pool().login_account(account_id, wait=body.wait)
+    audit_event("info", "login", "账号登录流程已启动", account_id=account_id)
+    return result
 
 
 @app.post(
@@ -534,9 +650,16 @@ async def login_pool_account(
 async def refresh_pool_subaccounts(
     account_id: str, body: SubaccountRefreshRequest
 ) -> dict[str, Any]:
-    return await require_pool().refresh_subaccounts(
+    result = await require_pool().refresh_subaccounts(
         account_id, check_access=body.check_access
     )
+    audit_event(
+        "info",
+        "account",
+        "子账号与 Credits 已刷新",
+        account_id=account_id,
+    )
+    return result
 
 
 @app.patch(
@@ -548,9 +671,17 @@ async def update_pool_subaccount(
     advertiser_id: str,
     body: SubaccountUpdateRequest,
 ) -> dict[str, Any]:
-    return await require_pool().set_subaccount_enabled(
+    result = await require_pool().set_subaccount_enabled(
         account_id, advertiser_id, enabled=body.enabled
     )
+    audit_event(
+        "info",
+        "account",
+        "子账号已启用" if body.enabled else "子账号已停用",
+        account_id=account_id,
+        details={"advertiser_id": advertiser_id},
+    )
+    return result
 
 
 @app.get("/admin/config/status", dependencies=[Depends(require_admin_key)])
@@ -576,28 +707,95 @@ async def pool_status() -> dict[str, Any]:
     return await require_pool().status()
 
 
+def admin_task(record: TaskRecord) -> dict[str, Any]:
+    return {
+        "id": record.id,
+        "api": record.api,
+        "account_id": record.account_id,
+        "advertiser_id": record.advertiser_id,
+        "status": record.status,
+        "progress": record.progress,
+        "model": record.model,
+        "upstream_model": upstream_model_name(record.model),
+        "prompt": record.prompt,
+        "seconds": record.seconds,
+        "size": record.size,
+        "ratio": record.ratio,
+        "resolution": record.resolution,
+        "created_at": record.created_at,
+        "updated_at": record.updated_at,
+        "completed_at": record.completed_at,
+        "downloadable": record.status == "succeeded" and bool(record.video_url),
+        "error_code": record.error_code,
+        "error_message": record.error_message,
+    }
+
+
 @app.get("/admin/tasks", dependencies=[Depends(require_admin_key)])
 async def list_admin_tasks(
     limit: int = Query(default=100, ge=1, le=1000),
     account_id: str | None = None,
+    status: Literal["all", "queued", "running", "succeeded", "failed"] = "all",
+    search: str | None = Query(default=None, max_length=256),
+    refresh_pending: bool = False,
 ) -> dict[str, Any]:
-    records = store.list(limit=limit, account_id=account_id)
+    selected_status = None if status == "all" else status
+    records = store.list(
+        limit=limit,
+        account_id=account_id,
+        status=selected_status,
+        search=search,
+    )
+    if refresh_pending:
+        pending = [record for record in records if record.status in {"queued", "running"}]
+        semaphore = asyncio.Semaphore(4)
+
+        async def refresh_one(record: TaskRecord) -> None:
+            async with semaphore:
+                try:
+                    await refresh(record)
+                except Exception as exc:
+                    logger.warning("Could not refresh task %s: %s", record.id, exc)
+
+        await asyncio.gather(*(refresh_one(record) for record in pending))
+        records = store.list(
+            limit=limit,
+            account_id=account_id,
+            status=selected_status,
+            search=search,
+        )
+    return {
+        "data": [admin_task(record) for record in records],
+        "summary": store.task_counts(),
+    }
+
+
+@app.get("/admin/logs", dependencies=[Depends(require_admin_key)])
+async def list_admin_logs(
+    limit: int = Query(default=200, ge=1, le=1000),
+    level: Literal["all", "info", "success", "warning", "error"] = "all",
+    category: Literal["all", "system", "account", "login", "video"] = "all",
+    search: str | None = Query(default=None, max_length=256),
+) -> dict[str, Any]:
+    events = store.list_events(
+        limit=limit,
+        level=None if level == "all" else level,
+        category=None if category == "all" else category,
+        search=search,
+    )
     return {
         "data": [
             {
-                "id": record.id,
-                "account_id": record.account_id,
-                "advertiser_id": record.advertiser_id,
-                "status": record.status,
-                "progress": record.progress,
-                "model": record.model,
-                "seconds": record.seconds,
-                "created_at": record.created_at,
-                "updated_at": record.updated_at,
-                "error_code": record.error_code,
-                "error_message": record.error_message,
+                "id": event.id,
+                "created_at": event.created_at,
+                "level": event.level,
+                "category": event.category,
+                "message": event.message,
+                "account_id": event.account_id,
+                "task_id": event.task_id,
+                "details": event.details,
             }
-            for record in records
+            for event in events
         ]
     }
 
@@ -710,6 +908,18 @@ async def create_seedance_video(
             if isinstance(client, BrowserPoolClient)
             else None
         ),
+    )
+    audit_event(
+        "info",
+        "video",
+        "视频任务已提交",
+        account_id=record.account_id,
+        task_id=record.id,
+        details={
+            "mode": mode,
+            "model": upstream_model_name(record.model),
+            "duration": record.seconds,
+        },
     )
     return seedance_task(record)
 
@@ -1000,6 +1210,18 @@ async def create_openai_video(request: Request) -> dict[str, Any]:
             if isinstance(client, BrowserPoolClient)
             else None
         ),
+    )
+    audit_event(
+        "info",
+        "video",
+        "视频任务已提交",
+        account_id=record.account_id,
+        task_id=record.id,
+        details={
+            "mode": "reference" if reference_media else "image" if input_image else "text",
+            "model": upstream_model_name(record.model),
+            "duration": record.seconds,
+        },
     )
     return openai_video(record)
 

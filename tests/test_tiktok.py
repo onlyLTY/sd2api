@@ -137,6 +137,27 @@ def test_store_round_trip(tmp_path: Path) -> None:
     assert updated.completed_at is not None
     assert store.get("task-1") == updated
     assert store.list()[0].id == "task-1"
+    assert store.list(status="succeeded")[0].id == "task-1"
+    assert store.list(search="red ball")[0].id == "task-1"
+    assert store.task_counts() == {
+        "total": 1,
+        "queued": 0,
+        "running": 0,
+        "succeeded": 1,
+        "failed": 0,
+    }
+
+    event = store.add_event(
+        level="success",
+        category="video",
+        message="视频生成完成",
+        task_id="task-1",
+        details={"model": "seedance-2.0"},
+    )
+    assert event.id > 0
+    assert event.details == {"model": "seedance-2.0"}
+    assert store.list_events(level="success")[0].task_id == "task-1"
+    assert store.list_events(category="video", search="seedance")[0].id == event.id
 
     account = store.create_account(account_id="account-a", name="Account A")
     assert account["enabled"] is True
@@ -1693,6 +1714,9 @@ def test_admin_account_routes_without_starting_browser(
     listed = api.get("/admin/accounts", headers=headers)
     status = api.get("/admin/pool/status", headers=headers)
     dashboard = api.get("/admin")
+    styles = api.get("/admin/assets/admin.css")
+    script = api.get("/admin/assets/admin.js")
+    logs = api.get("/admin/logs", headers=headers)
     secured = api.post(
         "/admin/accounts",
         headers=headers,
@@ -1712,8 +1736,15 @@ def test_admin_account_routes_without_starting_browser(
     assert listed.json()["data"][0]["name"] == "primary@example.com"
     assert status.json()["max_parallel"] == 0
     assert dashboard.status_code == 200
-    assert "TikTok Ads 账号池" in dashboard.text
+    assert "sd2api 控制台" in dashboard.text
+    assert all(label in dashboard.text for label in ("生视频", "号池管理", "日志", "视频管理"))
     assert 'name="email_address"' not in dashboard.text
+    assert styles.status_code == 200
+    assert ".sidebar" in styles.text
+    assert script.status_code == 200
+    assert "refreshVideos" in script.text
+    assert logs.status_code == 200
+    assert any(item["message"] == "账号已加入号池" for item in logs.json()["data"])
     assert secured.status_code == 200
     assert secured.json()["credentials_configured"] is True
     assert "password_ciphertext" not in secured.json()
@@ -1742,3 +1773,77 @@ def test_admin_account_routes_without_starting_browser(
     assert selected.status_code == 200
     assert selected.json()["enabled"] is True
     assert selected.json()["credits"] == 2000
+
+
+def test_admin_tasks_refresh_pending_records_and_expose_actual_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sd2api.main as main
+
+    class FakeClient:
+        async def check_task(self, task_id: str) -> UpstreamTask:
+            assert task_id == "task-refresh"
+            return UpstreamTask(
+                id=task_id,
+                status="succeeded",
+                progress=100,
+                video_url="https://cdn.example/video.mp4",
+            )
+
+    task_store = TaskStore(str(tmp_path / "task-refresh.db"))
+    task_store.create(
+        task_id="task-refresh",
+        api="openai",
+        model="sora-2",
+        prompt="A portrait",
+        seconds=5,
+    )
+    monkeypatch.setattr(main, "store", task_store)
+    monkeypatch.setattr(main, "client", FakeClient())
+    api = TestClient(main.app)
+    headers = {
+        "Authorization": f"Bearer {main.settings.sd2api_admin_key or main.settings.sd2api_api_key}"
+    }
+
+    response = api.get(
+        "/admin/tasks?refresh_pending=true&search=portrait", headers=headers
+    )
+    assert response.status_code == 200
+    task = response.json()["data"][0]
+    assert task["status"] == "succeeded"
+    assert task["downloadable"] is True
+    assert task["model"] == "sora-2"
+    assert task["upstream_model"] == "seedance-2.0"
+    assert response.json()["summary"]["succeeded"] == 1
+    assert any(
+        event.message == "视频生成完成" for event in task_store.list_events()
+    )
+
+
+def test_admin_key_can_submit_openai_compatible_video(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sd2api.main as main
+
+    class FakeClient:
+        async def create_text_video(self, **kwargs: object) -> str:
+            assert kwargs["model"] == "seedance-2.0"
+            return "admin-created-task"
+
+    monkeypatch.setattr(main.settings, "sd2api_api_key", "separate-api-key")
+    monkeypatch.setattr(main.settings, "sd2api_admin_key", "separate-admin-key")
+    monkeypatch.setattr(main, "client", FakeClient())
+    monkeypatch.setattr(main, "store", TaskStore(str(tmp_path / "admin-generate.db")))
+    api = TestClient(main.app)
+
+    response = api.post(
+        "/v1/videos",
+        headers={"Authorization": "Bearer separate-admin-key"},
+        json={
+            "model": "seedance-2.0",
+            "prompt": "A quiet portrait",
+            "seconds": 5,
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["id"] == "admin-created-task"
