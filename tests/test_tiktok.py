@@ -1381,6 +1381,38 @@ def test_parameter_schema_marks_display_only_fields_as_not_forwarded() -> None:
     assert seedance_schema["duration"]["maximum"] == 15
 
 
+def test_openapi_documents_video_parameters_and_both_openai_body_formats() -> None:
+    import sd2api.main as main
+
+    schema = main.app.openapi()
+    seedance_operation = schema["paths"]["/api/v3/contents/generations/tasks"]["post"]
+    assert seedance_operation["summary"] == "创建 Seedance 视频"
+    assert "720 × 1280" in seedance_operation["description"]
+    assert set(seedance_operation["requestBody"]["content"]["application/json"]["examples"]) == {
+        "text_to_video",
+        "image_to_video",
+        "reference_to_video",
+    }
+
+    openai_operation = schema["paths"]["/v1/videos"]["post"]
+    assert openai_operation["summary"] == "创建视频（OpenAI 兼容）"
+    assert "720 × 1280" in openai_operation["description"]
+    content = openai_operation["requestBody"]["content"]
+    assert set(content) == {"application/json", "multipart/form-data"}
+    json_properties = content["application/json"]["schema"]["properties"]
+    assert json_properties["seconds"]["minimum"] == 4
+    assert json_properties["seconds"]["maximum"] == 15
+    assert "不会发送给 TikTok" in json_properties["size"]["description"]
+    assert set(content["application/json"]["examples"]) == {
+        "text_to_video",
+        "image_to_video",
+        "reference_to_video",
+    }
+    multipart_properties = content["multipart/form-data"]["schema"]["properties"]
+    assert multipart_properties["input_reference"]["format"] == "binary"
+    assert multipart_properties["reference_media"]["items"]["format"] == "binary"
+
+
 def test_protocol_session_derives_device_id_from_browser_cookie() -> None:
     session = ProtocolSession.from_dict(
         {

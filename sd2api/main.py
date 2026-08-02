@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.responses import FileResponse
@@ -64,9 +64,203 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="sd2api",
     version="0.1.0",
-    description="TikTok Symphony Seedance adapter with Seedance and OpenAI-compatible video APIs",
+    description=(
+        "TikTok Symphony Seedance adapter with Seedance and OpenAI-compatible video APIs. "
+        "当前 TikTok 网页协议只有 4–15 秒时长会真实生效；size、ratio、resolution "
+        "等兼容字段不会改变上游输出。"
+    ),
     lifespan=lifespan,
 )
+
+
+SEEDANCE_CREATE_DESCRIPTION = """
+创建 TikTok Seedance 视频任务，支持文生视频、单首帧图生视频和多模态 Reference to video。
+
+### 参数能力
+
+| 参数 | 当前行为 |
+|---|---|
+| `duration` | **真实生效**；支持 4–15 秒的任意整数，当前页面显示预计 Credits 与秒数相同。 |
+| `ratio` / `resolution` | 仅兼容记录和回显，**不会发送给 TikTok**，不能改变实际画幅或分辨率。 |
+| `seed` / `camera_fixed` / `watermark` / `generate_audio` | 仅兼容接收，**不会发送给 TikTok**。 |
+
+T2V、I2V、R2V 的成功任务当前均实测为竖屏 `720 × 1280`。单首帧可用；严格的首帧+尾帧模式尚未实现，会返回 HTTP 501。
+"""
+
+
+OPENAI_CREATE_DESCRIPTION = """
+以 OpenAI Videos 风格创建 TikTok Seedance 视频。既接受 `application/json`，也接受上传文件用的 `multipart/form-data`。
+
+- `seconds` 是唯一可控的视频规格参数：支持 **4–15 秒**的任意整数。
+- `size` 只为 OpenAI SDK 兼容而保存和回显，**不会发送给 TikTok**；当前实测输出固定为竖屏 `720 × 1280`。
+- `sora-2` 是本服务映射到 Dreamina Seedance 2.0 的兼容别名，并非 OpenAI Sora。
+- JSON 的 `input_reference` 或 multipart 的同名文件用于单首帧 I2V。
+- JSON 的 `references` 或 multipart 的 `reference_media` 用于 R2V；最多 9 张图片、3 个视频、3 段音频，且必须至少包含一张图片或一个视频。
+"""
+
+
+OPENAI_JSON_REFERENCE_ITEM_SCHEMA: dict[str, Any] = {
+    "oneOf": [
+        {
+            "type": "object",
+            "required": ["type", "image_url"],
+            "properties": {
+                "type": {"type": "string", "const": "image_url"},
+                "image_url": {
+                    "oneOf": [
+                        {"type": "string", "format": "uri"},
+                        {
+                            "type": "object",
+                            "required": ["url"],
+                            "properties": {"url": {"type": "string", "format": "uri"}},
+                        },
+                    ]
+                },
+                "role": {
+                    "type": "string",
+                    "enum": ["first_frame", "last_frame", "reference_image"],
+                },
+            },
+        },
+        {
+            "type": "object",
+            "required": ["type", "video_url"],
+            "properties": {
+                "type": {"type": "string", "const": "video_url"},
+                "video_url": {
+                    "oneOf": [
+                        {"type": "string", "format": "uri"},
+                        {
+                            "type": "object",
+                            "required": ["url"],
+                            "properties": {"url": {"type": "string", "format": "uri"}},
+                        },
+                    ]
+                },
+                "role": {"type": "string", "const": "reference_video"},
+            },
+        },
+        {
+            "type": "object",
+            "required": ["type", "audio_url"],
+            "properties": {
+                "type": {"type": "string", "const": "audio_url"},
+                "audio_url": {
+                    "oneOf": [
+                        {"type": "string", "format": "uri"},
+                        {
+                            "type": "object",
+                            "required": ["url"],
+                            "properties": {"url": {"type": "string", "format": "uri"}},
+                        },
+                    ]
+                },
+                "role": {"type": "string", "const": "reference_audio"},
+            },
+        },
+    ]
+}
+
+
+OPENAI_JSON_CREATE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["prompt"],
+    "additionalProperties": False,
+    "properties": {
+        "prompt": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32000,
+            "description": "视频提示词。",
+        },
+        "model": {
+            "type": "string",
+            "default": "sora-2",
+            "description": "OpenAI 兼容别名；sora-2 映射到 TikTok Dreamina Seedance 2.0。",
+        },
+        "seconds": {
+            "type": "integer",
+            "minimum": 4,
+            "maximum": 15,
+            "default": 4,
+            "description": "真实生效的视频时长，支持 4–15 秒的任意整数。",
+        },
+        "size": {
+            "type": "string",
+            "enum": ["720x1280", "1280x720", "1024x1792", "1792x1024"],
+            "default": "720x1280",
+            "description": "仅兼容记录和回显，不会发送给 TikTok，也不会改变实际输出尺寸。",
+        },
+        "input_reference": {
+            "type": "object",
+            "description": "单首帧 I2V。仅 image_url 可用；file_id 尚未实现。",
+            "properties": {
+                "image_url": {"type": "string", "format": "uri"},
+                "file_id": {
+                    "type": "string",
+                    "description": "尚未实现；提交后返回 HTTP 501。",
+                },
+            },
+        },
+        "references": {
+            "type": "array",
+            "description": "R2V 多模态参考素材。最多 9 图、3 视频、3 音频。",
+            "items": OPENAI_JSON_REFERENCE_ITEM_SCHEMA,
+        },
+    },
+}
+
+
+OPENAI_MULTIPART_CREATE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["prompt"],
+    "properties": {
+        "prompt": {"type": "string", "description": "视频提示词。"},
+        "model": {"type": "string", "default": "sora-2"},
+        "seconds": {
+            "type": "integer",
+            "minimum": 4,
+            "maximum": 15,
+            "default": 4,
+            "description": "真实生效的视频时长。",
+        },
+        "size": {
+            "type": "string",
+            "enum": ["720x1280", "1280x720", "1024x1792", "1792x1024"],
+            "default": "720x1280",
+            "description": "仅兼容记录和回显，不控制 TikTok 输出。",
+        },
+        "input_reference": {
+            "type": "string",
+            "format": "binary",
+            "description": "单张首帧图片；不能和 reference_media 同时使用。",
+        },
+        "reference_media": {
+            "type": "array",
+            "items": {"type": "string", "format": "binary"},
+            "description": "R2V 混合参考文件；最多 9 图、3 视频、3 音频。",
+        },
+        "reference_image": {
+            "type": "array",
+            "items": {"type": "string", "format": "binary"},
+            "description": "可重复提交的 R2V 图片文件字段。",
+        },
+        "reference_video": {
+            "type": "array",
+            "items": {"type": "string", "format": "binary"},
+            "description": "可重复提交的 R2V 视频文件字段。",
+        },
+        "reference_audio": {
+            "type": "array",
+            "items": {"type": "string", "format": "binary"},
+            "description": "可重复提交的 R2V 音频文件字段。",
+        },
+        "references": {
+            "type": "string",
+            "description": "可选的 JSON 字符串形式 references 数组。",
+        },
+    },
+}
 
 
 def require_api_key(request: Request) -> None:
@@ -408,8 +602,61 @@ async def list_admin_tasks(
     }
 
 
-@app.post("/api/v3/contents/generations/tasks", dependencies=[Depends(require_api_key)])
-async def create_seedance_video(body: SeedanceCreateRequest) -> dict[str, Any]:
+@app.post(
+    "/api/v3/contents/generations/tasks",
+    dependencies=[Depends(require_api_key)],
+    summary="创建 Seedance 视频",
+    description=SEEDANCE_CREATE_DESCRIPTION,
+)
+async def create_seedance_video(
+    body: SeedanceCreateRequest = Body(
+        openapi_examples={
+            "text_to_video": {
+                "summary": "文生视频（T2V）",
+                "value": {
+                    "model": "seedance-2.0",
+                    "content": [{"type": "text", "text": "一颗红球在白色桌面上缓慢滚动"}],
+                    "duration": 5,
+                },
+            },
+            "image_to_video": {
+                "summary": "单首帧图生视频（I2V）",
+                "value": {
+                    "model": "seedance-2.0",
+                    "content": [
+                        {"type": "text", "text": "让画面中的云朵缓慢移动"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/first-frame.png"},
+                            "role": "first_frame",
+                        },
+                    ],
+                    "duration": 5,
+                },
+            },
+            "reference_to_video": {
+                "summary": "多模态参考生视频（R2V）",
+                "value": {
+                    "model": "seedance-2.0",
+                    "content": [
+                        {"type": "text", "text": "参考图片主体和音频节奏生成视频"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/reference.png"},
+                            "role": "reference_image",
+                        },
+                        {
+                            "type": "audio_url",
+                            "audio_url": {"url": "https://example.com/reference.mp3"},
+                            "role": "reference_audio",
+                        },
+                    ],
+                    "duration": 5,
+                },
+            },
+        }
+    ),
+) -> dict[str, Any]:
     mode = body.generation_mode
     if mode == "first_last":
         raise HTTPException(
@@ -614,7 +861,65 @@ def validate_reference_media(media: list[StagedMedia]) -> None:
         )
 
 
-@app.post("/v1/videos", dependencies=[Depends(require_api_key)])
+@app.post(
+    "/v1/videos",
+    dependencies=[Depends(require_api_key)],
+    summary="创建视频（OpenAI 兼容）",
+    description=OPENAI_CREATE_DESCRIPTION,
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": OPENAI_JSON_CREATE_SCHEMA,
+                    "examples": {
+                        "text_to_video": {
+                            "summary": "文生视频（T2V）",
+                            "value": {
+                                "model": "sora-2",
+                                "prompt": "一颗红球在白色桌面上缓慢滚动",
+                                "seconds": 5,
+                                "size": "720x1280",
+                            },
+                        },
+                        "image_to_video": {
+                            "summary": "图片 URL 单首帧（I2V）",
+                            "value": {
+                                "model": "sora-2",
+                                "prompt": "让画面中的云朵缓慢移动",
+                                "seconds": 5,
+                                "input_reference": {
+                                    "image_url": "https://example.com/first-frame.png"
+                                },
+                            },
+                        },
+                        "reference_to_video": {
+                            "summary": "多模态参考（R2V）",
+                            "value": {
+                                "model": "sora-2",
+                                "prompt": "参考图片主体和音频节奏生成视频",
+                                "seconds": 5,
+                                "references": [
+                                    {
+                                        "type": "image_url",
+                                        "image_url": "https://example.com/reference.png",
+                                        "role": "reference_image",
+                                    },
+                                    {
+                                        "type": "audio_url",
+                                        "audio_url": "https://example.com/reference.mp3",
+                                        "role": "reference_audio",
+                                    },
+                                ],
+                            },
+                        },
+                    },
+                },
+                "multipart/form-data": {"schema": OPENAI_MULTIPART_CREATE_SCHEMA},
+            },
+        }
+    },
+)
 async def create_openai_video(request: Request) -> dict[str, Any]:
     body, input_image, reference_media = await parse_openai_create_request(request)
     try:
