@@ -22,7 +22,13 @@ from curl_cffi.requests.exceptions import RequestException as CurlRequestExcepti
 
 from .config import Settings
 from .models import UpstreamTask
-from .tiktok import T2V_MODELS, TikTokUpstreamError, _deep_find, _first
+from .tiktok import (
+    MODEL_PERMISSION_CODES,
+    T2V_MODELS,
+    TikTokUpstreamError,
+    _deep_find,
+    _first,
+)
 from .uploads import StagedMedia
 
 
@@ -451,11 +457,40 @@ class ProtocolTikTokClient:
             raise TikTokUpstreamError(
                 f"TikTok request failed: {exc.__class__.__name__}"
             ) from exc
-        if response.status_code in {401, 403}:
+        if response.status_code == 401:
             raise TikTokUpstreamError(
                 "TikTok session expired; the account must log in again",
                 status_code=401,
                 code="tiktok_authentication_error",
+            )
+        if response.status_code == 403:
+            try:
+                forbidden = response.json()
+            except ValueError:
+                forbidden = {}
+            forbidden_base = forbidden.get("BaseResp") if isinstance(forbidden, dict) else None
+            code = (
+                forbidden_base.get("StatusCode")
+                if isinstance(forbidden_base, dict)
+                else None
+            ) or (
+                _first(forbidden, ("code", "status_code", "statusCode"))
+                if isinstance(forbidden, dict)
+                else None
+            )
+            message = (
+                _first(forbidden, ("message", "msg", "status_message"))
+                if isinstance(forbidden, dict)
+                else None
+            ) or (
+                forbidden_base.get("StatusMessage")
+                if isinstance(forbidden_base, dict)
+                else None
+            )
+            raise TikTokUpstreamError(
+                str(message or "TikTok denied access to this model or operation"),
+                status_code=403,
+                code=str(code or "tiktok_permission_denied"),
             )
         if response.status_code >= 400:
             raise TikTokUpstreamError(
@@ -484,7 +519,13 @@ class ProtocolTikTokClient:
                 )
                 or "TikTok rejected the request"
             )
-            raise TikTokUpstreamError(str(message), code=str(effective))
+            raise TikTokUpstreamError(
+                str(message),
+                status_code=(
+                    403 if str(effective) in MODEL_PERMISSION_CODES else 502
+                ),
+                code=str(effective),
+            )
         return payload
 
     async def validate(self) -> dict[str, Any]:

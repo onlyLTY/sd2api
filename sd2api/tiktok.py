@@ -22,6 +22,8 @@ T2V_MODELS: dict[str, str] = {
     "dreamina-seedance-2.5": "5000007",
 }
 
+MODEL_PERMISSION_CODES = {"10001100"}
+
 
 class TikTokUpstreamError(RuntimeError):
     def __init__(self, message: str, *, status_code: int = 502, code: str = "upstream_error") -> None:
@@ -114,11 +116,27 @@ class TikTokClient:
                 response = await client.request(method, path, **kwargs)
             except httpx.HTTPError as exc:
                 raise TikTokUpstreamError(f"TikTok request failed: {exc.__class__.__name__}") from exc
-        if response.status_code in {401, 403}:
+        if response.status_code == 401:
             raise TikTokUpstreamError(
                 "TikTok session is expired or rejected; refresh TIKTOK_COOKIE and CSRF values",
                 status_code=401,
                 code="tiktok_authentication_error",
+            )
+        if response.status_code == 403:
+            try:
+                forbidden = response.json()
+            except ValueError:
+                forbidden = {}
+            code = _first(forbidden, ("code", "status_code", "statusCode")) if isinstance(forbidden, dict) else None
+            message = (
+                _first(forbidden, ("message", "msg", "status_message"))
+                if isinstance(forbidden, dict)
+                else None
+            )
+            raise TikTokUpstreamError(
+                str(message or "TikTok denied access to this model or operation"),
+                status_code=403,
+                code=str(code or "tiktok_permission_denied"),
             )
         if response.status_code >= 400:
             raise TikTokUpstreamError(
@@ -135,7 +153,11 @@ class TikTokClient:
         code = _first(payload, ("code", "status_code", "statusCode"))
         if code not in (None, 0, "0", 200, "200"):
             message = _first(payload, ("message", "msg", "status_message")) or "TikTok rejected the request"
-            raise TikTokUpstreamError(str(message), code=str(code))
+            raise TikTokUpstreamError(
+                str(message),
+                status_code=403 if str(code) in MODEL_PERMISSION_CODES else 502,
+                code=str(code),
+            )
         return payload
 
     async def create_text_video(self, *, prompt: str, model: str, duration: int) -> str:

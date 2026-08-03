@@ -771,6 +771,27 @@ async def test_create_and_check_success() -> None:
 
 
 @pytest.mark.asyncio
+async def test_direct_client_preserves_model_permission_denied_as_403() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403,
+            json={"code": 10001100, "message": "没有模型使用权限"},
+        )
+
+    client = TikTokClient(
+        Settings(tiktok_cookie="sessionid=test"),
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(TikTokUpstreamError) as error:
+        await client.create_text_video(
+            prompt="A red ball", model="seedance-2.0", duration=5
+        )
+    assert error.value.status_code == 403
+    assert error.value.code == "10001100"
+    assert str(error.value) == "没有模型使用权限"
+
+
+@pytest.mark.asyncio
 async def test_check_processing_and_failure() -> None:
     responses = iter(
         [
@@ -1391,6 +1412,31 @@ async def test_protocol_mode_specific_model_ids(tmp_path: Path) -> None:
         assert display_only.isdisjoint(json.loads(body["settings"]))
 
 
+@pytest.mark.asyncio
+async def test_protocol_client_preserves_model_permission_denied_as_403() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403,
+            json={"code": 10001100, "message": "没有模型使用权限"},
+        )
+
+    client = ProtocolTikTokClient(
+        Settings(),
+        protocol_session(),
+        account_id="account-a",
+        advertiser_id="no-access-advertiser",
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(TikTokUpstreamError) as error:
+        await client.create_text_video(
+            prompt="A red ball", model="seedance-2.0", duration=5
+        )
+    await client.close()
+    assert error.value.status_code == 403
+    assert error.value.code == "10001100"
+    assert str(error.value) == "没有模型使用权限"
+
+
 def test_parameter_schema_marks_display_only_fields_as_not_forwarded() -> None:
     seedance_schema = SeedanceCreateRequest.model_json_schema()["properties"]
     openai_schema = OpenAICreateVideoRequest.model_json_schema()["properties"]
@@ -1418,6 +1464,8 @@ def test_openapi_documents_video_parameters_and_both_openai_body_formats() -> No
     openai_operation = schema["paths"]["/v1/videos"]["post"]
     assert openai_operation["summary"] == "创建视频（OpenAI 兼容）"
     assert "720 × 1280" in openai_operation["description"]
+    assert "403" in openai_operation["responses"]
+    assert "403" in seedance_operation["responses"]
     content = openai_operation["requestBody"]["content"]
     assert set(content) == {"application/json", "multipart/form-data"}
     json_properties = content["application/json"]["schema"]["properties"]
@@ -1474,6 +1522,39 @@ async def test_protocol_generation_rejects_session_without_fp_id() -> None:
             prompt="text", model="seedance-2.0", duration=5
         )
     assert error.value.code == "protocol_fp_id_missing"
+
+
+@pytest.mark.asyncio
+async def test_pool_returns_403_when_online_accounts_have_no_seedance_access(
+    tmp_path: Path,
+) -> None:
+    pool = BrowserPoolClient(Settings(), TaskStore(str(tmp_path / "no-access.db")))
+
+    async def list_accounts() -> list[dict[str, Any]]:
+        return [
+            {
+                "id": "account-a",
+                "enabled": True,
+                "running": True,
+                "logged_in": True,
+                "subaccounts": [
+                    {
+                        "advertiser_id": "advertiser-no-access",
+                        "enabled": False,
+                        "seedance_access": False,
+                        "credits": 2000,
+                    }
+                ],
+            }
+        ]
+
+    pool.list_accounts = list_accounts  # type: ignore[method-assign]
+    with pytest.raises(TikTokUpstreamError) as error:
+        await pool.create_text_video(
+            prompt="A red ball", model="seedance-2.0", duration=5
+        )
+    assert error.value.status_code == 403
+    assert error.value.code == "seedance_access_required"
 
 
 @pytest.mark.asyncio
@@ -1847,3 +1928,39 @@ def test_admin_key_can_submit_openai_compatible_video(
     )
     assert response.status_code == 200
     assert response.json()["id"] == "admin-created-task"
+
+
+def test_video_api_returns_upstream_model_permission_error_as_403(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sd2api.main as main
+
+    class DeniedClient:
+        async def create_text_video(self, **kwargs: object) -> str:
+            raise TikTokUpstreamError(
+                "没有模型使用权限",
+                status_code=403,
+                code="10001100",
+            )
+
+    monkeypatch.setattr(main, "client", DeniedClient())
+    monkeypatch.setattr(main, "store", TaskStore(str(tmp_path / "denied.db")))
+    api = TestClient(main.app)
+    headers = {"Authorization": f"Bearer {main.settings.sd2api_api_key}"}
+
+    response = api.post(
+        "/v1/videos",
+        headers=headers,
+        json={
+            "model": "seedance-2.0",
+            "prompt": "A red ball",
+            "seconds": 5,
+        },
+    )
+    assert response.status_code == 403
+    assert response.json()["error"] == {
+        "message": "没有模型使用权限",
+        "type": "upstream_error",
+        "param": None,
+        "code": "10001100",
+    }

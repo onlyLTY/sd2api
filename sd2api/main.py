@@ -805,6 +805,11 @@ async def list_admin_logs(
     dependencies=[Depends(require_api_key)],
     summary="创建 Seedance 视频",
     description=SEEDANCE_CREATE_DESCRIPTION,
+    responses={
+        403: {
+            "description": "TikTok 子账号没有所请求模型的使用权限",
+        }
+    },
 )
 async def create_seedance_video(
     body: SeedanceCreateRequest = Body(
@@ -1076,6 +1081,11 @@ def validate_reference_media(media: list[StagedMedia]) -> None:
     dependencies=[Depends(require_api_key)],
     summary="创建视频（OpenAI 兼容）",
     description=OPENAI_CREATE_DESCRIPTION,
+    responses={
+        403: {
+            "description": "TikTok 子账号没有所请求模型的使用权限",
+        }
+    },
     openapi_extra={
         "requestBody": {
             "required": True,

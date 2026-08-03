@@ -158,6 +158,7 @@ curl http://127.0.0.1:8765/admin/pool/status \
 - 素材上传在每个协议客户端内受 `SD2API_PROTOCOL_UPLOAD_CONCURRENCY` 限制；大文件超过 `SD2API_PROTOCOL_DIRECT_UPLOAD_BYTES` 后按 `SD2API_PROTOCOL_SLICE_BYTES` 分片。
 - 调度器按当前负载最小优先分配；同负载时优先 credits 较多的账号，再做轮转。
 - 页面可见 credits 为 0 的账号不会接收新任务；无法读取余额时仍可参与调度。
+- 如果在线账号没有 Seedance 权限，或 TikTok 返回 `10001100`（没有模型使用权限），生成 API 返回 HTTP 403，并在错误体中保留原始错误码和信息。
 - `SD2API_POOL_MAX_PENDING` 限制全池等待与运行任务总量，超限返回 HTTP 429。
 - 容器重启时最多并发验证 `SD2API_POOL_START_CONCURRENCY` 个账号；有效协议会话不会启动浏览器，只有缺失或过期时才拉起对应 Chromium。
 - 已经在 TikTok 页面提交的任务不会自动换号重试，避免重复扣点；账号离线时只会停止接收新任务。

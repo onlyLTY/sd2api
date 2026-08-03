@@ -782,7 +782,7 @@ class BrowserPoolClient:
         if enabled and target.get("seedance_access") is not True:
             raise TikTokUpstreamError(
                 f"Subaccount {advertiser_id!r} has no verified Seedance 2 access",
-                status_code=409,
+                status_code=403,
                 code="seedance_access_required",
             )
         updated = self.store.set_subaccount_enabled(account_id, advertiser_id, enabled)
@@ -893,6 +893,21 @@ class BrowserPoolClient:
                     if self._subaccount_eligible(subaccount)
                 )
             if not eligible:
+                online_subaccounts = [
+                    subaccount
+                    for status in statuses
+                    if status["enabled"] and status["running"] and status["logged_in"]
+                    for subaccount in status["subaccounts"]
+                ]
+                if online_subaccounts and not any(
+                    subaccount.get("seedance_access") is True
+                    for subaccount in online_subaccounts
+                ):
+                    raise TikTokUpstreamError(
+                        "No online subaccount has verified Seedance 2 access",
+                        status_code=403,
+                        code="seedance_access_required",
+                    )
                 raise TikTokUpstreamError(
                     "No selected subaccounts with verified Seedance 2 access and credits are available",
                     status_code=503,
