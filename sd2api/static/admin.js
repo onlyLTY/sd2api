@@ -224,17 +224,27 @@ function backendLabel(account) {
 function renderSubaccounts(account) {
   const items = account.subaccounts || [];
   if (!items.length) return '<div class="table-empty">尚未发现子账号。登录后点击“刷新子账号”获取权限与 Credits。</div>';
-  return `<div class="subaccounts">${items.map((sub) => `
+  return `<div class="subaccounts"><div class="subaccounts-head"><span>子账号</span><span>Seedance 权限</span><span>余额</span><span>加入调度</span><span>说明</span></div>${items.map((sub) => {
+    const canSchedule = sub.seedance_access === true;
+    const switchLabel = sub.enabled ? "已加入调度" : canSchedule ? "未加入调度" : "不可加入调度";
+    const note = canSchedule
+      ? (sub.enabled ? "会接收新任务" : "不会接收新任务")
+      : "缺少 Seedance 权限";
+    return `
     <div class="sub-row">
-      <label class="sub-name">
-        <input type="checkbox" data-sub-toggle data-account-id="${esc(account.id)}" data-advertiser-id="${esc(sub.advertiser_id)}" ${sub.enabled ? "checked" : ""} ${sub.seedance_access !== true ? "disabled" : ""}>
-        <div><strong>${esc(sub.name)}</strong><span class="cell-sub mono">${esc(sub.advertiser_id)} · ${esc(sub.account_type)}</span></div>
-      </label>
+      <div class="sub-name"><div><strong>${esc(sub.name)}</strong><span class="cell-sub mono">${esc(sub.advertiser_id)} · ${esc(sub.account_type)}</span></div></div>
       <div>${sub.seedance_access === true ? '<span class="pill ok">SD2 可用</span>' : sub.seedance_access === false ? '<span class="pill bad">无 SD2 权限</span>' : '<span class="pill wait">未检查</span>'}</div>
       <div><strong>${sub.credits ?? "—"}</strong><span class="cell-sub">Credits</span></div>
-      <div>${sub.active ? '<span class="pill info">当前</span>' : '<span class="muted">待调度</span>'}</div>
-      <div class="sub-error">${esc(sub.last_error || "")}</div>
-    </div>`).join("")}</div>`;
+      <label class="schedule-control ${canSchedule ? "" : "disabled"}">
+        <span class="switch">
+          <input type="checkbox" data-sub-toggle data-account-id="${esc(account.id)}" data-advertiser-id="${esc(sub.advertiser_id)}" aria-label="${esc(`将 ${sub.name} 加入生成调度`)}" ${sub.enabled ? "checked" : ""} ${canSchedule ? "" : "disabled"}>
+          <span class="switch-track"><span class="switch-thumb"></span></span>
+        </span>
+        <span class="switch-label">${esc(switchLabel)}</span>
+      </label>
+      <div><span class="sub-note ${canSchedule ? "" : "denied"}">${esc(note)}</span>${sub.last_error ? `<span class="sub-error">${esc(sub.last_error)}</span>` : ""}</div>
+    </div>`;
+  }).join("")}</div>`;
 }
 
 function renderAccounts(items) {
@@ -248,7 +258,7 @@ function renderAccounts(items) {
       <td><span class="cell-title">${esc(account.name)}</span><span class="cell-sub">${esc(account.username || "")}</span><span class="cell-sub mono">${esc(account.id)}</span></td>
       <td>${pill(account.login_state)}<span class="cell-sub">${account.logged_in ? "协议会话有效" : "会话不可用"}</span></td>
       <td>${backendLabel(account)}</td>
-      <td><strong>${(account.subaccounts || []).filter((sub) => sub.enabled).length}</strong> / ${(account.subaccounts || []).length}<span class="cell-sub">已启用 / 已发现</span></td>
+      <td><strong>${(account.subaccounts || []).filter((sub) => sub.enabled).length}</strong> / ${(account.subaccounts || []).length}<span class="cell-sub">已加入调度 / 已发现</span></td>
       <td>${account.busy ? '<span class="pill info">运行中</span>' : '<span class="muted">空闲</span>'}<span class="cell-sub">队列 ${account.queued || 0}</span></td>
       <td><span class="task-error-inline">${esc(account.login_error || account.last_error || "")}</span></td>
       <td><div class="row-actions">
@@ -534,7 +544,7 @@ async function toggleSubaccount(input) {
     await api(`/admin/accounts/${encodeURIComponent(input.dataset.accountId)}/subaccounts/${encodeURIComponent(input.dataset.advertiserId)}`, {
       method: "PATCH", body: JSON.stringify({ enabled: input.checked }),
     });
-    toast(input.checked ? "子账号已启用" : "子账号已停用", input.dataset.advertiserId);
+    toast(input.checked ? "已加入生成调度" : "已移出生成调度", input.dataset.advertiserId);
     await refreshAccounts();
   } catch (error) {
     input.checked = !input.checked;

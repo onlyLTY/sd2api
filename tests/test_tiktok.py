@@ -1824,6 +1824,10 @@ def test_admin_account_routes_without_starting_browser(
     assert ".sidebar" in styles.text
     assert script.status_code == 200
     assert "refreshVideos" in script.text
+    assert 'class="switch-track"' in script.text
+    assert "加入调度" in script.text
+    assert "待调度" not in script.text
+    assert '<span class="pill info">当前</span>' not in script.text
     assert logs.status_code == 200
     assert any(item["message"] == "账号已加入号池" for item in logs.json()["data"])
     assert secured.status_code == 200

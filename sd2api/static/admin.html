@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>sd2api 控制台</title>
-  <link rel="stylesheet" href="/admin/assets/admin.css?v=2">
-  <script defer src="/admin/assets/admin.js?v=2"></script>
+  <link rel="stylesheet" href="/admin/assets/admin.css?v=3">
+  <script defer src="/admin/assets/admin.js?v=3"></script>
 </head>
 <body>
   <div id="auth" class="auth-screen">
@@ -72,7 +72,7 @@
 
       <section id="page-generate" class="page active" data-page="generate">
         <div class="metric-grid generate-metrics">
-          <article class="metric-card accent"><span>可用 Credits</span><strong id="gCredits">—</strong><small>已启用子账号合计</small></article>
+          <article class="metric-card accent"><span>可用 Credits</span><strong id="gCredits">—</strong><small>已加入调度子账号合计</small></article>
           <article class="metric-card"><span>在线账号</span><strong id="gOnline">0</strong><small>协议会话有效</small></article>
           <article class="metric-card"><span>可用并发</span><strong id="gParallel">0</strong><small>当前可接收任务</small></article>
           <article class="metric-card"><span>生成中</span><strong id="gRunning">0</strong><small>上游活动任务</small></article>
@@ -172,12 +172,12 @@
           <article class="metric-card"><span>已登录</span><strong id="sOnline">0</strong><small>协议会话有效</small></article>
           <article class="metric-card"><span>登录中</span><strong id="sLogin">0</strong><small>正在完成验证</small></article>
           <article class="metric-card"><span>需验证码</span><strong id="sCaptcha">0</strong><small>需要人工操作</small></article>
-          <article class="metric-card"><span>启用子账号</span><strong id="sSubs">0</strong><small>参与任务调度</small></article>
+          <article class="metric-card"><span>调度子账号</span><strong id="sSubs">0</strong><small>已加入任务调度</small></article>
           <article class="metric-card"><span>可用并发</span><strong id="sParallel">0</strong><small>当前容量</small></article>
         </div>
         <section class="panel accounts-panel">
           <div class="panel-heading">
-            <div><p class="eyebrow">ACCOUNT POOL</p><h2>登录账号与 TikTok 子账号</h2><p class="muted">一个登录账号可管理多个 Client / Partner 子账号，并独立选择是否加入调度。</p></div>
+            <div><p class="eyebrow">ACCOUNT POOL</p><h2>登录账号与 TikTok 子账号</h2><p class="muted">“加入调度”开关决定该子账号是否接收新任务；没有 Seedance 权限的子账号无法开启。</p></div>
             <div class="button-group"><a id="novnc" class="button ghost" target="_blank" rel="noreferrer">打开 noVNC</a><button id="addAccountButton" class="button primary" type="button">添加账号</button></div>
           </div>
           <div class="table-wrap"><table class="accounts-table"><thead><tr><th>登录账号</th><th>状态</th><th>运行后端</th><th>子账号</th><th>任务</th><th>最近错误</th><th>操作</th></tr></thead><tbody id="accounts"></tbody></table></div>

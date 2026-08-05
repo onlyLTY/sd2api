@@ -118,7 +118,7 @@ ssh -L 8765:127.0.0.1:8765 -L 6080:127.0.0.1:6080 user@your-vps
 
 推荐在账号池面板中添加账号，只需填写 TikTok Ads 登录邮箱和密码。登录邮箱同时用于接收验证码，内部账号 ID 自动生成；加入号池后可在“编辑”中设置备注名称。密码经 Fernet 加密后才写入 SQLite，管理 API 和面板不会回传密码或密文。容器启动、账号掉线或点击“登录”时会自动执行账号密码登录，并通过 `cf_temp_mail` 的 `GET /api/emails?to_address=...` 获取本次登录产生的邮件验证码（支持纯数字及字母数字验证码）。
 
-登录成功后程序保存加密协议会话，并通过 TikTok 的结构化 JSON 接口读取全部 Client/Partner 子账号、Dreamina Seedance 2.0 权限、用户层级与 Credits，不再展开账号菜单或操作模型下拉框。每个子账号使用独立 CookieJar 和公开账号上下文 `s_aio_client_id`；Cookie、CSRF、fp ID、Client Hints 和 device ID 都从登录会话自动获得，不对管理 API 或用户配置暴露。子账号默认不加入生成池；管理员在面板中勾选一个或多个“SD2 可用”的子账号后才会参与调度。重新扫描会更新名称、权限和 Credits，但保留已有勾选结果。
+登录成功后程序保存加密协议会话，并通过 TikTok 的结构化 JSON 接口读取全部 Client/Partner 子账号、Dreamina Seedance 2.0 权限、用户层级与 Credits，不再展开账号菜单或操作模型下拉框。每个子账号使用独立 CookieJar 和公开账号上下文 `s_aio_client_id`；Cookie、CSRF、fp ID、Client Hints 和 device ID 都从登录会话自动获得，不对管理 API 或用户配置暴露。子账号默认不加入生成池；管理员在面板中打开一个或多个“SD2 可用”子账号的“加入调度”开关后才会参与调度，无权限子账号的开关保持禁用。重新扫描会更新名称、权限和 Credits，但保留已有开关状态。
 
 协议请求由 `curl_cffi` 使用 Chrome TLS/HTTP2 指纹发送；素材上传支持 ImageX/VOD 直传和分片，不需要后台保留 Chromium 进程。会话密文只使用 `SD2API_CREDENTIAL_KEY`（或回退的 Admin Key）解密，管理 API 永远不会返回 Cookie、密码或密文。
 
