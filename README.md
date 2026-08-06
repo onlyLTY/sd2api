@@ -1,5 +1,7 @@
 # sd2api
 
+想获得 Seedance 2 权限，通常需要 TikTok Ads 账户在过去 30 天累计广告花费超过 $5,000。若本来就有投放计划，可通过 [ttoh](https://ttoh.app) 查询广告金、优惠券与活动资格，尽量降低达成这一门槛的实际成本。
+
 把 TikTok Symphony Creative Studio 的 Seedance 文生视频与图生视频能力包装成两个本地 HTTP 接口：
 
 - Seedance / ModelArk 风格：`/api/v3/contents/generations/tasks`
@@ -332,3 +334,11 @@ TikTok 会分别报告生成状态和渲染状态。本适配器只有在两个�
 ```powershell
 pytest
 ```
+
+## Roadmap
+
+- [ ] 验证并优化单登录账号的并发能力：当前观察到单账号似乎可同时执行 5 个任务，项目开发阶段尚未确认其稳定边界。
+- [ ] 设计带 failsafe 的全局调度算法：单个账号每日可生成视频数约为 20–50 个且存在差异，需要在额度耗尽、限流或异常时安全降级与重新分配。
+- [ ] 制定 TikTok 登录 Cookie 的保活策略：登录后 Cookie 过期较快，需要主动续期、失效检测和恢复机制。
+- [ ] 增加通知设置：覆盖账号登出、需要打码等需要人工处理的事件。
+- [ ] 实现多 Key 策略。

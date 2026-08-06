@@ -10,11 +10,15 @@ RUN apt-get update \
         fonts-noto-cjk \
         novnc \
         openbox \
+        python3-venv \
         tint2 \
         websockify \
         x11vnc \
         xvfb \
     && rm -rf /var/lib/apt/lists/*
+
+RUN python -m venv /opt/sd2api-venv
+ENV PATH="/opt/sd2api-venv/bin:${PATH}"
 
 WORKDIR /app
 
