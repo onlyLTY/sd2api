@@ -1905,6 +1905,57 @@ async def test_pool_fails_over_when_subaccount_hits_daily_quota(
 
 
 @pytest.mark.asyncio
+async def test_pool_returns_429_when_every_selected_subaccount_is_quota_blocked(
+    tmp_path: Path,
+) -> None:
+    store = TaskStore(str(tmp_path / "all-quota-blocked.db"))
+    store.create_account(account_id="a", name="A")
+    store.upsert_subaccounts(
+        "a",
+        [
+            {
+                "advertiser_id": "sub-a",
+                "name": "Sub A",
+                "account_type": "partner",
+                "seedance_access": True,
+                "credits": 100,
+            }
+        ],
+    )
+    store.set_subaccount_enabled("a", "sub-a", True)
+    store.update_subaccount(
+        "a",
+        "sub-a",
+        quota_blocked_until=int(time.time()) + 600,
+        quota_reason="Daily generation limit reached",
+        quota_updated_at=int(time.time()),
+    )
+    pool = BrowserPoolClient(Settings(), store)
+
+    async def fake_list_accounts() -> list[dict[str, Any]]:
+        return [
+            {
+                "id": "a",
+                "enabled": True,
+                "running": True,
+                "logged_in": True,
+                "session_available": True,
+                "subaccounts": pool._decorate_subaccounts(
+                    "a", store.list_subaccounts("a")
+                ),
+            }
+        ]
+
+    pool.list_accounts = fake_list_accounts  # type: ignore[method-assign]
+    with pytest.raises(TikTokUpstreamError) as error:
+        await pool.create_text_video(
+            prompt="blocked", model="seedance-2.0", duration=5
+        )
+    assert error.value.status_code == 429
+    assert error.value.code == "subaccount_daily_quota_exhausted"
+
+
+@pytest.mark.asyncio
 async def test_refresh_subaccounts_is_allowed_while_generation_is_active(
     tmp_path: Path,
 ) -> None:

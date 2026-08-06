@@ -974,6 +974,26 @@ class BrowserPoolClient:
                     if status["enabled"] and status["running"] and status["logged_in"]
                     for subaccount in status["subaccounts"]
                 ]
+                selected_subaccounts = [
+                    subaccount
+                    for subaccount in online_subaccounts
+                    if subaccount.get("enabled")
+                    and subaccount.get("seedance_access") is True
+                    and (
+                        subaccount.get("credits") is None
+                        or int(subaccount["credits"]) > 0
+                    )
+                ]
+                if selected_subaccounts and all(
+                    int(subaccount.get("quota_blocked_until") or 0)
+                    > int(time.time())
+                    for subaccount in selected_subaccounts
+                ):
+                    raise TikTokUpstreamError(
+                        "All selected subaccounts have exhausted their daily generation quota",
+                        status_code=429,
+                        code="subaccount_daily_quota_exhausted",
+                    )
                 if online_subaccounts and not any(
                     subaccount.get("seedance_access") is True
                     for subaccount in online_subaccounts
