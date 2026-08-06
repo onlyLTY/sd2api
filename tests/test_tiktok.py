@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import base64
 import json
 from io import BytesIO
@@ -1092,6 +1093,36 @@ async def test_protocol_client_uses_isolated_subaccount_cookie_and_login_headers
 
 
 @pytest.mark.asyncio
+async def test_protocol_http_error_preserves_upstream_code_and_message() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            json={
+                "BaseResp": {
+                    "StatusCode": "daily-quota-code",
+                    "StatusMessage": "Daily generation limit reached",
+                }
+            },
+        )
+
+    client = ProtocolTikTokClient(
+        Settings(),
+        protocol_session(),
+        account_id="account-a",
+        advertiser_id="123456789012",
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(TikTokUpstreamError) as error:
+        await client.create_text_video(
+            prompt="quota", model="seedance-2.0", duration=5
+        )
+    await client.close()
+    assert error.value.status_code == 429
+    assert error.value.code == "daily-quota-code"
+    assert str(error.value) == "Daily generation limit reached"
+
+
+@pytest.mark.asyncio
 async def test_protocol_status_two_is_running_until_zero_with_vid() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -1697,6 +1728,9 @@ async def test_protocol_pool_balances_concurrency_across_same_login_subaccounts(
             return f"{self.advertiser_id}-task-{self.calls}"
 
     clients = {name: FakeProtocol(name) for name in ("sub-a", "sub-b")}
+    pool._protocol_clients = {
+        ("login-a", name): client for name, client in clients.items()
+    }  # type: ignore[assignment]
     pool.list_accounts = fake_list_accounts  # type: ignore[method-assign]
     pool._protocol_client = (  # type: ignore[method-assign]
         lambda _account_id, advertiser_id=None: clients[str(advertiser_id)]
@@ -1719,7 +1753,197 @@ async def test_protocol_pool_balances_concurrency_across_same_login_subaccounts(
     ]
     assert clients["sub-a"].load == clients["sub-b"].load == 2
     status = await pool.status()
-    assert status["max_parallel"] == 2
+    assert status["max_parallel"] == 6
+
+
+@pytest.mark.asyncio
+async def test_protocol_pool_limits_each_subaccount_to_five_active_tasks(
+    tmp_path: Path,
+) -> None:
+    store = TaskStore(str(tmp_path / "five-slots.db"))
+    store.create_account(account_id="login-a", name="Login A")
+    store.upsert_subaccounts(
+        "login-a",
+        [
+            {
+                "advertiser_id": "sub-a",
+                "name": "Sub A",
+                "account_type": "partner",
+                "seedance_access": True,
+                "credits": 100,
+            },
+            {
+                "advertiser_id": "sub-b",
+                "name": "Sub B",
+                "account_type": "partner",
+                "seedance_access": True,
+                "credits": 100,
+            },
+        ],
+    )
+    store.set_subaccount_enabled("login-a", "sub-a", True)
+    store.set_subaccount_enabled("login-a", "sub-b", True)
+    pool = BrowserPoolClient(
+        Settings(sd2api_pool_subaccount_concurrency=5), store
+    )
+
+    async def fake_list_accounts() -> list[dict[str, Any]]:
+        return [
+            {
+                "id": "login-a",
+                "enabled": True,
+                "running": True,
+                "logged_in": True,
+                "session_available": True,
+                "subaccounts": pool._decorate_subaccounts(
+                    "login-a", store.list_subaccounts("login-a")
+                ),
+            }
+        ]
+
+    class FakeProtocol:
+        def __init__(self, advertiser_id: str) -> None:
+            self.advertiser_id = advertiser_id
+            self.load = 0
+
+        async def create_text_video(self, **kwargs: Any) -> str:
+            self.load += 1
+            return f"{self.advertiser_id}-task-{self.load}"
+
+    clients = {name: FakeProtocol(name) for name in ("sub-a", "sub-b")}
+    pool.list_accounts = fake_list_accounts  # type: ignore[method-assign]
+    pool._protocol_client = (  # type: ignore[method-assign]
+        lambda _account_id, advertiser_id=None: clients[str(advertiser_id)]
+    )
+
+    tasks = []
+    for index in range(10):
+        tasks.append(
+            await pool.create_text_video(
+                prompt=f"slot-{index}", model="seedance-2.0", duration=5
+            )
+        )
+    assert clients["sub-a"].load == clients["sub-b"].load == 5
+    with pytest.raises(TikTokUpstreamError) as error:
+        await pool.create_text_video(
+            prompt="overflow", model="seedance-2.0", duration=5
+        )
+    assert error.value.status_code == 429
+    assert error.value.code == "subaccount_concurrency_full"
+
+
+@pytest.mark.asyncio
+async def test_pool_fails_over_when_subaccount_hits_daily_quota(
+    tmp_path: Path,
+) -> None:
+    store = TaskStore(str(tmp_path / "quota-failover.db"))
+    for account_id, advertiser_id in (("a", "sub-a"), ("b", "sub-b")):
+        store.create_account(account_id=account_id, name=account_id)
+        store.upsert_subaccounts(
+            account_id,
+            [
+                {
+                    "advertiser_id": advertiser_id,
+                    "name": advertiser_id,
+                    "account_type": "partner",
+                    "seedance_access": True,
+                    "credits": 100,
+                }
+            ],
+        )
+        store.set_subaccount_enabled(account_id, advertiser_id, True)
+    pool = BrowserPoolClient(Settings(sd2api_pool_quota_cooldown=600), store)
+
+    async def fake_list_accounts() -> list[dict[str, Any]]:
+        return [
+            {
+                "id": account_id,
+                "enabled": True,
+                "running": True,
+                "logged_in": True,
+                "session_available": True,
+                "subaccounts": pool._decorate_subaccounts(
+                    account_id, store.list_subaccounts(account_id)
+                ),
+            }
+            for account_id in ("a", "b")
+        ]
+
+    class QuotaClient:
+        load = 0
+
+        async def create_text_video(self, **kwargs: Any) -> str:
+            raise TikTokUpstreamError(
+                "Daily generation limit reached",
+                status_code=429,
+                code="daily_limit",
+            )
+
+    class HealthyClient:
+        load = 0
+
+        async def create_text_video(self, **kwargs: Any) -> str:
+            self.load += 1
+            return "healthy-task"
+
+    clients = {"sub-a": QuotaClient(), "sub-b": HealthyClient()}
+    pool.list_accounts = fake_list_accounts  # type: ignore[method-assign]
+    pool._protocol_client = (  # type: ignore[method-assign]
+        lambda _account_id, advertiser_id=None: clients[str(advertiser_id)]
+    )
+
+    task_id = await pool.create_text_video(
+        prompt="fail over", model="seedance-2.0", duration=5
+    )
+    assert task_id == "healthy-task"
+    blocked = next(
+        item for item in store.list_subaccounts("a") if item["advertiser_id"] == "sub-a"
+    )
+    assert blocked["quota_blocked_until"] > int(time.time())
+    assert blocked["quota_reason"] == "Daily generation limit reached"
+    assert pool.account_for_task(task_id) == "b"
+
+
+@pytest.mark.asyncio
+async def test_refresh_subaccounts_is_allowed_while_generation_is_active(
+    tmp_path: Path,
+) -> None:
+    store = TaskStore(str(tmp_path / "refresh-active.db"))
+    store.create_account(account_id="login-a", name="Login A")
+    store.create(
+        task_id="active-task",
+        api="openai",
+        model="seedance-2.0",
+        prompt="active",
+        seconds=5,
+        account_id="login-a",
+        advertiser_id="sub-a",
+    )
+    pool = BrowserPoolClient(Settings(), store)
+
+    class RootClient:
+        async def discover_subaccounts(self) -> list[dict[str, Any]]:
+            return [
+                {
+                    "advertiser_id": "sub-a",
+                    "name": "Sub A",
+                    "account_type": "partner",
+                }
+            ]
+
+    class SubClient:
+        async def account_capabilities(self) -> dict[str, Any]:
+            return {
+                "advertiser_id": "sub-a",
+                "credits": 95,
+                "seedance_access": True,
+            }
+
+    pool._protocol_client = (  # type: ignore[method-assign]
+        lambda _account_id, advertiser_id=None: SubClient() if advertiser_id else RootClient()
+    )
+    result = await pool.refresh_subaccounts("login-a", check_access=True)
+    assert result["subaccounts"][0]["credits"] == 95
 
 
 @pytest.mark.asyncio

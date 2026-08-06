@@ -3,6 +3,9 @@ const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
 }[char]));
+const formatUnix = (value) => value
+  ? new Date(Number(value) * 1000).toLocaleString("zh-CN", { hour12: false })
+  : "—";
 
 const state = {
   key: sessionStorage.getItem("sd2api_admin_key") || "",
@@ -226,23 +229,28 @@ function renderSubaccounts(account) {
   if (!items.length) return '<div class="table-empty">尚未发现子账号。登录后点击“刷新子账号”获取权限与 Credits。</div>';
   return `<div class="subaccounts"><div class="subaccounts-head"><span>子账号</span><span>Seedance 权限</span><span>余额</span><span>加入调度</span><span>说明</span></div>${items.map((sub) => {
     const canSchedule = sub.seedance_access === true;
-    const switchLabel = sub.enabled ? "已加入调度" : canSchedule ? "未加入调度" : "不可加入调度";
+    const switchLabel = sub.quota_blocked ? "额度熔断中" : sub.enabled ? "已加入调度" : canSchedule ? "未加入调度" : "不可加入调度";
     const note = canSchedule
-      ? (sub.enabled ? "会接收新任务" : "不会接收新任务")
+      ? (sub.quota_blocked
+        ? `今日额度受限，暂停至 ${formatUnix(sub.quota_blocked_until)}`
+        : sub.enabled
+          ? `运行中 ${sub.active_tasks || 0} / ${sub.concurrency_limit || 5} · 今日已提交 ${sub.tasks_today || 0}`
+          : "不会接收新任务")
       : "缺少 Seedance 权限";
+    const schedulable = canSchedule;
     return `
     <div class="sub-row">
       <div class="sub-name"><div><strong>${esc(sub.name)}</strong><span class="cell-sub mono">${esc(sub.advertiser_id)} · ${esc(sub.account_type)}</span></div></div>
       <div>${sub.seedance_access === true ? '<span class="pill ok">SD2 可用</span>' : sub.seedance_access === false ? '<span class="pill bad">无 SD2 权限</span>' : '<span class="pill wait">未检查</span>'}</div>
       <div><strong>${sub.credits ?? "—"}</strong><span class="cell-sub">Credits</span></div>
-      <label class="schedule-control ${canSchedule ? "" : "disabled"}">
+      <label class="schedule-control ${schedulable ? "" : "disabled"}">
         <span class="switch">
-          <input type="checkbox" data-sub-toggle data-account-id="${esc(account.id)}" data-advertiser-id="${esc(sub.advertiser_id)}" aria-label="${esc(`将 ${sub.name} 加入生成调度`)}" ${sub.enabled ? "checked" : ""} ${canSchedule ? "" : "disabled"}>
+          <input type="checkbox" data-sub-toggle data-account-id="${esc(account.id)}" data-advertiser-id="${esc(sub.advertiser_id)}" aria-label="${esc(`将 ${sub.name} 加入生成调度`)}" ${sub.enabled ? "checked" : ""} ${schedulable ? "" : "disabled"}>
           <span class="switch-track"><span class="switch-thumb"></span></span>
         </span>
         <span class="switch-label">${esc(switchLabel)}</span>
       </label>
-      <div><span class="sub-note ${canSchedule ? "" : "denied"}">${esc(note)}</span>${sub.last_error ? `<span class="sub-error">${esc(sub.last_error)}</span>` : ""}</div>
+      <div><span class="sub-note ${canSchedule && !sub.quota_blocked ? "" : "denied"}">${esc(note)}</span>${sub.last_error && !sub.quota_blocked ? `<span class="sub-error">${esc(sub.last_error)}</span>` : ""}</div>
     </div>`;
   }).join("")}</div>`;
 }

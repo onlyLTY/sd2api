@@ -147,10 +147,29 @@ class TaskStore:
                     active INTEGER NOT NULL DEFAULT 0,
                     last_checked_at INTEGER,
                     last_error TEXT,
+                    quota_blocked_until INTEGER,
+                    quota_reason TEXT,
+                    quota_updated_at INTEGER,
                     PRIMARY KEY (account_id, advertiser_id)
                 )
                 """
             )
+            subaccount_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(subaccounts)"
+                ).fetchall()
+            }
+            subaccount_migrations = {
+                "quota_blocked_until": "INTEGER",
+                "quota_reason": "TEXT",
+                "quota_updated_at": "INTEGER",
+            }
+            for name, declaration in subaccount_migrations.items():
+                if name not in subaccount_columns:
+                    connection.execute(
+                        f"ALTER TABLE subaccounts ADD COLUMN {name} {declaration}"
+                    )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS events (
@@ -362,6 +381,34 @@ class TaskStore:
             counts[status] = value
             counts["total"] += value
         return counts
+
+    def active_task_ids(
+        self, account_id: str, advertiser_id: str
+    ) -> list[str]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id FROM tasks
+                WHERE account_id = ? AND advertiser_id = ?
+                  AND status IN ('queued', 'running')
+                ORDER BY created_at, id
+                """,
+                (account_id, advertiser_id),
+            ).fetchall()
+        return [str(row["id"]) for row in rows]
+
+    def task_count_since(
+        self, account_id: str, advertiser_id: str, since: int
+    ) -> int:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM tasks
+                WHERE account_id = ? AND advertiser_id = ? AND created_at >= ?
+                """,
+                (account_id, advertiser_id, since),
+            ).fetchone()
+        return int(row["count"] if row else 0)
 
     def list_events(
         self,
@@ -624,6 +671,9 @@ class TaskStore:
             "active",
             "last_checked_at",
             "last_error",
+            "quota_blocked_until",
+            "quota_reason",
+            "quota_updated_at",
         }
         invalid = set(changes) - allowed
         if invalid:

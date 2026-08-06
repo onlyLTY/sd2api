@@ -699,6 +699,9 @@ async def admin_config_status() -> dict[str, Any]:
         "relogin_interval": settings.sd2api_relogin_interval,
         "protocol_transport": "curl_cffi/chrome",
         "protocol_upload_concurrency": settings.sd2api_protocol_upload_concurrency,
+        "subaccount_concurrency": settings.sd2api_pool_subaccount_concurrency,
+        "quota_cooldown": settings.sd2api_pool_quota_cooldown,
+        "daily_quota_codes": settings.sd2api_pool_daily_quota_codes,
     }
 
 

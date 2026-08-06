@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     sd2api_browser_max_wait: int = Field(default=1800, ge=60, le=7200)
     sd2api_browser_autostart: bool = False
     sd2api_pool_max_pending: int = Field(default=500, ge=1, le=100000)
+    sd2api_pool_subaccount_concurrency: int = Field(default=5, ge=1, le=20)
+    sd2api_pool_quota_cooldown: int = Field(default=86400, ge=300, le=604800)
+    sd2api_pool_daily_quota_codes: str = ""
     sd2api_pool_start_concurrency: int = Field(default=3, ge=1, le=50)
     sd2api_protocol_upload_concurrency: int = Field(default=3, ge=1, le=16)
     sd2api_protocol_direct_upload_bytes: int = Field(

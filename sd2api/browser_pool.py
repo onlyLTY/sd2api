@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 import hashlib
 import json
 from pathlib import Path
@@ -198,18 +199,20 @@ class BrowserPoolClient:
             "running_jobs": sum(int(account.get("queued", 0)) for account in accounts),
             "queued_jobs": sum(int(account.get("queued", 0)) for account in accounts),
             "max_parallel": sum(
-                (
-                    sum(
-                        self._subaccount_eligible(item)
-                        for item in account["subaccounts"]
-                    )
-                    if account.get("session_available")
-                    else int(
-                        any(
-                            self._subaccount_eligible(item)
-                            for item in account["subaccounts"]
+                sum(
+                    (
+                        int(item["available_slots"])
+                        if item.get("available_slots") is not None
+                        else max(
+                            0,
+                            self.settings.sd2api_pool_subaccount_concurrency
+                            - self._subaccount_load(
+                                account["id"], item["advertiser_id"]
+                            ),
                         )
                     )
+                    for item in account["subaccounts"]
+                    if self._subaccount_eligible(item)
                 )
                 if account.get("enabled") and account.get("logged_in")
                 else 0
@@ -219,6 +222,9 @@ class BrowserPoolClient:
             "enabled_subaccounts": sum(bool(item["enabled"]) for item in subaccounts),
             "eligible_subaccounts": sum(
                 self._subaccount_eligible(item) for item in subaccounts
+            ),
+            "quota_blocked_subaccounts": sum(
+                bool(item.get("quota_blocked")) for item in subaccounts
             ),
             "logging_in": sum(
                 account.get("login_state")
@@ -241,11 +247,7 @@ class BrowserPoolClient:
                     account["id"] in self._started_accounts
                     and account.get("session_available")
                 ):
-                    protocol_load = sum(
-                        client.load
-                        for (owner, _), client in self._protocol_clients.items()
-                        if owner == account["id"]
-                    )
+                    protocol_load = self._account_load(account["id"])
                     runtime = {
                         "running": True,
                         "browser_running": False,
@@ -274,7 +276,9 @@ class BrowserPoolClient:
                 {
                     **account,
                     **runtime,
-                    "subaccounts": self.store.list_subaccounts(account["id"]),
+                    "subaccounts": self._decorate_subaccounts(
+                        account["id"], self.store.list_subaccounts(account["id"])
+                    ),
                 }
             )
         return result
@@ -302,7 +306,88 @@ class BrowserPoolClient:
     def _subaccount_eligible(item: dict[str, Any]) -> bool:
         return bool(item.get("enabled")) and item.get("seedance_access") is True and (
             item.get("credits") is None or int(item["credits"]) > 0
+        ) and int(item.get("quota_blocked_until") or 0) <= int(time.time())
+
+    def _subaccount_load(self, account_id: str, advertiser_id: str) -> int:
+        stored = len(self.store.active_task_ids(account_id, advertiser_id))
+        client = self._protocol_clients.get((account_id, advertiser_id))
+        return max(stored, client.load if client is not None else 0)
+
+    def _account_load(self, account_id: str) -> int:
+        stored = sum(
+            self._subaccount_load(account_id, item["advertiser_id"])
+            for item in self.store.list_subaccounts(account_id)
         )
+        client_only = sum(
+            client.load
+            for (owner, advertiser_id), client in self._protocol_clients.items()
+            if owner == account_id and advertiser_id is None
+        )
+        return stored + client_only
+
+    @staticmethod
+    def _today_start() -> int:
+        now = datetime.now().astimezone()
+        return int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+
+    def _is_daily_quota_error(self, exc: TikTokUpstreamError) -> bool:
+        configured_codes = {
+            item.strip()
+            for item in self.settings.sd2api_pool_daily_quota_codes.split(",")
+            if item.strip()
+        }
+        if exc.code in configured_codes:
+            return True
+        text = f"{exc.code} {exc}".lower()
+        markers = (
+            "daily limit",
+            "daily quota",
+            "daily generation",
+            "generation limit reached",
+            "quota exceeded",
+            "maximum number of generations",
+            "今日",
+            "当天",
+            "每日",
+            "日上限",
+            "次数已达",
+            "达到上限",
+            "已达上限",
+            "用量上限",
+            "生成额度",
+        )
+        return any(marker in text for marker in markers)
+
+    def _decorate_subaccounts(
+        self, account_id: str, items: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        now = int(time.time())
+        result: list[dict[str, Any]] = []
+        for item in items:
+            decorated = dict(item)
+            advertiser_id = str(item["advertiser_id"])
+            active_tasks = self._subaccount_load(account_id, advertiser_id)
+            blocked_until = int(item.get("quota_blocked_until") or 0)
+            quota_blocked = blocked_until > now
+            decorated.update(
+                active_tasks=active_tasks,
+                concurrency_limit=self.settings.sd2api_pool_subaccount_concurrency,
+                available_slots=(
+                    0
+                    if quota_blocked
+                    else max(
+                        0,
+                        self.settings.sd2api_pool_subaccount_concurrency
+                        - active_tasks,
+                    )
+                ),
+                quota_blocked=quota_blocked,
+                tasks_today=self.store.task_count_since(
+                    account_id, advertiser_id, self._today_start()
+                ),
+            )
+            result.append(decorated)
+        return result
 
     async def add_account(
         self,
@@ -521,11 +606,7 @@ class BrowserPoolClient:
             await asyncio.gather(login_task, return_exceptions=True)
             self._login_tasks.pop(account_id, None)
         worker = self._workers.pop(account_id, None)
-        protocol_load = sum(
-            client.load
-            for (owner, _), client in self._protocol_clients.items()
-            if owner == account_id
-        )
+        protocol_load = self._account_load(account_id)
         if protocol_load > 0 and not force:
             if worker:
                 self._workers[account_id] = worker
@@ -712,17 +793,6 @@ class BrowserPoolClient:
                 status_code=404,
                 code="account_not_found",
             )
-        active_load = sum(
-            client.load
-            for (owner, _), client in self._protocol_clients.items()
-            if owner == account_id
-        )
-        if active_load > 0:
-            raise TikTokUpstreamError(
-                f"Account {account_id!r} is busy and cannot refresh subaccounts",
-                status_code=409,
-                code="account_busy",
-            )
         try:
             root_client = self._protocol_client(account_id)
             discovered = await root_client.discover_subaccounts()
@@ -785,6 +855,12 @@ class BrowserPoolClient:
                 status_code=403,
                 code="seedance_access_required",
             )
+        if enabled and int(target.get("quota_blocked_until") or 0) > int(time.time()):
+            raise TikTokUpstreamError(
+                f"Subaccount {advertiser_id!r} reached its daily generation limit",
+                status_code=429,
+                code="subaccount_daily_quota_exhausted",
+            )
         updated = self.store.set_subaccount_enabled(account_id, advertiser_id, enabled)
         return updated
 
@@ -803,11 +879,7 @@ class BrowserPoolClient:
                 runtime.setdefault("browser_running", True)
                 runtime.setdefault("backend", "browser")
             elif account_id in self._started_accounts and account.get("session_available"):
-                protocol_load = sum(
-                    client.load
-                    for (owner, _), client in self._protocol_clients.items()
-                    if owner == account_id
-                )
+                protocol_load = self._account_load(account_id)
                 runtime = {
                     "running": True,
                     "browser_running": False,
@@ -833,7 +905,9 @@ class BrowserPoolClient:
         return {
             **account,
             **runtime,
-            "subaccounts": self.store.list_subaccounts(account_id),
+            "subaccounts": self._decorate_subaccounts(
+                account_id, self.store.list_subaccounts(account_id)
+            ),
         }
 
     async def create_text_video(self, *, prompt: str, model: str, duration: int) -> str:
@@ -882,6 +956,7 @@ class BrowserPoolClient:
         media: list[StagedMedia],
     ) -> str:
         async with self._scheduler_lock:
+            cleanup_protocol_media = False
             statuses = await self.list_accounts()
             eligible: list[tuple[dict[str, Any], dict[str, Any]]] = []
             for status in statuses:
@@ -913,12 +988,21 @@ class BrowserPoolClient:
                     status_code=503,
                     code="account_pool_unavailable",
                 )
+
             def pair_load(pair: tuple[dict[str, Any], dict[str, Any]]) -> int:
                 status, subaccount = pair
                 if status.get("session_available"):
-                    return self._protocol_client(
-                        status["id"], subaccount["advertiser_id"]
-                    ).load
+                    stored = len(
+                        self.store.active_task_ids(
+                            status["id"], subaccount["advertiser_id"]
+                        )
+                    )
+                    return max(
+                        stored,
+                        self._protocol_client(
+                            status["id"], subaccount["advertiser_id"]
+                        ).load,
+                    )
                 return self._worker(status["id"]).load
 
             total_pending = sum(pair_load(pair) for pair in eligible)
@@ -928,69 +1012,133 @@ class BrowserPoolClient:
                     status_code=429,
                     code="pool_queue_full",
                 )
-            selected_account, selected_subaccount = min(
-                eligible,
-                key=lambda pair: (
-                    pair_load(pair),
-                    -int(pair[1]["credits"])
-                    if isinstance(pair[1].get("credits"), int)
-                    else 1,
-                    self._last_selected.get(
-                        f'{pair[0]["id"]}:{pair[1]["advertiser_id"]}', -1
-                    ),
-                    pair[0]["id"],
-                    pair[1]["advertiser_id"],
-                ),
-            )
-            account_id = selected_account["id"]
-            advertiser_id = selected_subaccount["advertiser_id"]
-            protocol_mode = bool(selected_account.get("session_available"))
-            if protocol_mode:
-                target: Any = self._protocol_client(account_id, advertiser_id)
-            else:
-                target = self._worker(account_id)
+
+            candidates = [
+                pair
+                for pair in eligible
+                if pair_load(pair) < self.settings.sd2api_pool_subaccount_concurrency
+            ]
+            if not candidates:
+                raise TikTokUpstreamError(
+                    "All selected subaccounts are at their concurrency limit",
+                    status_code=429,
+                    code="subaccount_concurrency_full",
+                )
+
             try:
-                if mode == "image":
-                    kwargs: dict[str, Any] = {
-                        "prompt": prompt,
-                        "model": model,
-                        "duration": duration,
-                        "image_path": media[0].path,
-                    }
-                    if not protocol_mode:
-                        kwargs["advertiser_id"] = advertiser_id
-                    task_id = await target.create_image_video(**kwargs)
-                elif mode == "reference":
-                    kwargs = {
-                        "prompt": prompt,
-                        "model": model,
-                        "duration": duration,
-                        "media": media,
-                    }
-                    if not protocol_mode:
-                        kwargs["advertiser_id"] = advertiser_id
-                    task_id = await target.create_reference_video(**kwargs)
-                else:
-                    kwargs = {
-                        "prompt": prompt,
-                        "model": model,
-                        "duration": duration,
-                    }
-                    if not protocol_mode:
-                        kwargs["advertiser_id"] = advertiser_id
-                    task_id = await target.create_text_video(**kwargs)
+                while candidates:
+                    selected_account, selected_subaccount = min(
+                        candidates,
+                        key=lambda pair: (
+                            pair_load(pair),
+                            int(pair[1].get("tasks_today") or 0),
+                            -int(pair[1]["credits"])
+                            if isinstance(pair[1].get("credits"), int)
+                            else 1,
+                            self._last_selected.get(
+                                f'{pair[0]["id"]}:{pair[1]["advertiser_id"]}',
+                                -1,
+                            ),
+                            pair[0]["id"],
+                            pair[1]["advertiser_id"],
+                        ),
+                    )
+                    candidates.remove((selected_account, selected_subaccount))
+                    account_id = selected_account["id"]
+                    advertiser_id = selected_subaccount["advertiser_id"]
+                    protocol_mode = bool(selected_account.get("session_available"))
+                    cleanup_protocol_media = protocol_mode
+                    target: Any = (
+                        self._protocol_client(account_id, advertiser_id)
+                        if protocol_mode
+                        else self._worker(account_id)
+                    )
+                    try:
+                        if mode == "image":
+                            kwargs: dict[str, Any] = {
+                                "prompt": prompt,
+                                "model": model,
+                                "duration": duration,
+                                "image_path": media[0].path,
+                            }
+                            if not protocol_mode:
+                                kwargs["advertiser_id"] = advertiser_id
+                            task_id = await target.create_image_video(**kwargs)
+                        elif mode == "reference":
+                            kwargs = {
+                                "prompt": prompt,
+                                "model": model,
+                                "duration": duration,
+                                "media": media,
+                            }
+                            if not protocol_mode:
+                                kwargs["advertiser_id"] = advertiser_id
+                            task_id = await target.create_reference_video(**kwargs)
+                        else:
+                            kwargs = {
+                                "prompt": prompt,
+                                "model": model,
+                                "duration": duration,
+                            }
+                            if not protocol_mode:
+                                kwargs["advertiser_id"] = advertiser_id
+                            task_id = await target.create_text_video(**kwargs)
+                    except TikTokUpstreamError as exc:
+                        if not self._is_daily_quota_error(exc):
+                            raise
+                        blocked_until = (
+                            int(time.time())
+                            + self.settings.sd2api_pool_quota_cooldown
+                        )
+                        self.store.update_subaccount(
+                            account_id,
+                            advertiser_id,
+                            quota_blocked_until=blocked_until,
+                            quota_reason=str(exc),
+                            quota_updated_at=int(time.time()),
+                            last_error=str(exc),
+                        )
+                        self.store.add_event(
+                            level="warning",
+                            category="account",
+                            message="Subaccount daily generation quota exhausted",
+                            account_id=account_id,
+                            details={
+                                "advertiser_id": advertiser_id,
+                                "blocked_until": blocked_until,
+                                "upstream_code": exc.code,
+                                "upstream_message": str(exc),
+                            },
+                        )
+                        continue
+                    self._selection_counter += 1
+                    self._last_selected[
+                        f"{account_id}:{advertiser_id}"
+                    ] = self._selection_counter
+                    self._task_accounts[task_id] = account_id
+                    self._task_advertisers[task_id] = advertiser_id
+                    if selected_subaccount.get("quota_reason"):
+                        self.store.update_subaccount(
+                            account_id,
+                            advertiser_id,
+                            quota_blocked_until=None,
+                            quota_reason=None,
+                            quota_updated_at=None,
+                            last_error=None,
+                        )
+                    return task_id
+                raise TikTokUpstreamError(
+                    "All selected subaccounts have exhausted their daily generation quota",
+                    status_code=429,
+                    code="subaccount_daily_quota_exhausted",
+                )
             finally:
-                if protocol_mode:
+                if cleanup_protocol_media:
                     upload_root = Path(self.settings.sd2api_upload_dir).resolve()
                     for item in media:
                         path = Path(item.path).resolve()
                         if path.is_relative_to(upload_root):
                             path.unlink(missing_ok=True)
-            self._selection_counter += 1
-            self._last_selected[f"{account_id}:{advertiser_id}"] = self._selection_counter
-            self._task_accounts[task_id] = account_id
-            self._task_advertisers[task_id] = advertiser_id
-            return task_id
 
     def account_for_task(self, task_id: str) -> str | None:
         return self._task_accounts.get(task_id)

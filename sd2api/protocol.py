@@ -493,9 +493,38 @@ class ProtocolTikTokClient:
                 code=str(code or "tiktok_permission_denied"),
             )
         if response.status_code >= 400:
+            try:
+                rejected = response.json()
+            except ValueError:
+                rejected = {}
+            rejected_base = (
+                rejected.get("BaseResp") if isinstance(rejected, dict) else None
+            )
+            rejected_code = (
+                rejected_base.get("StatusCode")
+                if isinstance(rejected_base, dict)
+                else None
+            ) or (
+                _first(rejected, ("code", "status_code", "statusCode"))
+                if isinstance(rejected, dict)
+                else None
+            )
+            rejected_message = (
+                _first(rejected, ("message", "msg", "status_message"))
+                if isinstance(rejected, dict)
+                else None
+            ) or (
+                rejected_base.get("StatusMessage")
+                if isinstance(rejected_base, dict)
+                else None
+            )
             raise TikTokUpstreamError(
-                f"TikTok returned HTTP {response.status_code} for {path}",
-                code="tiktok_http_error",
+                str(
+                    rejected_message
+                    or f"TikTok returned HTTP {response.status_code} for {path}"
+                ),
+                status_code=response.status_code,
+                code=str(rejected_code or f"tiktok_http_{response.status_code}"),
             )
         try:
             payload = response.json()

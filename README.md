@@ -151,15 +151,18 @@ curl http://127.0.0.1:8765/admin/pool/status \
   -H "Authorization: Bearer $SD2API_ADMIN_KEY"
 ```
 
-返回值包含每个登录账号的 `enabled`、`running`、`logged_in`、`login_state`、`busy`、`queued` 和 `subaccounts`。每个子账号包含 `advertiser_id`、`account_type`、`enabled`、`seedance_access`、`credits` 和检查错误；汇总状态还包含 `max_parallel`、`enabled_subaccounts`、`logging_in` 和 `captcha_required`。
+返回值包含每个登录账号的 `enabled`、`running`、`logged_in`、`login_state`、`busy`、`queued` 和 `subaccounts`。每个子账号包含 `advertiser_id`、`account_type`、`enabled`、`seedance_access`、`credits`、`active_tasks`、`concurrency_limit`、`available_slots`、`tasks_today` 与每日额度熔断状态；汇总状态还包含 `max_parallel`、`enabled_subaccounts`、`quota_blocked_subaccounts`、`logging_in` 和 `captcha_required`。
 
 ### 并发规则
 
 - 协议模式不切换网页上下文；每个已启用子账号都有隔离的 CookieJar，可与同一登录账号下的其他子账号并发。
-- `max_parallel` 为当前在线且可用的子账号数；例如一个登录账号启用 5 个有权限的子账号，可并行分配到这 5 个上下文。
+- 每个子账号默认允许同时保有 5 个排队或生成中的上游任务，可通过 `SD2API_POOL_SUBACCOUNT_CONCURRENCY` 调整。`max_parallel` 表示全池当前剩余槽位，不再等同于子账号数量。
 - 素材上传在每个协议客户端内受 `SD2API_PROTOCOL_UPLOAD_CONCURRENCY` 限制；大文件超过 `SD2API_PROTOCOL_DIRECT_UPLOAD_BYTES` 后按 `SD2API_PROTOCOL_SLICE_BYTES` 分片。
-- 调度器按当前负载最小优先分配；同负载时优先 credits 较多的账号，再做轮转。
+- 调度器先选择当前活动任务最少的子账号；负载相同时优先当日已提交任务较少者，再比较 credits 并轮转，从而避免少数账号过早撞到单日上限。
 - 页面可见 credits 为 0 的账号不会接收新任务；无法读取余额时仍可参与调度。
+- 如果创建请求返回包含 daily limit / quota / 今日次数上限等语义的上游错误，程序会将该子账号动态熔断，并立刻尝试同一号池的下一个可用子账号。默认暂停 86400 秒，可通过 `SD2API_POOL_QUOTA_COOLDOWN` 调整；不会假定所有账号都有固定的 20 或 50 次额度。
+- 若生产日志中出现只有错误码、没有明确额度文案的上游响应，可把确认过的错误码用逗号写入 `SD2API_POOL_DAILY_QUOTA_CODES`，无需改代码即可纳入熔断。
+- 刷新子账号、权限与 Credits 使用独立 HTTP 请求，不再因为该登录账号存在排队或生成任务而返回 `account_busy`。
 - 如果在线账号没有 Seedance 权限，或 TikTok 返回 `10001100`（没有模型使用权限），生成 API 返回 HTTP 403，并在错误体中保留原始错误码和信息。
 - `SD2API_POOL_MAX_PENDING` 限制全池等待与运行任务总量，超限返回 HTTP 429。
 - 容器重启时最多并发验证 `SD2API_POOL_START_CONCURRENCY` 个账号；有效协议会话不会启动浏览器，只有缺失或过期时才拉起对应 Chromium。
@@ -337,8 +340,8 @@ pytest
 
 ## Roadmap
 
-- [ ] 验证并优化单登录账号的并发能力：当前观察到单账号似乎可同时执行 5 个任务，项目开发阶段尚未确认其稳定边界。
-- [ ] 设计带 failsafe 的全局调度算法：单个账号每日可生成视频数约为 20–50 个且存在差异，需要在额度耗尽、限流或异常时安全降级与重新分配。
+- [x] 子账号级并发槽位：默认 5 个活动任务，并按实时负载分配。
+- [x] 单日额度动态熔断：识别上游额度错误，暂停该子账号并自动改投其他账号。
 - [ ] 制定 TikTok 登录 Cookie 的保活策略：登录后 Cookie 过期较快，需要主动续期、失效检测和恢复机制。
 - [ ] 增加通知设置：覆盖账号登出、需要打码等需要人工处理的事件。
 - [ ] 实现多 Key 策略。
