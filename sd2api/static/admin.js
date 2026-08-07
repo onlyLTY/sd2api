@@ -20,6 +20,19 @@ const state = {
   focusTask: null,
   refreshing: false,
   timer: null,
+  ttohOffers: [],
+  ttohIndex: 0,
+  ttohTimer: null,
+};
+
+const TTOH_HOME = "https://ttoh.app/";
+const defaultTtohOffer = {
+  title: "发现适合你的 TikTok Ads 优惠",
+  description: "聚合广告金、优惠券与限时活动，降低 TikTok For Business 投放成本。",
+  link: TTOH_HOME,
+  region: "全球活动",
+  end: "",
+  isDefault: true,
 };
 
 const routes = {
@@ -45,10 +58,8 @@ const settingsSchema = [
     ["browser_autostart", "启动时恢复号池", "boolean"],
     ["browser_max_wait", "浏览器最长等待（秒）", "number", { min: 60, max: 7200 }],
     ["auto_login", "自动登录", "boolean"],
-    ["auto_accept_terms", "自动接受条款", "boolean"],
     ["login_timeout", "登录超时（秒）", "number", { min: 60, max: 3600 }],
     ["relogin_interval", "登录状态检查间隔（秒）", "number", { min: 30, max: 86400 }],
-    ["temp_mail_base_url", "cf_temp_mail 地址", "text", { placeholder: "https://mail.example.com" }],
     ["temp_mail_poll_seconds", "邮箱轮询间隔（秒）", "number", { min: 1, max: 30, step: 0.5 }],
     ["temp_mail_timeout", "邮箱验证码超时（秒）", "number", { min: 30, max: 900 }],
   ]},
@@ -132,6 +143,83 @@ function toast(title, message = "", type = "success") {
   node.innerHTML = `<strong>${esc(title)}</strong>${message ? `<span>${esc(message)}</span>` : ""}`;
   $("toastRegion").append(node);
   setTimeout(() => node.remove(), 4200);
+}
+
+function ttohDateLabel(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return `优惠截至 ${date.getMonth() + 1}月${date.getDate()}日`;
+}
+
+function ttohCardMarkup(offer, mobile = false) {
+  const offers = state.ttohOffers.length ? state.ttohOffers : [defaultTtohOffer];
+  const dots = offers.length > 1 ? `<div class="ttoh-ad-controls" aria-label="选择优惠">${offers.map((_, index) => `<button class="ttoh-dot ${index === state.ttohIndex ? "active" : ""}" data-ttoh-index="${index}" type="button" aria-label="第 ${index + 1} 个优惠"></button>`).join("")}</div>` : "";
+  const endLabel = ttohDateLabel(offer.end);
+  return `<article class="ttoh-ad">
+    ${mobile ? '<button class="ttoh-close" data-ttoh-close type="button" aria-label="关闭 ttoh 优惠">×</button>' : ""}
+    <div class="ttoh-ad-topline"><a class="ttoh-home-link" href="${TTOH_HOME}" target="_blank" rel="noopener noreferrer sponsored">ttoh.app</a><span class="ttoh-sponsored">TikTok Ads 优惠</span></div>
+    <a class="ttoh-ad-link" href="${esc(offer.link || TTOH_HOME)}" target="_blank" rel="noopener noreferrer sponsored">
+      <div class="ttoh-ad-copy">
+        <p class="ttoh-kicker">${endLabel || (offer.isDefault ? "发现 TikTok Ads 优惠" : "限时优惠")}</p>
+        <h3 class="ttoh-title">${esc(offer.title)}</h3>
+        <p class="ttoh-description">${esc(offer.description || defaultTtohOffer.description)}</p>
+        <div class="ttoh-ad-footer"><span class="ttoh-meta">${offer.region ? `<span class="ttoh-chip">${esc(offer.region)}</span>` : ""}</span><span class="ttoh-cta">查看优惠 <span class="ttoh-cta-arrow">→</span></span></div>
+      </div>
+    </a>${dots}
+  </article>`;
+}
+
+function renderTtohAds(animate = false) {
+  const offers = state.ttohOffers.length ? state.ttohOffers : [defaultTtohOffer];
+  state.ttohIndex %= offers.length;
+  const offer = offers[state.ttohIndex];
+  [["ttohAdDesktop", false], ["ttohAdMobile", true]].forEach(([id, mobile]) => {
+    const root = $(id);
+    if (!root) return;
+    const update = () => { root.innerHTML = ttohCardMarkup(offer, mobile); };
+    if (animate && root.firstElementChild) {
+      root.firstElementChild.classList.add("is-changing");
+      setTimeout(update, 220);
+    } else update();
+  });
+}
+
+function scheduleTtohRotation() {
+  clearInterval(state.ttohTimer);
+  if (state.ttohOffers.length < 2 || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  state.ttohTimer = setInterval(() => {
+    if (document.hidden || document.querySelector(".ttoh-ad:hover, .ttoh-ad:focus-within")) return;
+    state.ttohIndex = (state.ttohIndex + 1) % state.ttohOffers.length;
+    renderTtohAds(true);
+  }, 8000);
+}
+
+async function loadTtohOffers() {
+  try {
+    const response = await fetch("/admin/ttoh/offers", { headers: { Accept: "application/json" } });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    if (Array.isArray(data.offers) && data.offers.length) {
+      state.ttohOffers = data.offers;
+      state.ttohIndex = 0;
+      renderTtohAds(true);
+      scheduleTtohRotation();
+    }
+  } catch (error) {
+    console.warn("ttoh offers unavailable; keeping the homepage promotion", error);
+  }
+}
+
+function initTtohAds() {
+  if (sessionStorage.getItem("sd2api_ttoh_dismissed") !== "1") document.body.classList.add("ttoh-mobile-visible");
+  renderTtohAds();
+  const start = () => {
+    if ("requestIdleCallback" in window) requestIdleCallback(loadTtohOffers, { timeout: 1800 });
+    else setTimeout(loadTtohOffers, 250);
+  };
+  if (document.readyState === "complete") start();
+  else window.addEventListener("load", start, { once: true });
 }
 
 function formatTime(timestamp, compact = false) {
@@ -737,6 +825,7 @@ function bindEvents() {
   });
   $("addAccountButton").addEventListener("click", openAddAccount);
   $("accountForm").addEventListener("submit", saveAccount);
+  $("settingsForm").addEventListener("submit", saveSettings);
   $$('[data-dialog-close]').forEach((button) => button.addEventListener("click", () => $("accountDialog").close()));
   $("accounts").addEventListener("click", (event) => {
     const button = event.target.closest("[data-account-action]");
@@ -761,6 +850,18 @@ function bindEvents() {
     if (button.dataset.taskAction === "delete") deleteTask(button.dataset.taskId);
   });
   window.addEventListener("hashchange", () => navigate(currentRoute(), false));
+  document.addEventListener("click", (event) => {
+    const dot = event.target.closest("[data-ttoh-index]");
+    if (dot) {
+      state.ttohIndex = Number(dot.dataset.ttohIndex) || 0;
+      renderTtohAds(true);
+      scheduleTtohRotation();
+    }
+    if (event.target.closest("[data-ttoh-close]")) {
+      document.body.classList.remove("ttoh-mobile-visible");
+      sessionStorage.setItem("sd2api_ttoh_dismissed", "1");
+    }
+  });
 }
 
 function startPolling() {
@@ -775,6 +876,7 @@ function startPolling() {
 
 function init() {
   bindEvents();
+  initTtohAds();
   $("novnc").href = `${location.protocol}//${location.hostname}:6080/vnc.html?autoconnect=1&resize=scale`;
   setGenerationMode("text");
   updateDuration();

@@ -9,6 +9,7 @@ __pycache__/
 *.egg-info/
 .browser-profile/
 uploads/
+.codex-server.*.log
 test-assets/
 *.mp4
 uvicorn*.log

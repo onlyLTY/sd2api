@@ -6,7 +6,9 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 import logging
 from pathlib import Path
+import re
 from typing import Any, Literal
+import xml.etree.ElementTree as ET
 
 import httpx
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
@@ -40,6 +42,10 @@ logger = logging.getLogger("sd2api")
 store = TaskStore(settings.sd2api_database)
 uploads = UploadManager(settings)
 admin_static_dir = Path(__file__).with_name("static")
+TTOH_RSS_URL = "https://ttoh.app/rss.xml"
+TTOH_HOME_URL = "https://ttoh.app/"
+TTOH_DATE_PATTERN = re.compile(r"(?:^|\|)\s*(Start|End):\s*([^|]+)", re.IGNORECASE)
+TTOH_REGION_PATTERN = re.compile(r"(?:^|\|)\s*Region:\s*([^|]+)", re.IGNORECASE)
 client: TikTokClient | BrowserTikTokClient | BrowserPoolClient
 if settings.sd2api_mode.lower() == "browser_pool":
     client = BrowserPoolClient(settings, store)
@@ -504,6 +510,82 @@ async def admin_script() -> FileResponse:
     )
 
 
+def parse_ttoh_datetime(value: str | None) -> int | None:
+    if not value:
+        return None
+    from datetime import datetime
+
+    text = value.strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        text += "T00:00:00Z"
+    try:
+        return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        return None
+
+
+def parse_ttoh_featured_offers(xml_body: str, now: int) -> list[dict[str, Any]]:
+    root = ET.fromstring(xml_body)
+    offers: list[dict[str, Any]] = []
+    for item in root.findall("./channel/item"):
+        categories = {
+            (category.text or "").strip().lower()
+            for category in item.findall("category")
+        }
+        if "featured" not in categories:
+            continue
+        description = (item.findtext("description") or "").strip()
+        dates = {key.lower(): value.strip() for key, value in TTOH_DATE_PATTERN.findall(description)}
+        start_at = parse_ttoh_datetime(dates.get("start"))
+        end_at = parse_ttoh_datetime(dates.get("end"))
+        # A date-only end is inclusive through the end of that local campaign day.
+        if end_at is not None and re.fullmatch(r"\d{4}-\d{2}-\d{2}", dates.get("end", "")):
+            end_at += 86_399
+        if start_at is None or start_at > now or (end_at is not None and end_at < now):
+            continue
+        region_match = TTOH_REGION_PATTERN.search(description)
+        summary = description.split("|", 1)[0].strip()
+        offers.append(
+            {
+                "title": (item.findtext("title") or "TikTok Ads offer").strip(),
+                "description": summary,
+                "link": (item.findtext("link") or TTOH_HOME_URL).strip(),
+                "region": region_match.group(1).strip() if region_match else "",
+                "start": dates.get("start", ""),
+                "end": dates.get("end", ""),
+                "start_at": start_at,
+            }
+        )
+    offers.sort(key=lambda offer: offer["start_at"] or 0, reverse=True)
+    for offer in offers:
+        offer.pop("start_at", None)
+    return offers
+
+
+@app.get("/admin/ttoh/offers", include_in_schema=False)
+async def ttoh_offers() -> JSONResponse:
+    import time
+
+    try:
+        async with httpx.AsyncClient(timeout=8, follow_redirects=True) as rss_client:
+            response = await rss_client.get(
+                TTOH_RSS_URL,
+                headers={"Accept": "application/rss+xml, application/xml;q=0.9"},
+            )
+            response.raise_for_status()
+        offers = parse_ttoh_featured_offers(response.text, int(time.time()))
+        return JSONResponse(
+            {"offers": offers},
+            headers={"Cache-Control": "public, max-age=900, stale-if-error=86400"},
+        )
+    except (httpx.HTTPError, ET.ParseError, ValueError) as exc:
+        logger.warning("Could not load ttoh RSS: %s", exc)
+        return JSONResponse(
+            {"offers": []},
+            headers={"Cache-Control": "public, max-age=60"},
+        )
+
+
 @app.post("/browser/start", dependencies=[Depends(require_admin_key)])
 async def start_browser() -> dict[str, Any]:
     if not isinstance(client, (BrowserTikTokClient, BrowserPoolClient)):
@@ -689,7 +771,6 @@ async def admin_config_status() -> dict[str, Any]:
     return {
         "mode": settings.sd2api_mode,
         "auto_login": settings.sd2api_auto_login,
-        "auto_accept_terms": settings.sd2api_auto_accept_terms,
         "credential_encryption": bool(settings.credential_master_key),
         "temp_mail_configured": bool(
             settings.sd2api_temp_mail_base_url and settings.sd2api_temp_mail_api_key

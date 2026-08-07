@@ -639,7 +639,7 @@ async def test_subaccount_scan_uses_control_apis_without_ui_navigation(
 
 
 @pytest.mark.asyncio
-async def test_terms_are_automatically_accepted_only_when_enabled(
+async def test_terms_are_automatically_accepted_when_present(
     tmp_path: Path,
 ) -> None:
     class Page:
@@ -698,29 +698,19 @@ async def test_terms_are_automatically_accepted_only_when_enabled(
             assert timeout == 10_000
             assert not self.page.accept_visible
 
-    disabled_page = Page()
-    disabled = BrowserTikTokClient(
+    page = Page()
+    client = BrowserTikTokClient(
         Settings(
-            sd2api_browser_profile=str(tmp_path / "terms-disabled"),
-            sd2api_auto_accept_terms=False,
+            sd2api_browser_profile=str(tmp_path / "terms-auto"),
         ),
-        account_id="terms-disabled",
+        account_id="terms-auto",
     )
-    with pytest.raises(TikTokUpstreamError) as error:
-        await disabled._ensure_terms_accepted(disabled_page)  # type: ignore[arg-type]
-    assert error.value.code == "terms_acceptance_required"
-    assert disabled_page.accept_clicked is False
+    await client._ensure_terms_accepted(page)  # type: ignore[arg-type]
+    assert page.accept_clicked is True
 
-    enabled_page = Page()
-    enabled = BrowserTikTokClient(
-        Settings(
-            sd2api_browser_profile=str(tmp_path / "terms-enabled"),
-            sd2api_auto_accept_terms=True,
-        ),
-        account_id="terms-enabled",
-    )
-    await enabled._ensure_terms_accepted(enabled_page)  # type: ignore[arg-type]
-    assert enabled_page.accept_clicked is True
+    page.terms_visible = False
+    page.accept_visible = False
+    await client._ensure_terms_accepted(page)  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
@@ -2038,6 +2028,29 @@ async def test_protocol_pool_refreshes_subaccount_credits_after_terminal_task(
     assert isinstance(updates["last_checked_at"], int)
 
 
+def test_ttoh_rss_only_returns_current_featured_offers() -> None:
+    from sd2api.main import parse_ttoh_featured_offers
+
+    rss = """<?xml version="1.0"?><rss><channel>
+      <item><title>Current</title><link>https://go.ttoh.app/CURRENT</link><description>Save 50% | Region: SEA | Start: 2026-07-30 | End: 2026-08-10</description><category>Featured</category></item>
+      <item><title>Future</title><link>https://go.ttoh.app/FUTURE</link><description>Later | Region: NA | Start: 2026-08-20 | End: 2026-09-15</description><category>Featured</category></item>
+      <item><title>Expired</title><link>https://go.ttoh.app/OLD</link><description>Old | Region: EU | Start: 2026-07-01 | End: 2026-07-31</description><category>Featured</category></item>
+      <item><title>Evergreen</title><link>https://go.ttoh.app/EVERGREEN</link><description>Always | Region: Global | Start: 2025-01-01</description><category>credit</category></item>
+    </channel></rss>"""
+    now = int(datetime(2026, 8, 6, 12, tzinfo=timezone.utc).timestamp())
+
+    assert parse_ttoh_featured_offers(rss, now) == [
+        {
+            "title": "Current",
+            "description": "Save 50%",
+            "link": "https://go.ttoh.app/CURRENT",
+            "region": "SEA",
+            "start": "2026-07-30",
+            "end": "2026-08-10",
+        }
+    ]
+
+
 def test_admin_account_routes_without_starting_browser(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2163,11 +2176,13 @@ def test_runtime_config_file_round_trip_and_admin_update(
     read = api.get("/admin/config", headers=headers)
     assert read.status_code == 200
     assert read.json()["config"]["pool_subaccount_concurrency"] == 5
+    assert "temp_mail_base_url" not in read.json()["config"]
+    assert "auto_accept_terms" not in read.json()["config"]
     assert "sd2api_api_key" not in read.text
     updated = original.model_copy(
         update={
             "pool_subaccount_concurrency": 7,
-            "temp_mail_base_url": "https://mail.example.com",
+            "temp_mail_poll_seconds": 4.0,
         }
     )
     response = api.put(
@@ -2177,10 +2192,11 @@ def test_runtime_config_file_round_trip_and_admin_update(
     assert response.json()["restart_required"] is False
     assert set(response.json()["changed"]) == {
         "pool_subaccount_concurrency",
-        "temp_mail_base_url",
+        "temp_mail_poll_seconds",
     }
     persisted, _ = load_runtime_config(path)
     assert persisted.pool_subaccount_concurrency == 7
+    assert persisted.temp_mail_poll_seconds == 4.0
     assert main.settings.sd2api_pool_subaccount_concurrency == 7
     main.settings.replace_runtime(previous_runtime, source=previous_source)
 
@@ -2199,6 +2215,19 @@ def test_runtime_config_migrates_old_dotenv_when_file_is_missing(
     assert source == "legacy_env"
     assert config.mode == "browser"
     assert config.pool_subaccount_concurrency == 8
+
+
+def test_temp_mail_base_url_is_loaded_from_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sd2api.config import Settings
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SD2API_TEMP_MAIL_BASE_URL", "https://mail.example.com")
+    configured = Settings()
+
+    assert configured.sd2api_temp_mail_base_url == "https://mail.example.com"
+    assert "temp_mail_base_url" not in configured.runtime.model_dump()
 
 
 def test_runtime_config_admin_marks_path_changes_for_restart(

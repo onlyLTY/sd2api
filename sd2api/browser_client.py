@@ -1908,13 +1908,6 @@ class BrowserTikTokClient:
                 break
         if visible_accept is None:
             return
-        if not self.settings.sd2api_auto_accept_terms:
-            raise TikTokUpstreamError(
-                "TikTok Creative GenAI Terms require one-time acceptance for this "
-                "subaccount in Chromium; review the terms, click Accept, then retry",
-                status_code=409,
-                code="terms_acceptance_required",
-            )
         await visible_anchor.evaluate(
             """
             element => {

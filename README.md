@@ -46,7 +46,7 @@ Copy-Item .env.example .env
 Copy-Item config.example.json config.json
 ```
 
-`.env` 只保存 API Key、Admin Key、凭据加密 Key 和邮箱 API Key 等敏感值；其余运行参数保存在 `config.json`，也可在 `/admin#/settings` 的“系统配置”页面修改。推荐保持 `mode` 为 `browser_pool`，再通过 `/admin` 添加 TikTok Ads 登录邮箱和密码。程序会在 Chromium 中完成账号密码和邮箱验证码步骤，只把图形验证码交给管理员；登录成功后自动捕获 Cookie、CSRF、fp ID、Client Hints 和 device ID，加密写入 SQLite 并关闭 Chromium。
+`.env` 只保存 API Key、Admin Key、凭据加密 Key、`cf_temp_mail` 地址及邮箱 API Key 等部署环境信息；其余运行参数保存在 `config.json`，也可在 `/admin#/settings` 的“系统配置”页面修改。推荐保持 `mode` 为 `browser_pool`，再通过 `/admin` 添加 TikTok Ads 登录邮箱和密码。程序会在 Chromium 中完成账号密码和邮箱验证码步骤，只把图形验证码交给管理员；登录成功后自动捕获 Cookie、CSRF、fp ID、Client Hints 和 device ID，加密写入 SQLite 并关闭 Chromium。
 
 启动：
 
@@ -90,10 +90,11 @@ SD2API_API_KEY=调用视频 API 的长随机密钥
 SD2API_ADMIN_KEY=管理账号池的另一条长随机密钥
 NOVNC_PASSWORD=noVNC 登录密码
 SD2API_CREDENTIAL_KEY=用于加密账号密码的长期随机密钥
+SD2API_TEMP_MAIL_BASE_URL=https://你的-cf_temp_mail-worker
 SD2API_TEMP_MAIL_API_KEY=cf_temp_mail 的 API_SECRET
 ```
 
-然后在 `config.json` 或后台“系统配置”中填写 `temp_mail_base_url`。Compose 会把宿主机的 `./config.json` 映射到容器 `/app/config.json`；迁移到另一台 VPS 时可直接复制 `.env.docker` 和 `config.json`，其中前者是敏感文件，后者不含密钥。
+`cf_temp_mail` 地址与 API 密钥都从 `.env.docker` 读取，不会出现在可在线修改的系统配置里。Compose 会把宿主机的 `./config.json` 映射到容器 `/app/config.json`；迁移到另一台 VPS 时可直接复制 `.env.docker` 和 `config.json`，其中前者包含 API、密钥和外部服务地址，后者保存其余非敏感运行参数。
 
 启动：
 
@@ -131,7 +132,7 @@ ssh -L 8765:127.0.0.1:8765 -L 6080:127.0.0.1:6080 user@your-vps
 
 图形验证码属于 TikTok 的交互式安全验证：程序会把账号状态标记为 `captcha_required` 并保持对应浏览器页面，管理员通过 noVNC 完成验证后，登录状态机会自动继续邮箱接码和后续登录。自动接码在后台并行进行，管理员仍可手动输入验证码；只要页面进入已登录状态，程序会立即确认成功。登录过程中关闭页面或 Chromium 后，程序最多自动重建三次并复用同一持久化 Profile。项目不包含验证码破解或绕过逻辑。
 
-`SD2API_AUTO_ACCEPT_TERMS=true` 表示部署者明确授权程序在首次使用子账号时滚动阅读提示并自动点击 TikTok Creative GenAI Terms 的 “Accept”。默认值为 `false`；关闭时程序会暂停，并要求管理员通过 Chromium/noVNC 自行审阅和接受。
+首次使用子账号时，如果出现 TikTok Creative GenAI Terms，程序会自动滚动条款并点击 “Accept”；未出现条款时直接继续后续流程。该行为固定启用，不需要后台设置或环境变量。
 
 也可以通过 API 添加账号：
 

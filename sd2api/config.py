@@ -38,10 +38,8 @@ class RuntimeConfig(BaseModel):
         default=3 * 1024 * 1024, ge=1024 * 1024, le=32 * 1024 * 1024
     )
     auto_login: bool = True
-    auto_accept_terms: bool = False
     login_timeout: int = Field(default=600, ge=60, le=3600)
     relogin_interval: int = Field(default=300, ge=30, le=86400)
-    temp_mail_base_url: str = ""
     temp_mail_poll_seconds: float = Field(default=3.0, ge=1, le=30)
     temp_mail_timeout: int = Field(default=180, ge=30, le=900)
     upload_dir: str = "uploads"
@@ -82,10 +80,8 @@ LEGACY_ENV_FIELDS = {
     "SD2API_PROTOCOL_DIRECT_UPLOAD_BYTES": "protocol_direct_upload_bytes",
     "SD2API_PROTOCOL_SLICE_BYTES": "protocol_slice_bytes",
     "SD2API_AUTO_LOGIN": "auto_login",
-    "SD2API_AUTO_ACCEPT_TERMS": "auto_accept_terms",
     "SD2API_LOGIN_TIMEOUT": "login_timeout",
     "SD2API_RELOGIN_INTERVAL": "relogin_interval",
-    "SD2API_TEMP_MAIL_BASE_URL": "temp_mail_base_url",
     "SD2API_TEMP_MAIL_POLL_SECONDS": "temp_mail_poll_seconds",
     "SD2API_TEMP_MAIL_TIMEOUT": "temp_mail_timeout",
     "SD2API_UPLOAD_DIR": "upload_dir",
@@ -151,6 +147,7 @@ class Settings(BaseSettings):
     sd2api_api_key: str = ""
     sd2api_admin_key: str = ""
     sd2api_credential_key: str = ""
+    sd2api_temp_mail_base_url: str = ""
     sd2api_temp_mail_api_key: str = ""
     _runtime: RuntimeConfig = PrivateAttr()
     _config_source: str = PrivateAttr()
