@@ -2093,7 +2093,7 @@ def test_admin_account_routes_without_starting_browser(
     assert status.json()["max_parallel"] == 0
     assert dashboard.status_code == 200
     assert "sd2api 控制台" in dashboard.text
-    assert all(label in dashboard.text for label in ("生视频", "号池管理", "日志", "视频管理"))
+    assert all(label in dashboard.text for label in ("生视频", "号池管理", "日志", "视频管理", "系统配置"))
     assert 'name="email_address"' not in dashboard.text
     assert styles.status_code == 200
     assert ".sidebar" in styles.text
@@ -2133,6 +2133,97 @@ def test_admin_account_routes_without_starting_browser(
     assert selected.status_code == 200
     assert selected.json()["enabled"] is True
     assert selected.json()["credits"] == 2000
+
+
+def test_runtime_config_file_round_trip_and_admin_update(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sd2api.main as main
+    from sd2api.config import RuntimeConfig, load_runtime_config, save_runtime_config
+
+    path = tmp_path / "config.json"
+    original = RuntimeConfig(
+        database=str(tmp_path / "runtime.db"),
+        browser_profile=str(tmp_path / "profiles"),
+        upload_dir=str(tmp_path / "uploads"),
+        pool_subaccount_concurrency=5,
+    )
+    save_runtime_config(original, path)
+    loaded, source = load_runtime_config(path)
+    assert source == "file"
+    assert loaded == original
+
+    monkeypatch.setattr(main, "CONFIG_PATH", path)
+    previous_runtime, previous_source = main.settings.runtime, main.settings.config_source
+    main.settings.replace_runtime(original)
+    monkeypatch.setattr(main.settings, "sd2api_admin_key", "admin-key")
+    api = TestClient(main.app)
+    headers = {"Authorization": "Bearer admin-key"}
+
+    read = api.get("/admin/config", headers=headers)
+    assert read.status_code == 200
+    assert read.json()["config"]["pool_subaccount_concurrency"] == 5
+    assert "sd2api_api_key" not in read.text
+    updated = original.model_copy(
+        update={
+            "pool_subaccount_concurrency": 7,
+            "temp_mail_base_url": "https://mail.example.com",
+        }
+    )
+    response = api.put(
+        "/admin/config", headers=headers, json=updated.model_dump(mode="json")
+    )
+    assert response.status_code == 200
+    assert response.json()["restart_required"] is False
+    assert set(response.json()["changed"]) == {
+        "pool_subaccount_concurrency",
+        "temp_mail_base_url",
+    }
+    persisted, _ = load_runtime_config(path)
+    assert persisted.pool_subaccount_concurrency == 7
+    assert main.settings.sd2api_pool_subaccount_concurrency == 7
+    main.settings.replace_runtime(previous_runtime, source=previous_source)
+
+
+def test_runtime_config_migrates_old_dotenv_when_file_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sd2api.config import load_runtime_config
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(
+        "SD2API_MODE=browser\nSD2API_POOL_SUBACCOUNT_CONCURRENCY=8\n",
+        encoding="utf-8",
+    )
+    config, source = load_runtime_config(tmp_path / "missing.json")
+    assert source == "legacy_env"
+    assert config.mode == "browser"
+    assert config.pool_subaccount_concurrency == 8
+
+
+def test_runtime_config_admin_marks_path_changes_for_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sd2api.main as main
+    from sd2api.config import RuntimeConfig
+
+    path = tmp_path / "config.json"
+    current = RuntimeConfig()
+    monkeypatch.setattr(main, "CONFIG_PATH", path)
+    previous_runtime, previous_source = main.settings.runtime, main.settings.config_source
+    main.settings.replace_runtime(current, source="defaults")
+    monkeypatch.setattr(main.settings, "sd2api_admin_key", "admin-key")
+    api = TestClient(main.app)
+    changed = current.model_copy(update={"database": str(tmp_path / "new.db")})
+    response = api.put(
+        "/admin/config",
+        headers={"Authorization": "Bearer admin-key"},
+        json=changed.model_dump(mode="json"),
+    )
+    assert response.status_code == 200
+    assert response.json()["restart_required"] is True
+    assert response.json()["changed"] == ["database"]
+    main.settings.replace_runtime(previous_runtime, source=previous_source)
 
 
 def test_admin_tasks_refresh_pending_records_and_expose_actual_model(

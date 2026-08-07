@@ -27,7 +27,50 @@ const routes = {
   accounts: { eyebrow: "ACCOUNT POOL", title: "号池管理", subtitle: "管理登录账号、子账号权限与 Credits" },
   logs: { eyebrow: "ACTIVITY", title: "日志", subtitle: "查看账号、登录、视频与系统事件" },
   videos: { eyebrow: "VIDEO LIBRARY", title: "视频管理", subtitle: "自动同步状态并管理所有生成任务" },
+  settings: { eyebrow: "RUNTIME CONFIG", title: "系统配置", subtitle: "编辑可复制的非敏感运行配置" },
 };
+
+const settingsSchema = [
+  { title: "基础服务", description: "服务模式、上游地址和本地持久化路径。", fields: [
+    ["mode", "运行模式", "select", [["browser_pool", "browser_pool（推荐）"], ["browser", "browser（网页回退）"], ["direct", "direct（旧模式）"]]],
+    ["tiktok_base_url", "TikTok 基础地址", "text"],
+    ["tiktok_user_agent", "浏览器 User-Agent", "text"],
+    ["database", "数据库文件", "text"],
+    ["request_timeout", "请求超时（秒）", "number", { min: 1, max: 300, step: 1 }],
+  ]},
+  { title: "浏览器与登录", description: "Chromium 只负责登录，协议模式下生成任务不会依赖浏览器常驻。", fields: [
+    ["browser_profile", "浏览器 Profile 目录", "text"],
+    ["browser_channel", "浏览器 Channel", "text", { placeholder: "Docker/Chromium 留空" }],
+    ["browser_headless", "无头浏览器", "boolean"],
+    ["browser_autostart", "启动时恢复号池", "boolean"],
+    ["browser_max_wait", "浏览器最长等待（秒）", "number", { min: 60, max: 7200 }],
+    ["auto_login", "自动登录", "boolean"],
+    ["auto_accept_terms", "自动接受条款", "boolean"],
+    ["login_timeout", "登录超时（秒）", "number", { min: 60, max: 3600 }],
+    ["relogin_interval", "登录状态检查间隔（秒）", "number", { min: 30, max: 86400 }],
+    ["temp_mail_base_url", "cf_temp_mail 地址", "text", { placeholder: "https://mail.example.com" }],
+    ["temp_mail_poll_seconds", "邮箱轮询间隔（秒）", "number", { min: 1, max: 30, step: 0.5 }],
+    ["temp_mail_timeout", "邮箱验证码超时（秒）", "number", { min: 30, max: 900 }],
+  ]},
+  { title: "号池调度", description: "控制全池排队、单子账号并发和每日额度熔断。", fields: [
+    ["pool_max_pending", "全池最大活动任务", "number", { min: 1, max: 100000 }],
+    ["pool_subaccount_concurrency", "单子账号并发", "number", { min: 1, max: 20 }],
+    ["pool_quota_cooldown", "额度熔断时间（秒）", "number", { min: 300, max: 604800 }],
+    ["pool_daily_quota_codes", "每日额度错误码", "text", { placeholder: "多个错误码用逗号分隔" }],
+    ["pool_start_concurrency", "号池启动并发", "number", { min: 1, max: 50 }],
+  ]},
+  { title: "协议上传", description: "素材上传并发、直传阈值和分片大小，字节数可直接复制。", fields: [
+    ["protocol_upload_concurrency", "上传并发", "number", { min: 1, max: 16 }],
+    ["protocol_direct_upload_bytes", "直传阈值（字节）", "number", { min: 262144, max: 67108864 }],
+    ["protocol_slice_bytes", "分片大小（字节）", "number", { min: 1048576, max: 33554432 }],
+    ["upload_dir", "暂存目录", "text"],
+    ["upload_max_bytes", "总上传上限（字节）", "number", { min: 1024, max: 524288000 }],
+    ["upload_image_max_bytes", "图片上限（字节）", "number", { min: 1024, max: 104857600 }],
+    ["upload_video_max_bytes", "视频上限（字节）", "number", { min: 1024, max: 524288000 }],
+    ["upload_audio_max_bytes", "音频上限（字节）", "number", { min: 1024, max: 104857600 }],
+    ["upload_max_pixels", "图片像素上限", "number", { min: 1000000, max: 200000000 }],
+  ]},
+];
 
 const stateMap = {
   logged_in: ["已登录", "ok"], captcha_required: ["等待图形验证", "wait"],
@@ -156,6 +199,55 @@ function renderConfig(config) {
   if (!config.credential_encryption) notes.push("没有可用的凭据加密主密钥。");
   $("configNotice").textContent = notes.join(" ");
   $("configNotice").classList.toggle("hidden", notes.length === 0);
+}
+
+function settingsFieldMarkup(field, config) {
+  const [name, label, type, options = {}] = field;
+  const value = config[name];
+  if (type === "boolean") {
+    return `<label class="setting-toggle"><span><strong>${esc(label)}</strong><small>${name}</small></span><span class="switch"><input name="${esc(name)}" type="checkbox" ${value ? "checked" : ""}><span class="switch-track"><span class="switch-thumb"></span></span></span></label>`;
+  }
+  if (type === "select") {
+    return `<label class="field setting-field"><span>${esc(label)}<small>${esc(name)}</small></span><select name="${esc(name)}">${options.map(([optionValue, optionLabel]) => `<option value="${esc(optionValue)}" ${value === optionValue ? "selected" : ""}>${esc(optionLabel)}</option>`).join("")}</select></label>`;
+  }
+  const attributes = typeof options === "object" ? Object.entries(options).map(([key, item]) => `${key}="${esc(item)}"`).join(" ") : "";
+  return `<label class="field setting-field"><span>${esc(label)}<small>${esc(name)}</small></span><input name="${esc(name)}" type="${type}" value="${esc(value)}" ${attributes}></label>`;
+}
+
+function renderSettings(data) {
+  const config = data.config || {};
+  state.runtimeConfig = config;
+  $("configFilePath").textContent = data.path || "config.json";
+  $("configSourceBadge").textContent = ({ file: "配置文件", legacy_env: "旧环境变量兼容", defaults: "内置默认值", explicit: "临时配置" })[data.source] || data.source || "配置文件";
+  $("settingsGroups").innerHTML = settingsSchema.map((group) => `<section class="settings-group"><div class="settings-group-heading"><h3>${esc(group.title)}</h3><p>${esc(group.description)}</p></div><div class="settings-grid">${group.fields.map((field) => settingsFieldMarkup(field, config)).join("")}</div></section>`).join("");
+  $("settingsRestartHint").textContent = data.restart_required ? "上次修改包含需重启项目" : "部分路径和运行模式修改保存后需要重启服务";
+}
+
+async function refreshSettings() {
+  renderSettings(await api("/admin/config"));
+}
+
+async function saveSettings(event) {
+  event.preventDefault();
+  const form = new FormData($("settingsForm"));
+  const config = {};
+  settingsSchema.flatMap((group) => group.fields).forEach(([name, , type]) => {
+    if (type === "boolean") config[name] = form.get(name) === "on";
+    else if (type === "number") config[name] = Number(form.get(name));
+    else config[name] = String(form.get(name) ?? "").trim();
+  });
+  $("settingsError").textContent = "";
+  $("settingsSave").disabled = true;
+  try {
+    const result = await api("/admin/config", { method: "PUT", body: JSON.stringify(config) });
+    renderSettings(result);
+    toast("配置已保存", result.restart_required ? "部分修改需要重启服务后生效" : "修改已写入 config.json");
+  } catch (error) {
+    $("settingsError").textContent = error.message;
+    toast("保存失败", error.message, "error");
+  } finally {
+    $("settingsSave").disabled = false;
+  }
 }
 
 function enabledCreditTotal(accounts) {
@@ -386,6 +478,7 @@ async function refreshCurrent(userInitiated = false) {
     if (state.route === "accounts") await refreshAccounts();
     if (state.route === "logs") await refreshLogs();
     if (state.route === "videos") await refreshVideos();
+    if (state.route === "settings") await refreshSettings();
     setConnection(true);
     $("lastUpdated").textContent = `更新于 ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
     if (userInitiated && state.route !== "generate") toast("已刷新", routes[state.route].title);

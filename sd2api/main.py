@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse
 from pydantic import ValidationError
 from starlette.datastructures import UploadFile
 
-from .config import settings
+from .config import CONFIG_PATH, RuntimeConfig, save_runtime_config, settings
 from .browser_client import BrowserTikTokClient
 from .browser_pool import BrowserPoolClient
 from .models import (
@@ -702,6 +702,62 @@ async def admin_config_status() -> dict[str, Any]:
         "subaccount_concurrency": settings.sd2api_pool_subaccount_concurrency,
         "quota_cooldown": settings.sd2api_pool_quota_cooldown,
         "daily_quota_codes": settings.sd2api_pool_daily_quota_codes,
+        "config_file": str(CONFIG_PATH.resolve()),
+        "config_source": settings.config_source,
+    }
+
+
+@app.get("/admin/config", dependencies=[Depends(require_admin_key)])
+async def admin_runtime_config() -> dict[str, Any]:
+    return {
+        "config": settings.runtime.model_dump(mode="json"),
+        "path": str(CONFIG_PATH.resolve()),
+        "source": settings.config_source,
+        "restart_required": False,
+    }
+
+
+@app.put("/admin/config", dependencies=[Depends(require_admin_key)])
+async def update_admin_runtime_config(body: RuntimeConfig) -> dict[str, Any]:
+    previous = settings.runtime
+    save_runtime_config(body, CONFIG_PATH)
+    settings.replace_runtime(body)
+    changed = sorted(
+        name
+        for name in RuntimeConfig.model_fields
+        if getattr(previous, name) != getattr(body, name)
+    )
+    restart_fields = {
+        "tiktok_base_url",
+        "tiktok_user_agent",
+        "database",
+        "request_timeout",
+        "mode",
+        "browser_profile",
+        "browser_channel",
+        "browser_headless",
+        "browser_autostart",
+        "pool_start_concurrency",
+        "protocol_upload_concurrency",
+        "upload_dir",
+    }
+    restart_required = bool(restart_fields.intersection(changed))
+    audit_event(
+        "warning" if restart_required else "info",
+        "system",
+        "运行配置已更新",
+        details={
+            "changed": changed,
+            "restart_required": restart_required,
+            "path": str(CONFIG_PATH.resolve()),
+        },
+    )
+    return {
+        "config": body.model_dump(mode="json"),
+        "path": str(CONFIG_PATH.resolve()),
+        "source": "file",
+        "changed": changed,
+        "restart_required": restart_required,
     }
 
 

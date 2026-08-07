@@ -23,6 +23,7 @@ ENV PATH="/opt/sd2api-venv/bin:${PATH}"
 WORKDIR /app
 
 COPY pyproject.toml README.md ./
+COPY config.example.json ./config.example.json
 COPY sd2api ./sd2api
 RUN python -m pip install --no-cache-dir .
 

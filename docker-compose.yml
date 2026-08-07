@@ -12,6 +12,7 @@ services:
       - "127.0.0.1:8765:8765"
       - "127.0.0.1:6080:6080"
     volumes:
+      - ./config.json:/app/config.json
       - browser_profiles:/data/profiles
       - task_database:/data/db
       - staged_uploads:/data/uploads

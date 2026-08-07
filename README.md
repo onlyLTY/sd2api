@@ -43,9 +43,10 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[test]"
 Copy-Item .env.example .env
+Copy-Item config.example.json config.json
 ```
 
-推荐设置 `SD2API_MODE=browser_pool`，再通过 `/admin` 添加 TikTok Ads 登录邮箱和密码。程序会在 Chromium 中完成账号密码和邮箱验证码步骤，只把图形验证码交给管理员；登录成功后自动捕获 Cookie、CSRF、fp ID、Client Hints 和 device ID，加密写入 SQLite 并关闭 Chromium。用户不需要查看或填写 Cookie、fp ID、device ID，也不要把 `.env` 发给别人或提交到版本库。
+`.env` 只保存 API Key、Admin Key、凭据加密 Key 和邮箱 API Key 等敏感值；其余运行参数保存在 `config.json`，也可在 `/admin#/settings` 的“系统配置”页面修改。推荐保持 `mode` 为 `browser_pool`，再通过 `/admin` 添加 TikTok Ads 登录邮箱和密码。程序会在 Chromium 中完成账号密码和邮箱验证码步骤，只把图形验证码交给管理员；登录成功后自动捕获 Cookie、CSRF、fp ID、Client Hints 和 device ID，加密写入 SQLite 并关闭 Chromium。
 
 启动：
 
@@ -57,15 +58,17 @@ uvicorn sd2api.main:app --host 127.0.0.1 --port 8765
 
 ### 旧 UI 浏览器模式
 
-在 `.env` 中设置：
+在 `config.json` 中设置：
 
-```dotenv
-SD2API_MODE=browser
-SD2API_BROWSER_CHANNEL=
-SD2API_BROWSER_PROFILE=.browser-profile
+```json
+{
+  "mode": "browser",
+  "browser_channel": "",
+  "browser_profile": ".browser-profile"
+}
 ```
 
-`SD2API_MODE=browser` 保留为 UI 自动化回退模式：调用 `POST /browser/start` 后，任务会依次操作网页。新部署应使用 `browser_pool`，它在登录后将会话加密保存，扫描、上传、生成、轮询和下载都直接调用协议，不受生成页 DOM 变化影响。
+配置项 `mode=browser` 保留为 UI 自动化回退模式：调用 `POST /browser/start` 后，任务会依次操作网页。新部署应使用 `browser_pool`，它在登录后将会话加密保存，扫描、上传、生成、轮询和下载都直接调用协议，不受生成页 DOM 变化影响。
 
 浏览器模式的限制：任务串行执行，容易受到网页 UI 更新影响，吞吐量低于直接 HTTP 模式。开发结束后可在该 Chromium 窗口登出；如需彻底移除本地会话，应先停止服务，再手动删除 `.browser-profile`。
 
@@ -77,6 +80,7 @@ Docker 模式在一个容器中运行 API、按需 Chromium、Xvfb 和 noVNC。�
 
 ```bash
 cp .env.docker.example .env.docker
+cp config.example.json config.json
 ```
 
 至少修改这些值：
@@ -86,9 +90,10 @@ SD2API_API_KEY=调用视频 API 的长随机密钥
 SD2API_ADMIN_KEY=管理账号池的另一条长随机密钥
 NOVNC_PASSWORD=noVNC 登录密码
 SD2API_CREDENTIAL_KEY=用于加密账号密码的长期随机密钥
-SD2API_TEMP_MAIL_BASE_URL=https://你的-cf_temp_mail-worker
 SD2API_TEMP_MAIL_API_KEY=cf_temp_mail 的 API_SECRET
 ```
+
+然后在 `config.json` 或后台“系统配置”中填写 `temp_mail_base_url`。Compose 会把宿主机的 `./config.json` 映射到容器 `/app/config.json`；迁移到另一台 VPS 时可直接复制 `.env.docker` 和 `config.json`，其中前者是敏感文件，后者不含密钥。
 
 启动：
 
@@ -156,16 +161,16 @@ curl http://127.0.0.1:8765/admin/pool/status \
 ### 并发规则
 
 - 协议模式不切换网页上下文；每个已启用子账号都有隔离的 CookieJar，可与同一登录账号下的其他子账号并发。
-- 每个子账号默认允许同时保有 5 个排队或生成中的上游任务，可通过 `SD2API_POOL_SUBACCOUNT_CONCURRENCY` 调整。`max_parallel` 表示全池当前剩余槽位，不再等同于子账号数量。
-- 素材上传在每个协议客户端内受 `SD2API_PROTOCOL_UPLOAD_CONCURRENCY` 限制；大文件超过 `SD2API_PROTOCOL_DIRECT_UPLOAD_BYTES` 后按 `SD2API_PROTOCOL_SLICE_BYTES` 分片。
+- 每个子账号默认允许同时保有 5 个排队或生成中的上游任务，可通过配置项 `pool_subaccount_concurrency` 调整。`max_parallel` 表示全池当前剩余槽位，不再等同于子账号数量。
+- 素材上传在每个协议客户端内受 `protocol_upload_concurrency` 限制；大文件超过 `protocol_direct_upload_bytes` 后按 `protocol_slice_bytes` 分片。
 - 调度器先选择当前活动任务最少的子账号；负载相同时优先当日已提交任务较少者，再比较 credits 并轮转，从而避免少数账号过早撞到单日上限。
 - 页面可见 credits 为 0 的账号不会接收新任务；无法读取余额时仍可参与调度。
-- 如果创建请求返回包含 daily limit / quota / 今日次数上限等语义的上游错误，程序会将该子账号动态熔断，并立刻尝试同一号池的下一个可用子账号。默认暂停 86400 秒，可通过 `SD2API_POOL_QUOTA_COOLDOWN` 调整；不会假定所有账号都有固定的 20 或 50 次额度。
-- 若生产日志中出现只有错误码、没有明确额度文案的上游响应，可把确认过的错误码用逗号写入 `SD2API_POOL_DAILY_QUOTA_CODES`，无需改代码即可纳入熔断。
+- 如果创建请求返回包含 daily limit / quota / 今日次数上限等语义的上游错误，程序会将该子账号动态熔断，并立刻尝试同一号池的下一个可用子账号。默认暂停 86400 秒，可通过 `pool_quota_cooldown` 调整；不会假定所有账号都有固定的 20 或 50 次额度。
+- 若生产日志中出现只有错误码、没有明确额度文案的上游响应，可把确认过的错误码写入 `pool_daily_quota_codes`，无需改代码即可纳入熔断。
 - 刷新子账号、权限与 Credits 使用独立 HTTP 请求，不再因为该登录账号存在排队或生成任务而返回 `account_busy`。
 - 如果在线账号没有 Seedance 权限，或 TikTok 返回 `10001100`（没有模型使用权限），生成 API 返回 HTTP 403，并在错误体中保留原始错误码和信息。
-- `SD2API_POOL_MAX_PENDING` 限制全池等待与运行任务总量，超限返回 HTTP 429。
-- 容器重启时最多并发验证 `SD2API_POOL_START_CONCURRENCY` 个账号；有效协议会话不会启动浏览器，只有缺失或过期时才拉起对应 Chromium。
+- `pool_max_pending` 限制全池等待与运行任务总量，超限返回 HTTP 429。
+- 容器重启时最多并发验证 `pool_start_concurrency` 个账号；有效协议会话不会启动浏览器，只有缺失或过期时才拉起对应 Chromium。
 - 已经在 TikTok 页面提交的任务不会自动换号重试，避免重复扣点；账号离线时只会停止接收新任务。
 - 有运行或排队任务的账号不能被停用、停止或删除，管理 API 会返回 HTTP 409。
 - 容器重建不会丢失账号登录 Profile、加密协议会话和已落库任务；已提交任务可在重启后继续查询。
@@ -300,7 +305,7 @@ curl.exe -X POST http://127.0.0.1:8765/v1/videos `
 
 JSON 调用可使用扩展字段 `references`，其中元素结构与上面的 Seedance 多模态内容一致。`input_reference` 和 `references/reference_media` 互斥。
 
-支持 JPEG、PNG、WebP、BMP、TIFF、GIF、MP4、MOV、WAV 和 MP3。默认图片上限 30 MiB/4000 万像素，视频上限 200 MiB，音频上限 15 MiB。远程素材会阻止私网和本机地址；视频 data URL 不接受，图片和音频可以使用 data URL。暂存文件会在浏览器任务结束后自动清理。素材模式需要 `SD2API_MODE=browser` 或 `browser_pool`。
+支持 JPEG、PNG、WebP、BMP、TIFF、GIF、MP4、MOV、WAV 和 MP3。默认图片上限 30 MiB/4000 万像素，视频上限 200 MiB，音频上限 15 MiB。远程素材会阻止私网和本机地址；视频 data URL 不接受，图片和音频可以使用 data URL。暂存文件会在浏览器任务结束后自动清理。素材模式需要配置 `mode` 为 `browser` 或 `browser_pool`。
 
 OpenAI Python SDK 可以通过自定义 `base_url` 使用创建和查询接口（SDK 版本需包含 Videos 资源）：
 

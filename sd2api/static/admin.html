@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>sd2api 控制台</title>
-  <link rel="stylesheet" href="/admin/assets/admin.css?v=4">
-  <script defer src="/admin/assets/admin.js?v=4"></script>
+  <link rel="stylesheet" href="/admin/assets/admin.css?v=6">
+  <script defer src="/admin/assets/admin.js?v=6"></script>
 </head>
 <body>
   <div id="auth" class="auth-screen">
@@ -43,6 +43,9 @@
         </button>
         <button class="nav-item" data-route="videos" type="button">
           <span class="nav-icon">▶</span><span>视频管理</span><span id="navTaskBadge" class="nav-badge hidden">0</span>
+        </button>
+        <button class="nav-item" data-route="settings" type="button">
+          <span class="nav-icon">⚙</span><span>系统配置</span>
         </button>
       </nav>
       <div class="sidebar-foot">
@@ -218,8 +221,27 @@
           <div class="table-wrap"><table class="video-table"><thead><tr><th>任务</th><th>模型</th><th>状态</th><th>时长</th><th>账号 / 子账号</th><th>更新时间</th><th>操作</th></tr></thead><tbody id="tasks"></tbody></table></div>
         </section>
       </section>
+
+      <section id="page-settings" class="page" data-page="settings">
+        <section class="panel settings-panel">
+          <div class="panel-heading">
+            <div><p class="eyebrow">RUNTIME CONFIG</p><h2>系统配置</h2><p class="muted">非敏感运行参数保存在独立 config.json。API Key、Admin Key、凭据加密 Key 和邮箱 API Key 仍只从环境变量读取。</p></div>
+            <span id="configSourceBadge" class="pill info">读取中</span>
+          </div>
+          <div class="parameter-note settings-note">
+            <span class="note-icon">i</span>
+            <div><strong id="configFilePath">config.json</strong><p>Docker 默认映射宿主机 ./config.json 到容器 /app/config.json。复制该文件即可复用非敏感配置。</p></div>
+          </div>
+          <form id="settingsForm">
+            <div id="settingsGroups" class="settings-groups"></div>
+            <div id="settingsError" class="form-error" role="alert"></div>
+            <div class="settings-actions"><span id="settingsRestartHint" class="muted"></span><button id="settingsSave" class="button primary" type="submit">保存配置</button></div>
+          </form>
+        </section>
+      </section>
     </main>
   </div>
+
 
   <dialog id="accountDialog">
     <form id="accountForm">
