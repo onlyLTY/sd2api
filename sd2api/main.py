@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 import logging
 from pathlib import Path
 import re
+import time
 from typing import Any, Literal
 import xml.etree.ElementTree as ET
 
@@ -871,6 +872,78 @@ def admin_task(record: TaskRecord) -> dict[str, Any]:
     }
 
 
+def duration_level(seconds: int | None) -> str:
+    if seconds is None:
+        return "unknown"
+    if seconds <= 30 * 60:
+        return "recommended"
+    if seconds <= 60 * 60:
+        return "normal"
+    return "busy"
+
+
+def hourly_duration_profile(
+    rows: list[dict[str, Any]], timezone_offset_minutes: int
+) -> list[dict[str, Any]]:
+    timezone_shift = timezone_offset_minutes * 60
+    hourly = [{"hour": hour, "durations": []} for hour in range(24)]
+    for row in rows:
+        if row["status"] != "succeeded" or row["completed_at"] is None:
+            continue
+        created_at = int(row["created_at"])
+        hour = ((created_at + timezone_shift) // 3600) % 24
+        hourly[hour]["durations"].append(
+            max(0, int(row["completed_at"]) - created_at)
+        )
+    result = []
+    for bucket in hourly:
+        durations = bucket["durations"]
+        average = round(sum(durations) / len(durations)) if durations else None
+        count = len(durations)
+        result.append({
+            "hour": bucket["hour"],
+            "average_seconds": average,
+            "sample_count": count,
+            "level": duration_level(average),
+            "confidence": "high" if count >= 5 else "medium" if count >= 2 else "low" if count else "none",
+        })
+    return result
+
+
+def daily_hour_heatmap(
+    rows: list[dict[str, Any]], timezone_offset_minutes: int
+) -> list[dict[str, Any]]:
+    from datetime import datetime, timezone
+
+    timezone_shift = timezone_offset_minutes * 60
+    days: dict[str, list[list[int]]] = {}
+    for row in rows:
+        if row["status"] != "succeeded" or row["completed_at"] is None:
+            continue
+        created_at = int(row["created_at"])
+        local_timestamp = created_at + timezone_shift
+        date = datetime.fromtimestamp(local_timestamp, tz=timezone.utc).strftime("%Y-%m-%d")
+        hour = (local_timestamp // 3600) % 24
+        days.setdefault(date, [[] for _ in range(24)])[hour].append(
+            max(0, int(row["completed_at"]) - created_at)
+        )
+    return [
+        {
+            "date": date,
+            "hours": [
+                {
+                    "hour": hour,
+                    "average_seconds": round(sum(values) / len(values)) if values else None,
+                    "sample_count": len(values),
+                    "level": duration_level(round(sum(values) / len(values)) if values else None),
+                }
+                for hour, values in enumerate(hour_values)
+            ],
+        }
+        for date, hour_values in sorted(days.items())
+    ]
+
+
 @app.get("/admin/tasks", dependencies=[Depends(require_admin_key)])
 async def list_admin_tasks(
     limit: int = Query(default=100, ge=1, le=1000),
@@ -907,6 +980,28 @@ async def list_admin_tasks(
     return {
         "data": [admin_task(record) for record in records],
         "summary": store.task_counts(),
+    }
+
+
+@app.get("/admin/analytics/durations", dependencies=[Depends(require_admin_key)])
+async def admin_duration_analytics(
+    range: Literal["7d", "30d", "90d"] = "30d",
+    timezone_offset: int = Query(default=480, ge=-720, le=840),
+) -> dict[str, Any]:
+    now = int(time.time())
+    range_seconds = {"7d": 7 * 86400, "30d": 30 * 86400, "90d": 90 * 86400}[range]
+    since = now - range_seconds
+    rows = store.duration_analytics_rows(since=since, until=now)
+    hourly = hourly_duration_profile(rows, timezone_offset)
+    return {
+        "range": range,
+        "since": since,
+        "until": now,
+        "hourly": hourly,
+        "heatmap": daily_hour_heatmap(rows, timezone_offset),
+        "recommended_hours": [item["hour"] for item in hourly if item["level"] == "recommended"],
+        "busy_hours": [item["hour"] for item in hourly if item["level"] == "busy"],
+        "completed_samples": sum(item["sample_count"] for item in hourly),
     }
 
 

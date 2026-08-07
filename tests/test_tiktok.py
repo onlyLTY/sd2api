@@ -159,6 +159,12 @@ def test_store_round_trip(tmp_path: Path) -> None:
     assert event.details == {"model": "seedance-2.0"}
     assert store.list_events(level="success")[0].task_id == "task-1"
     assert store.list_events(category="video", search="seedance")[0].id == event.id
+    analytics_rows = store.duration_analytics_rows(
+        since=created.created_at - 1,
+        until=updated.completed_at + 1,
+    )
+    assert analytics_rows[0]["status"] == "succeeded"
+    assert analytics_rows[0]["completed_at"] == updated.completed_at
 
     account = store.create_account(account_id="account-a", name="Account A")
     assert account["enabled"] is True
@@ -2298,6 +2304,72 @@ def test_admin_tasks_refresh_pending_records_and_expose_actual_model(
     assert any(
         event.message == "视频生成完成" for event in task_store.list_events()
     )
+
+
+def test_admin_duration_analytics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sd2api.main as main
+
+    task_store = TaskStore(str(tmp_path / "analytics.db"))
+    now = int(time.time())
+    local_day_start = now - ((now + 8 * 3600) % 86400)
+    for task_id, status, created_at, duration in [
+        ("fast", "succeeded", local_day_start + 2 * 3600, 300),
+        ("slow", "succeeded", local_day_start + 14 * 3600, 7200),
+        ("failed", "failed", local_day_start + 14 * 3600 + 600, 600),
+    ]:
+        task_store.create(
+            task_id=task_id,
+            api="openai",
+            model="sora-2",
+            prompt=task_id,
+            seconds=5,
+            account_id="account-a",
+        )
+        with task_store._connect() as connection:
+            connection.execute(
+                """
+                UPDATE tasks
+                SET status = ?, progress = 100, created_at = ?, updated_at = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                (status, created_at, created_at + duration, created_at + duration, task_id),
+            )
+
+    monkeypatch.setattr(main, "store", task_store)
+    api = TestClient(main.app)
+    headers = {
+        "Authorization": f"Bearer {main.settings.sd2api_admin_key or main.settings.sd2api_api_key}"
+    }
+    response = api.get(
+        "/admin/analytics/durations?range=7d&timezone_offset=480",
+        headers=headers,
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["completed_samples"] == 2
+    assert data["hourly"][2] == {
+        "hour": 2,
+        "average_seconds": 300,
+        "sample_count": 1,
+        "level": "recommended",
+        "confidence": "low",
+    }
+    assert data["hourly"][14]["average_seconds"] == 7200
+    assert data["hourly"][14]["level"] == "busy"
+    assert data["recommended_hours"] == [2]
+    assert data["busy_hours"] == [14]
+    assert sum(hour["sample_count"] for day in data["heatmap"] for hour in day["hours"]) == 2
+
+
+def test_duration_level_uses_thirty_minutes_as_recommended_cutoff() -> None:
+    from sd2api.main import duration_level
+
+    assert duration_level(30 * 60) == "recommended"
+    assert duration_level(30 * 60 + 1) == "normal"
+    assert duration_level(60 * 60) == "normal"
+    assert duration_level(60 * 60 + 1) == "busy"
 
 
 def test_admin_key_can_submit_openai_compatible_video(

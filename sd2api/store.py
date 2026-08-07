@@ -382,6 +382,28 @@ class TaskStore:
             counts["total"] += value
         return counts
 
+    def duration_analytics_rows(
+        self,
+        *,
+        since: int,
+        until: int,
+    ) -> list[dict[str, Any]]:
+        """Return the small task projection needed by the admin duration dashboard."""
+        conditions = ["created_at >= ?", "created_at < ?"]
+        params: list[Any] = [since, until]
+        where = " AND ".join(conditions)
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT status, model, account_id, created_at, completed_at
+                FROM tasks
+                WHERE {where}
+                ORDER BY created_at ASC
+                """,
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def active_task_ids(
         self, account_id: str, advertiser_id: str
     ) -> list[str]:

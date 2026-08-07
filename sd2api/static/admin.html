@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>sd2api 控制台</title>
-  <link rel="stylesheet" href="/admin/assets/admin.css?v=6">
-  <script defer src="/admin/assets/admin.js?v=6"></script>
+  <link rel="stylesheet" href="/admin/assets/admin.css?v=7">
+  <script defer src="/admin/assets/admin.js?v=7"></script>
 </head>
 <body>
   <div id="auth" class="auth-screen">
@@ -40,6 +40,9 @@
         </button>
         <button class="nav-item" data-route="logs" type="button">
           <span class="nav-icon">≡</span><span>日志</span><span id="navLogBadge" class="nav-dot hidden"></span>
+        </button>
+        <button class="nav-item" data-route="analytics" type="button">
+          <span class="nav-icon">⌁</span><span>最佳时段</span>
         </button>
         <button class="nav-item" data-route="videos" type="button">
           <span class="nav-icon">▶</span><span>视频管理</span><span id="navTaskBadge" class="nav-badge hidden">0</span>
@@ -200,6 +203,40 @@
         <section class="panel log-panel">
           <div class="panel-heading compact"><div><p class="eyebrow">ACTIVITY</p><h2>运行日志</h2></div><span id="logCount" class="muted">0 条</span></div>
           <div id="logs" class="log-list"></div>
+        </section>
+      </section>
+
+      <section id="page-analytics" class="page" data-page="analytics">
+        <section class="panel analytics-toolbar">
+          <div class="analytics-toolbar-main">
+            <div class="range-switch" role="group" aria-label="统计时间范围">
+              <button class="range-button" data-analytics-range="7d" type="button">近 7 天</button>
+              <button class="range-button active" data-analytics-range="30d" type="button">近 30 天</button>
+              <button class="range-button" data-analytics-range="90d" type="button">近 90 天</button>
+            </div>
+            <div class="speed-legend"><span class="speed-good"><i></i>推荐 ≤ 30 分钟</span><span class="speed-normal"><i></i>一般 ≤ 1 小时</span><span class="speed-busy"><i></i>拥堵 ＞ 1 小时</span></div>
+          </div>
+          <p class="analytics-scope"><span class="scope-dot"></span>把历史任务按每天 0–23 点的提交时段归类，耗时为提交至生成完成的实际等待时间</p>
+        </section>
+
+        <div class="recommendation-grid">
+          <article class="recommendation-card recommended"><span>✓</span><div><small>建议使用</small><strong id="recommendedHours">等待数据</strong><p id="recommendedDetail">绿色时段生成速度最快</p></div></article>
+          <article class="recommendation-card avoid"><span>!</span><div><small>建议避开</small><strong id="busyHours">等待数据</strong><p id="busyDetail">红色时段通常需要等待较久</p></div></article>
+          <article class="recommendation-card sample"><span>≋</span><div><small>判断依据</small><strong id="analyticsSamples">0 个历史任务</strong><p>每个时段会显示独立样本数</p></div></article>
+        </div>
+
+        <section class="panel hourly-chart-panel">
+          <div class="panel-heading compact analytics-heading">
+            <div><p class="eyebrow">BEST HOURS</p><h2>一天 24 小时生成速度</h2><p class="muted">柱越短越快。颜色直接表示是否适合提交任务，柱下方是该时段的历史样本数。</p></div>
+          </div>
+          <div id="hourlyDurationChart" class="hourly-duration-chart" role="img" aria-label="一天 24 小时视频生成平均耗时"></div>
+        </section>
+
+        <section class="panel heatmap-panel">
+          <div class="panel-heading compact analytics-heading">
+            <div><p class="eyebrow">DAILY HISTORY</p><h2>每天各时段生成速度</h2><p class="muted">用于确认拥堵时段是否持续出现。空白代表该天该小时没有完成任务。</p></div>
+          </div>
+          <div id="durationHeatmap" class="duration-heatmap"></div>
         </section>
       </section>
 

@@ -16,6 +16,8 @@ const state = {
   tasks: [],
   logs: [],
   taskSummary: {},
+  analytics: null,
+  analyticsRange: "30d",
   editId: null,
   focusTask: null,
   refreshing: false,
@@ -39,6 +41,7 @@ const routes = {
   generate: { eyebrow: "CREATE", title: "生视频", subtitle: "创建并跟踪 Seedance 视频任务" },
   accounts: { eyebrow: "ACCOUNT POOL", title: "号池管理", subtitle: "管理登录账号、子账号权限与 Credits" },
   logs: { eyebrow: "ACTIVITY", title: "日志", subtitle: "查看账号、登录、视频与系统事件" },
+  analytics: { eyebrow: "BEST TIME", title: "最佳生成时段", subtitle: "根据历史等待时间判断每天适合提交视频的时段" },
   videos: { eyebrow: "VIDEO LIBRARY", title: "视频管理", subtitle: "自动同步状态并管理所有生成任务" },
   settings: { eyebrow: "RUNTIME CONFIG", title: "系统配置", subtitle: "编辑可复制的非敏感运行配置" },
 };
@@ -507,6 +510,119 @@ async function refreshLogs() {
   renderLogs(state.logs);
 }
 
+function formatDuration(seconds, compact = false) {
+  if (seconds === null || seconds === undefined || Number.isNaN(Number(seconds))) return "—";
+  const value = Math.max(0, Math.round(Number(seconds)));
+  if (value < 60) return `${value} 秒`;
+  const hours = Math.floor(value / 3600);
+  const minutes = Math.floor((value % 3600) / 60);
+  if (!hours) return `${minutes} 分${compact || value % 60 === 0 ? "" : ` ${value % 60} 秒`}`;
+  return `${hours} 小时${minutes ? ` ${minutes} 分` : ""}`;
+}
+
+function niceDurationMax(value) {
+  const candidates = [900, 1800, 3600, 7200, 10800, 14400, 21600, 43200, 86400];
+  return candidates.find((item) => item >= value) || Math.ceil(value / 86400) * 86400;
+}
+
+function hourLabel(hour) {
+  return `${String(hour).padStart(2, "0")}:00`;
+}
+
+function hourRanges(hours = []) {
+  if (!hours.length) return "暂无足够样本";
+  const sorted = [...new Set(hours)].sort((a, b) => a - b);
+  if (sorted.length === 24) return "全天";
+  const ranges = [];
+  let start = sorted[0];
+  let previous = sorted[0];
+  for (const hour of sorted.slice(1)) {
+    if (hour === previous + 1) { previous = hour; continue; }
+    ranges.push([start, previous + 1]);
+    start = previous = hour;
+  }
+  ranges.push([start, previous + 1]);
+  if (ranges.length > 1 && ranges[0][0] === 0 && ranges.at(-1)[1] === 24) {
+    const first = ranges.shift();
+    const last = ranges.pop();
+    ranges.unshift([last[0], first[1]]);
+  }
+  return ranges.map(([from, to]) => `${String(from).padStart(2, "0")}:00–${String(to % 24).padStart(2, "0")}:00`).join("、");
+}
+
+function renderHourlyDurationChart(hourly = []) {
+  const root = $("hourlyDurationChart");
+  const populated = hourly.filter((item) => item.sample_count > 0);
+  if (!populated.length) {
+    root.innerHTML = '<div class="chart-empty"><span>⌁</span><strong>暂无已完成任务</strong><p>选择更长的统计周期，或等待更多任务完成。</p></div>';
+    return;
+  }
+  const width = matchMedia("(max-width: 680px)").matches ? 920 : Math.max(760, Math.round(root.clientWidth || 1100));
+  const height = 410;
+  const margin = { top: 20, right: 18, bottom: 76, left: 70 };
+  const plotWidth = width - margin.left - margin.right;
+  const plotHeight = height - margin.top - margin.bottom;
+  const maxValue = niceDurationMax(Math.max(...populated.map((item) => item.average_seconds || 0)) * 1.08);
+  const y = (value) => margin.top + plotHeight - Math.max(0, Number(value || 0)) / maxValue * plotHeight;
+  const slot = plotWidth / 24;
+  const barWidth = Math.max(12, Math.min(28, slot * .68));
+  const ticks = [0, .25, .5, .75, 1];
+  const grid = ticks.map((ratio) => {
+    const value = maxValue * ratio;
+    const lineY = y(value);
+    return `<g class="chart-gridline"><line x1="${margin.left}" y1="${lineY}" x2="${width - margin.right}" y2="${lineY}"></line><text x="${margin.left - 12}" y="${lineY + 4}">${esc(formatDuration(value, true))}</text></g>`;
+  }).join("");
+  const marks = hourly.map((item) => {
+    const x = margin.left + slot * item.hour + slot / 2;
+    const barY = item.average_seconds === null ? margin.top + plotHeight : y(item.average_seconds);
+    const barHeight = item.average_seconds === null ? 0 : margin.top + plotHeight - barY;
+    const title = `${hourLabel(item.hour)}–${hourLabel((item.hour + 1) % 24)}\n平均耗时 ${formatDuration(item.average_seconds)}\n历史样本 ${item.sample_count} 个\n置信度 ${{high:"较高",medium:"一般",low:"较低",none:"无数据"}[item.confidence]}`;
+    return `<g class="hour-bar-group level-${item.level} ${item.sample_count ? "has-data" : "no-data"}"><title>${esc(title)}</title>
+      <rect class="hour-bar" x="${x - barWidth / 2}" y="${barY}" width="${barWidth}" height="${barHeight}" rx="5"></rect>
+      ${item.sample_count ? `<text class="hour-value" x="${x}" y="${Math.max(margin.top + 12, barY - 7)}">${esc(formatDuration(item.average_seconds, true))}</text>` : `<line class="no-data-mark" x1="${x - 6}" y1="${margin.top + plotHeight - 3}" x2="${x + 6}" y2="${margin.top + plotHeight - 3}"></line>`}
+      <text class="hour-label" x="${x}" y="${height - 38}">${String(item.hour).padStart(2, "0")}</text>
+      <text class="hour-samples" x="${x}" y="${height - 17}">${item.sample_count ? `${item.sample_count}个` : "—"}</text>
+      <rect class="chart-hitbox" x="${x - slot / 2}" y="${margin.top}" width="${slot}" height="${plotHeight}"></rect></g>`;
+  }).join("");
+  root.innerHTML = `<svg viewBox="0 0 ${width} ${height}" aria-hidden="true">${grid}<text class="chart-axis-title" x="15" y="${margin.top + plotHeight / 2}" transform="rotate(-90 15 ${margin.top + plotHeight / 2})">平均生成耗时</text>${marks}</svg><div class="hour-axis-hint">一天中的提交时间（本地时区）</div>`;
+}
+
+function renderDurationHeatmap(days = []) {
+  const root = $("durationHeatmap");
+  if (!days.length) {
+    root.innerHTML = '<div class="heatmap-empty">暂无逐日数据</div>';
+    return;
+  }
+  const dayRows = [...days].reverse().map((day) => {
+    const label = new Date(`${day.date}T00:00:00`).toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" });
+    const cells = day.hours.map((item) => `<div class="heat-cell level-${item.level}" title="${esc(`${day.date} ${hourLabel(item.hour)} · ${formatDuration(item.average_seconds)} · ${item.sample_count} 个样本`)}"><span>${item.average_seconds === null ? "" : formatDuration(item.average_seconds, true)}</span></div>`).join("");
+    return `<div class="heatmap-row"><div class="heatmap-date">${esc(label)}</div>${cells}</div>`;
+  }).join("");
+  const labels = Array.from({length:24}, (_, hour) => `<span>${hour % 2 === 0 ? String(hour).padStart(2, "0") : ""}</span>`).join("");
+  root.innerHTML = `<div class="heatmap-scroll"><div class="heatmap-hours"><span></span>${labels}</div>${dayRows}</div>`;
+}
+
+function renderAnalytics(data) {
+  state.analytics = data;
+  const recommended = data.recommended_hours || [];
+  const busy = data.busy_hours || [];
+  $("recommendedHours").textContent = hourRanges(recommended);
+  $("busyHours").textContent = hourRanges(busy);
+  $("analyticsSamples").textContent = `${data.completed_samples || 0} 个历史任务`;
+  $("recommendedDetail").textContent = recommended.length ? "这些时段平均等待不超过 30 分钟" : "当前还没有平均等待不超过 30 分钟的时段";
+  $("busyDetail").textContent = busy.length ? "这些时段历史平均等待超过 1 小时" : "当前没有平均等待超过 1 小时的时段";
+  renderHourlyDurationChart(data.hourly || []);
+  renderDurationHeatmap(data.heatmap || []);
+}
+
+async function refreshAnalytics() {
+  const params = query({
+    range: state.analyticsRange,
+    timezone_offset: -new Date().getTimezoneOffset(),
+  });
+  renderAnalytics(await api(`/admin/analytics/durations?${params}`));
+}
+
 function renderVideoSummary(summary) {
   $("vTotal").textContent = summary.total || 0;
   $("vActive").textContent = Number(summary.queued || 0) + Number(summary.running || 0);
@@ -565,6 +681,7 @@ async function refreshCurrent(userInitiated = false) {
     if (state.route === "generate") await refreshGenerate();
     if (state.route === "accounts") await refreshAccounts();
     if (state.route === "logs") await refreshLogs();
+    if (state.route === "analytics") await refreshAnalytics();
     if (state.route === "videos") await refreshVideos();
     if (state.route === "settings") await refreshSettings();
     setConnection(true);
@@ -838,6 +955,11 @@ function bindEvents() {
   $("logSearch").addEventListener("input", refreshLogFilters);
   $("logLevel").addEventListener("change", () => refreshCurrent(false));
   $("logCategory").addEventListener("change", () => refreshCurrent(false));
+  $$('[data-analytics-range]').forEach((button) => button.addEventListener("click", () => {
+    state.analyticsRange = button.dataset.analyticsRange;
+    $$('[data-analytics-range]').forEach((item) => item.classList.toggle("active", item === button));
+    refreshCurrent(false);
+  }));
   const refreshVideoFilters = debounce(() => refreshCurrent(false));
   $("videoSearch").addEventListener("input", refreshVideoFilters);
   $("videoStatus").addEventListener("change", () => refreshCurrent(false));
@@ -870,6 +992,7 @@ function startPolling() {
     if (!state.key || !$("auth").classList.contains("hidden")) return;
     if (state.route === "logs" && !$("logAutoRefresh").checked) return;
     if (state.route === "videos" && !$("videoAutoRefresh").checked) return;
+    if (state.route === "analytics") return;
     refreshCurrent(false);
   }, 5000);
 }

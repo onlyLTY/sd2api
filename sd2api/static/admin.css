@@ -336,6 +336,70 @@ tbody > tr:not(.detail-row):not(.subaccount-row):hover > td { background: rgba(2
 .table-empty { padding: 42px !important; color: var(--muted); text-align: center; }
 
 .filter-panel { margin-bottom: 14px; padding: 16px 18px; }
+.analytics-toolbar { display: grid; gap: 12px; margin-bottom: 14px; padding: 15px 18px; }
+.analytics-toolbar-main { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; }
+.range-switch { display: inline-flex; gap: 3px; border: 1px solid var(--line); border-radius: 10px; background: #090e15; padding: 3px; }
+.range-button { min-height: 34px; border: 0; border-radius: 7px; background: transparent; color: var(--muted); padding: 5px 12px; font-size: 11px; font-weight: 700; cursor: pointer; }
+.range-button:hover { color: var(--text); }
+.range-button.active { background: var(--surface-3); color: var(--brand); box-shadow: inset 0 0 0 1px rgba(92, 221, 176, .18); }
+.speed-legend { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 13px; color: var(--muted); font-size: 10px; }
+.speed-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.speed-legend i { width: 9px; height: 9px; border-radius: 3px; }
+.speed-good i { background: var(--brand); }
+.speed-normal i { background: var(--warn); }
+.speed-busy i { background: var(--bad); }
+.analytics-scope { display: flex; align-items: center; gap: 8px; margin: 0; color: var(--muted); font-size: 10px; }
+.scope-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--brand); box-shadow: 0 0 0 4px var(--brand-soft); }
+.recommendation-grid { display: grid; grid-template-columns: 1.2fr 1.2fr .8fr; gap: 12px; margin-bottom: 14px; }
+.recommendation-card { display: flex; min-width: 0; min-height: 112px; align-items: flex-start; gap: 13px; border: 1px solid var(--line); border-radius: 14px; background: rgba(14, 19, 27, .94); padding: 17px 18px; }
+.recommendation-card > span { display: grid; width: 30px; height: 30px; flex: 0 0 30px; place-items: center; border-radius: 9px; font-weight: 900; }
+.recommendation-card div { min-width: 0; }
+.recommendation-card small { display: block; margin-bottom: 5px; color: var(--muted); font-size: 10px; font-weight: 750; letter-spacing: .08em; }
+.recommendation-card strong { display: block; color: #edf2f7; font-size: clamp(16px, 1.45vw, 22px); line-height: 1.25; letter-spacing: -.025em; overflow-wrap: anywhere; }
+.recommendation-card p { margin: 5px 0 0; color: var(--muted); font-size: 10px; }
+.recommendation-card.recommended { border-color: rgba(92, 221, 176, .28); background: linear-gradient(135deg, rgba(92, 221, 176, .11), rgba(14, 19, 27, .96) 64%); }
+.recommendation-card.recommended > span { background: var(--brand-soft); color: var(--brand); }
+.recommendation-card.avoid { border-color: rgba(255, 123, 135, .25); background: linear-gradient(135deg, rgba(255, 123, 135, .09), rgba(14, 19, 27, .96) 64%); }
+.recommendation-card.avoid > span { background: var(--bad-soft); color: var(--bad); }
+.recommendation-card.sample > span { background: var(--blue-soft); color: var(--blue); }
+.hourly-chart-panel { min-width: 0; margin-bottom: 14px; }
+.analytics-heading p.muted { margin: 5px 0 0; font-size: 10px; }
+.hourly-duration-chart { position: relative; min-height: 410px; overflow: hidden; }
+.hourly-duration-chart svg { display: block; width: 100%; height: 410px; overflow: visible; }
+.chart-gridline line { stroke: rgba(140, 152, 170, .13); stroke-width: 1; }
+.chart-gridline text, .hour-label, .hour-samples, .hour-value, .chart-axis-title { fill: var(--muted); font-family: Inter, ui-sans-serif, system-ui, sans-serif; font-size: 10px; }
+.chart-gridline text { text-anchor: end; }
+.hour-label, .hour-samples, .hour-value { text-anchor: middle; }
+.hour-label { fill: #b9c3cf; font-size: 9px; font-weight: 700; }
+.hour-samples { fill: #596575; font-size: 8px; }
+.hour-value { fill: #cbd4df; font-size: 8px; font-weight: 700; }
+.chart-axis-title { fill: #657184; text-anchor: middle; font-size: 9px; letter-spacing: .08em; }
+.hour-bar { opacity: .72; transition: opacity .16s ease; }
+.hour-bar-group.level-recommended .hour-bar { fill: var(--brand); }
+.hour-bar-group.level-normal .hour-bar { fill: var(--warn); }
+.hour-bar-group.level-busy .hour-bar { fill: var(--bad); }
+.hour-bar-group:hover .hour-bar { opacity: 1; }
+.no-data-mark { stroke: #34404e; stroke-width: 2; stroke-linecap: round; }
+.chart-hitbox { fill: transparent; }
+.hour-axis-hint { position: absolute; right: 4px; bottom: 1px; color: #596575; font-size: 9px; }
+.chart-empty { display: grid; min-height: 360px; place-content: center; color: var(--muted); text-align: center; }
+.chart-empty span { color: var(--brand); font-size: 30px; }
+.chart-empty strong { margin-top: 7px; color: #dbe2ea; }
+.chart-empty p { margin: 5px 0 0; font-size: 11px; }
+.heatmap-panel { min-width: 0; }
+.duration-heatmap { overflow: hidden; }
+.heatmap-scroll { min-width: 880px; }
+.heatmap-hours, .heatmap-row { display: grid; grid-template-columns: 58px repeat(24, minmax(28px, 1fr)); gap: 3px; }
+.heatmap-hours { margin-bottom: 5px; }
+.heatmap-hours span { color: #647083; font-size: 8px; text-align: center; }
+.heatmap-row { align-items: center; margin-bottom: 3px; }
+.heatmap-date { color: var(--muted); font-size: 9px; text-align: right; padding-right: 7px; }
+.heat-cell { display: grid; min-width: 0; height: 26px; place-items: center; border: 1px solid rgba(37, 46, 59, .55); border-radius: 4px; background: #111721; color: rgba(255,255,255,.76); font-size: 7px; cursor: help; }
+.heat-cell.level-recommended { border-color: rgba(92, 221, 176, .22); background: rgba(55, 200, 145, .5); }
+.heat-cell.level-normal { border-color: rgba(243, 191, 98, .2); background: rgba(243, 191, 98, .46); }
+.heat-cell.level-busy { border-color: rgba(255, 123, 135, .24); background: rgba(255, 123, 135, .52); }
+.heat-cell.level-unknown { background: #0a0f16; }
+.heatmap-empty { padding: 42px; color: var(--muted); text-align: center; }
 .filter-row { display: grid; grid-template-columns: minmax(240px, 1fr) 170px 170px auto; align-items: end; gap: 12px; }
 .video-filter-row { grid-template-columns: minmax(260px, 1fr) 180px auto; }
 .filter-row .field { margin: 0; }
@@ -403,6 +467,8 @@ dialog::backdrop { background: rgba(3, 5, 8, .76); backdrop-filter: blur(5px); }
 
 @media (max-width: 1180px) {
   .account-metrics { grid-template-columns: repeat(3, 1fr); }
+  .recommendation-grid { grid-template-columns: 1fr 1fr; }
+  .recommendation-card.sample { grid-column: 1 / -1; min-height: 90px; }
   .generate-layout { grid-template-columns: minmax(0, 1.4fr) minmax(270px, .75fr); }
   .recent-task-grid { grid-template-columns: repeat(2, 1fr); }
 }
@@ -434,6 +500,8 @@ dialog::backdrop { background: rgba(3, 5, 8, .76); backdrop-filter: blur(5px); }
   .generate-layout { grid-template-columns: 1fr; }
   .generate-aside { grid-template-columns: 1fr 1fr; }
   .filter-row, .video-filter-row { grid-template-columns: 1fr 1fr; }
+  .analytics-toolbar-main { align-items: stretch; flex-direction: column; }
+  .speed-legend { justify-content: flex-start; }
   .settings-grid { grid-template-columns: 1fr; }
   .search-field { grid-column: 1 / -1; }
   .log-entry { grid-template-columns: 84px 65px 1fr; }
@@ -456,6 +524,12 @@ dialog::backdrop { background: rgba(3, 5, 8, .76); backdrop-filter: blur(5px); }
   .mode-switch { grid-template-columns: 1fr; }
   .mode-button { min-height: 54px; }
   .two-columns, .generate-aside, .form-grid, .filter-row, .video-filter-row { grid-template-columns: 1fr; }
+  .recommendation-grid { grid-template-columns: 1fr; }
+  .recommendation-card.sample { grid-column: auto; }
+  .range-switch { display: grid; grid-template-columns: repeat(3, 1fr); }
+  .range-button { padding-inline: 7px; }
+  .hourly-duration-chart, .duration-heatmap { margin-inline: -9px; overflow-x: auto; }
+  .hourly-duration-chart svg { width: 920px; max-width: none; }
   .settings-group-heading { display: block; }
   .settings-group-heading p { margin-top: 5px; text-align: left; }
   .settings-actions { align-items: stretch; flex-direction: column; }
