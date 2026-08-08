@@ -1,5 +1,6 @@
 services:
   sd2api:
+    image: ${SD2API_IMAGE:-coolqoo/sd2api:latest}
     build:
       context: .
       dockerfile: Dockerfile
