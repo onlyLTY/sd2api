@@ -291,6 +291,7 @@ class TaskStore:
         self,
         *,
         limit: int = 20,
+        offset: int = 0,
         after: str | None = None,
         order: str = "desc",
         account_id: str | None = None,
@@ -320,13 +321,42 @@ class TaskStore:
             pattern = f"%{search}%"
             params.extend([pattern] * 5)
         where = "WHERE " + " AND ".join(conditions) if conditions else ""
-        params.append(limit)
+        params.extend([limit, offset])
         with self._lock, self._connect() as connection:
             rows = connection.execute(
-                f"SELECT * FROM tasks {where} ORDER BY created_at {direction}, id {direction} LIMIT ?",
+                f"SELECT * FROM tasks {where} ORDER BY created_at {direction}, id {direction} LIMIT ? OFFSET ?",
                 params,
             ).fetchall()
         return [self._decode(row) for row in rows]
+
+    def count_tasks(
+        self,
+        *,
+        account_id: str | None = None,
+        status: str | None = None,
+        search: str | None = None,
+    ) -> int:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if account_id:
+            conditions.append("account_id = ?")
+            params.append(account_id)
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        if search:
+            conditions.append(
+                "(id LIKE ? OR prompt LIKE ? OR model LIKE ? OR account_id LIKE ? "
+                "OR advertiser_id LIKE ?)"
+            )
+            pattern = f"%{search}%"
+            params.extend([pattern] * 5)
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                f"SELECT COUNT(*) AS count FROM tasks {where}", params
+            ).fetchone()
+        return int(row["count"] if row else 0)
 
     def add_event(
         self,
@@ -436,6 +466,7 @@ class TaskStore:
         self,
         *,
         limit: int = 200,
+        offset: int = 0,
         level: str | None = None,
         category: str | None = None,
         search: str | None = None,
@@ -455,13 +486,41 @@ class TaskStore:
             pattern = f"%{search}%"
             params.extend([pattern] * 4)
         where = "WHERE " + " AND ".join(conditions) if conditions else ""
-        params.append(limit)
+        params.extend([limit, offset])
         with self._lock, self._connect() as connection:
             rows = connection.execute(
-                f"SELECT * FROM events {where} ORDER BY created_at DESC, id DESC LIMIT ?",
+                f"SELECT * FROM events {where} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
                 params,
             ).fetchall()
         return [self._decode_event(row) for row in rows]
+
+    def count_events(
+        self,
+        *,
+        level: str | None = None,
+        category: str | None = None,
+        search: str | None = None,
+    ) -> int:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if level:
+            conditions.append("level = ?")
+            params.append(level)
+        if category:
+            conditions.append("category = ?")
+            params.append(category)
+        if search:
+            conditions.append(
+                "(message LIKE ? OR account_id LIKE ? OR task_id LIKE ? OR details LIKE ?)"
+            )
+            pattern = f"%{search}%"
+            params.extend([pattern] * 4)
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                f"SELECT COUNT(*) AS count FROM events {where}", params
+            ).fetchone()
+        return int(row["count"] if row else 0)
 
     def delete(self, task_id: str) -> bool:
         with self._lock, self._connect() as connection:

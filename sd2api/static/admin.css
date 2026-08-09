@@ -416,6 +416,12 @@ tbody > tr:not(.detail-row):not(.subaccount-row):hover > td { background: rgba(2
 .log-message strong { display: block; font-size: 12px; }
 .log-message pre { overflow: hidden; margin: 4px 0 0; color: var(--muted); font: 10px/1.45 "SFMono-Regular", Consolas, monospace; text-overflow: ellipsis; white-space: pre-wrap; overflow-wrap: anywhere; }
 .log-context { color: var(--muted); font-size: 10px; overflow-wrap: anywhere; }
+.pagination { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; border-top: 1px solid var(--line); margin-top: 12px; padding-top: 14px; }
+.pagination-summary { margin-right: auto; color: var(--muted); font-size: 11px; }
+.pagination-pages { color: #c8d1dc; font-size: 11px; min-width: 76px; text-align: center; }
+.pagination-size { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 11px; }
+.pagination-size select { width: auto; min-width: 76px; height: 32px; padding: 5px 26px 5px 9px; }
+.pagination .button { min-height: 32px; padding: 6px 10px; }
 
 .task-main { max-width: 330px; }
 .task-main .cell-title { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -537,6 +543,8 @@ dialog::backdrop { background: rgba(3, 5, 8, .76); backdrop-filter: blur(5px); }
   .recent-task-grid { grid-template-columns: 1fr; }
   .log-entry { grid-template-columns: 75px 60px 1fr; gap: 8px; }
   .log-context { grid-column: 1 / -1; padding-left: 143px; }
+  .pagination { justify-content: center; }
+  .pagination-summary { width: 100%; margin-right: 0; text-align: center; }
   .button-group { flex-wrap: wrap; }
 }
 

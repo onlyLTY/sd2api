@@ -140,6 +140,9 @@ def test_store_round_trip(tmp_path: Path) -> None:
     assert store.list()[0].id == "task-1"
     assert store.list(status="succeeded")[0].id == "task-1"
     assert store.list(search="red ball")[0].id == "task-1"
+    assert store.list(limit=1, offset=1) == []
+    assert store.count_tasks() == 1
+    assert store.count_tasks(status="succeeded", search="red ball") == 1
     assert store.task_counts() == {
         "total": 1,
         "queued": 0,
@@ -159,6 +162,8 @@ def test_store_round_trip(tmp_path: Path) -> None:
     assert event.details == {"model": "seedance-2.0"}
     assert store.list_events(level="success")[0].task_id == "task-1"
     assert store.list_events(category="video", search="seedance")[0].id == event.id
+    assert store.list_events(limit=1, offset=1) == []
+    assert store.count_events(level="success", search="seedance") == 1
     analytics_rows = store.duration_analytics_rows(
         since=created.created_at - 1,
         until=updated.completed_at + 1,
@@ -2092,6 +2097,8 @@ def test_admin_account_routes_without_starting_browser(
     styles = api.get("/admin/assets/admin.css")
     script = api.get("/admin/assets/admin.js")
     logs = api.get("/admin/logs", headers=headers)
+    paged_logs = api.get("/admin/logs?limit=50&page=1", headers=headers)
+    paged_tasks = api.get("/admin/tasks?limit=50&page=1", headers=headers)
     secured = api.post(
         "/admin/accounts",
         headers=headers,
@@ -2123,6 +2130,12 @@ def test_admin_account_routes_without_starting_browser(
     assert "待调度" not in script.text
     assert '<span class="pill info">当前</span>' not in script.text
     assert logs.status_code == 200
+    assert paged_logs.json()["pagination"]["page_size"] == 50
+    assert paged_logs.json()["pagination"]["total"] >= 1
+    assert paged_tasks.json()["pagination"] == {"page": 1, "page_size": 50, "total": 0}
+    assert 'id="logPagination"' in dashboard.text
+    assert 'id="videoPagination"' in dashboard.text
+    assert "[50, 100, 200, 500]" in script.text
     assert any(item["message"] == "账号已加入号池" for item in logs.json()["data"])
     assert secured.status_code == 200
     assert secured.json()["credentials_configured"] is True
@@ -2304,6 +2317,44 @@ def test_admin_tasks_refresh_pending_records_and_expose_actual_model(
     assert any(
         event.message == "视频生成完成" for event in task_store.list_events()
     )
+
+
+def test_admin_tasks_and_logs_support_pagination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sd2api.main as main
+
+    task_store = TaskStore(str(tmp_path / "pagination.db"))
+    for index in range(3):
+        task_store.create(
+            task_id=f"task-{index}",
+            api="openai",
+            model="sora-2",
+            prompt=f"Prompt {index}",
+            seconds=5,
+        )
+        task_store.add_event(
+            level="info", category="video", message=f"Event {index}"
+        )
+    monkeypatch.setattr(main, "store", task_store)
+    api = TestClient(main.app)
+    headers = {
+        "Authorization": f"Bearer {main.settings.sd2api_admin_key or main.settings.sd2api_api_key}"
+    }
+
+    tasks = api.get("/admin/tasks?limit=2&page=2", headers=headers)
+    logs = api.get("/admin/logs?limit=2&page=2", headers=headers)
+
+    assert tasks.status_code == 200
+    assert len(tasks.json()["data"]) == 1
+    assert tasks.json()["pagination"] == {
+        "page": 2, "page_size": 2, "total": 3
+    }
+    assert logs.status_code == 200
+    assert len(logs.json()["data"]) == 1
+    assert logs.json()["pagination"] == {
+        "page": 2, "page_size": 2, "total": 3
+    }
 
 
 def test_admin_duration_analytics(

@@ -15,6 +15,12 @@ const state = {
   config: null,
   tasks: [],
   logs: [],
+  logPage: 1,
+  logPageSize: 50,
+  logTotal: 0,
+  videoPage: 1,
+  videoPageSize: 50,
+  videoTotal: 0,
   taskSummary: {},
   analytics: null,
   analyticsRange: "30d",
@@ -479,8 +485,20 @@ function logLevelLabel(level) {
   return ({ info: "INFO", success: "SUCCESS", warning: "WARN", error: "ERROR" })[level] || String(level || "INFO").toUpperCase();
 }
 
+function renderPagination(rootId, type, page, pageSize, total) {
+  const root = $(rootId);
+  const pages = Math.max(1, Math.ceil(total / pageSize));
+  const start = total ? (page - 1) * pageSize + 1 : 0;
+  const end = Math.min(page * pageSize, total);
+  root.innerHTML = `<span class="pagination-summary">显示 ${start}-${end}，共 ${total} 条</span>
+    <label class="pagination-size">每页 <select data-pagination-size="${type}" aria-label="每页条数">${[50, 100, 200, 500].map((size) => `<option value="${size}" ${size === pageSize ? "selected" : ""}>${size}</option>`).join("")}</select> 条</label>
+    <button class="button ghost" data-pagination-page="${type}" data-page="${page - 1}" type="button" ${page <= 1 ? "disabled" : ""}>上一页</button>
+    <span class="pagination-pages">第 ${page} / ${pages} 页</span>
+    <button class="button ghost" data-pagination-page="${type}" data-page="${page + 1}" type="button" ${page >= pages ? "disabled" : ""}>下一页</button>`;
+}
+
 function renderLogs(items) {
-  $("logCount").textContent = `${items.length} 条`;
+  $("logCount").textContent = `共 ${state.logTotal} 条`;
   $("navLogBadge").classList.toggle("hidden", !items.some((item) => item.level === "error"));
   if (!items.length) {
     $("logs").innerHTML = '<div class="empty-state"><strong>没有匹配的日志</strong><p>调整筛选条件后重试。</p></div>';
@@ -500,14 +518,19 @@ function renderLogs(items) {
 
 async function refreshLogs() {
   const params = query({
-    limit: 300,
+    limit: state.logPageSize,
+    page: state.logPage,
     level: $("logLevel").value,
     category: $("logCategory").value,
     search: $("logSearch").value.trim(),
   });
   const data = await api(`/admin/logs?${params}`);
   state.logs = data.data || [];
+  state.logTotal = data.pagination?.total || 0;
+  const pages = Math.max(1, Math.ceil(state.logTotal / state.logPageSize));
+  if (state.logPage > pages) { state.logPage = pages; return refreshLogs(); }
   renderLogs(state.logs);
+  renderPagination("logPagination", "log", state.logPage, state.logPageSize, state.logTotal);
 }
 
 function formatDuration(seconds, compact = false) {
@@ -631,7 +654,7 @@ function renderVideoSummary(summary) {
 }
 
 function renderTasks(items) {
-  $("videoCount").textContent = `${items.length} 条`;
+  $("videoCount").textContent = `共 ${state.videoTotal} 条`;
   const body = $("tasks");
   if (!items.length) {
     body.innerHTML = '<tr><td colspan="7" class="table-empty">没有匹配的视频任务。</td></tr>';
@@ -658,16 +681,21 @@ function renderTasks(items) {
 
 async function refreshVideos() {
   const params = query({
-    limit: 200,
+    limit: state.videoPageSize,
+    page: state.videoPage,
     status: $("videoStatus").value,
     search: $("videoSearch").value.trim(),
     refresh_pending: $("videoAutoRefresh").checked,
   });
   const data = await api(`/admin/tasks?${params}`);
   state.tasks = data.data || [];
+  state.videoTotal = data.pagination?.total || 0;
+  const pages = Math.max(1, Math.ceil(state.videoTotal / state.videoPageSize));
+  if (state.videoPage > pages) { state.videoPage = pages; return refreshVideos(); }
   state.taskSummary = data.summary || {};
   renderVideoSummary(state.taskSummary);
   renderTasks(state.tasks);
+  renderPagination("videoPagination", "video", state.videoPage, state.videoPageSize, state.videoTotal);
   const active = Number(state.taskSummary.queued || 0) + Number(state.taskSummary.running || 0);
   $("navTaskBadge").textContent = active;
   $("navTaskBadge").classList.toggle("hidden", !active);
@@ -951,19 +979,34 @@ function bindEvents() {
   $("accounts").addEventListener("change", (event) => {
     if (event.target.matches("[data-sub-toggle]")) toggleSubaccount(event.target);
   });
-  const refreshLogFilters = debounce(() => refreshCurrent(false));
+  const refreshLogFilters = debounce(() => { state.logPage = 1; refreshCurrent(false); });
   $("logSearch").addEventListener("input", refreshLogFilters);
-  $("logLevel").addEventListener("change", () => refreshCurrent(false));
-  $("logCategory").addEventListener("change", () => refreshCurrent(false));
+  $("logLevel").addEventListener("change", () => { state.logPage = 1; refreshCurrent(false); });
+  $("logCategory").addEventListener("change", () => { state.logPage = 1; refreshCurrent(false); });
   $$('[data-analytics-range]').forEach((button) => button.addEventListener("click", () => {
     state.analyticsRange = button.dataset.analyticsRange;
     $$('[data-analytics-range]').forEach((item) => item.classList.toggle("active", item === button));
     refreshCurrent(false);
   }));
-  const refreshVideoFilters = debounce(() => refreshCurrent(false));
+  const refreshVideoFilters = debounce(() => { state.videoPage = 1; refreshCurrent(false); });
   $("videoSearch").addEventListener("input", refreshVideoFilters);
-  $("videoStatus").addEventListener("change", () => refreshCurrent(false));
+  $("videoStatus").addEventListener("change", () => { state.videoPage = 1; refreshCurrent(false); });
   $("videoAutoRefresh").addEventListener("change", () => refreshCurrent(false));
+  document.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-pagination-page]");
+    if (!button || button.disabled) return;
+    const type = button.dataset.paginationPage;
+    state[`${type}Page`] = Number(button.dataset.page);
+    refreshCurrent(false);
+  });
+  document.addEventListener("change", (event) => {
+    const select = event.target.closest("[data-pagination-size]");
+    if (!select) return;
+    const type = select.dataset.paginationSize;
+    state[`${type}PageSize`] = Number(select.value);
+    state[`${type}Page`] = 1;
+    refreshCurrent(false);
+  });
   $("tasks").addEventListener("click", (event) => {
     const button = event.target.closest("[data-task-action]");
     if (!button) return;

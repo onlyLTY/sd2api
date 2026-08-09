@@ -946,7 +946,8 @@ def daily_hour_heatmap(
 
 @app.get("/admin/tasks", dependencies=[Depends(require_admin_key)])
 async def list_admin_tasks(
-    limit: int = Query(default=100, ge=1, le=1000),
+    limit: int = Query(default=50, ge=1, le=1000),
+    page: int = Query(default=1, ge=1),
     account_id: str | None = None,
     status: Literal["all", "queued", "running", "succeeded", "failed"] = "all",
     search: str | None = Query(default=None, max_length=256),
@@ -955,6 +956,7 @@ async def list_admin_tasks(
     selected_status = None if status == "all" else status
     records = store.list(
         limit=limit,
+        offset=(page - 1) * limit,
         account_id=account_id,
         status=selected_status,
         search=search,
@@ -973,6 +975,7 @@ async def list_admin_tasks(
         await asyncio.gather(*(refresh_one(record) for record in pending))
         records = store.list(
             limit=limit,
+            offset=(page - 1) * limit,
             account_id=account_id,
             status=selected_status,
             search=search,
@@ -980,6 +983,13 @@ async def list_admin_tasks(
     return {
         "data": [admin_task(record) for record in records],
         "summary": store.task_counts(),
+        "pagination": {
+            "page": page,
+            "page_size": limit,
+            "total": store.count_tasks(
+                account_id=account_id, status=selected_status, search=search
+            ),
+        },
     }
 
 
@@ -1007,17 +1017,21 @@ async def admin_duration_analytics(
 
 @app.get("/admin/logs", dependencies=[Depends(require_admin_key)])
 async def list_admin_logs(
-    limit: int = Query(default=200, ge=1, le=1000),
+    limit: int = Query(default=50, ge=1, le=1000),
+    page: int = Query(default=1, ge=1),
     level: Literal["all", "info", "success", "warning", "error"] = "all",
     category: Literal["all", "system", "account", "login", "video"] = "all",
     search: str | None = Query(default=None, max_length=256),
 ) -> dict[str, Any]:
     events = store.list_events(
         limit=limit,
+        offset=(page - 1) * limit,
         level=None if level == "all" else level,
         category=None if category == "all" else category,
         search=search,
     )
+    selected_level = None if level == "all" else level
+    selected_category = None if category == "all" else category
     return {
         "data": [
             {
@@ -1031,7 +1045,14 @@ async def list_admin_logs(
                 "details": event.details,
             }
             for event in events
-        ]
+        ],
+        "pagination": {
+            "page": page,
+            "page_size": limit,
+            "total": store.count_events(
+                level=selected_level, category=selected_category, search=search
+            ),
+        },
     }
 
 
