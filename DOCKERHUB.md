@@ -20,9 +20,10 @@
 工作流会发布这些常用标签：
 
 - `coolqoo/sd2api:latest`：`main` 分支最新版本
-- `coolqoo/sd2api:main`：`main` 分支版本
-- `coolqoo/sd2api:sha-xxxxxxx`：精确对应某次提交
+- `coolqoo/sd2api:build-20260810-12`：带构建日期和 GitHub Actions 流水线序号的可追溯版本
 - `coolqoo/sd2api:1.2.0`、`1.2`、`1`：推送 `v1.2.0` 标签时生成
+
+工作流不再生成含义重复的 `main` 和不易阅读的纯 `sha-*` 新标签。Docker Hub 中已有的旧标签不会被自动删除，可在确认无人使用后从 Docker Hub 标签页面手动删除。
 
 ## VPS 更新
 
