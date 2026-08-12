@@ -358,6 +358,39 @@ class BrowserPoolClient:
         )
         return any(marker in text for marker in markers)
 
+    async def _mark_account_session_expired(
+        self, account_id: str, exc: TikTokUpstreamError
+    ) -> None:
+        """Remove an invalid login session before trying another account."""
+        await self._close_protocol_clients(account_id)
+        message = "TikTok session expired; the account must log in again"
+        self.store.update_account(
+            account_id,
+            session_ciphertext=None,
+            session_updated_at=None,
+            login_state="pending",
+            last_error=message,
+        )
+        self.store.add_event(
+            level="warning",
+            category="account",
+            message=message,
+            account_id=account_id,
+            details={
+                "upstream_code": exc.code,
+                "upstream_message": str(exc),
+            },
+        )
+        account = self.store.get_account(account_id)
+        if (
+            account
+            and account["enabled"]
+            and self.settings.sd2api_auto_login
+            and account.get("auto_login")
+            and account.get("credentials_configured")
+        ):
+            self._schedule_login(account_id)
+
     def _decorate_subaccounts(
         self, account_id: str, items: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
@@ -1046,6 +1079,8 @@ class BrowserPoolClient:
                 )
 
             try:
+                last_authentication_error: TikTokUpstreamError | None = None
+                quota_failures = 0
                 while candidates:
                     selected_account, selected_subaccount = min(
                         candidates,
@@ -1104,8 +1139,16 @@ class BrowserPoolClient:
                                 kwargs["advertiser_id"] = advertiser_id
                             task_id = await target.create_text_video(**kwargs)
                     except TikTokUpstreamError as exc:
+                        if exc.code == "tiktok_authentication_error":
+                            last_authentication_error = exc
+                            await self._mark_account_session_expired(account_id, exc)
+                            candidates = [
+                                pair for pair in candidates if pair[0]["id"] != account_id
+                            ]
+                            continue
                         if not self._is_daily_quota_error(exc):
                             raise
+                        quota_failures += 1
                         blocked_until = (
                             int(time.time())
                             + self.settings.sd2api_pool_quota_cooldown
@@ -1147,6 +1190,15 @@ class BrowserPoolClient:
                             last_error=None,
                         )
                     return task_id
+                if last_authentication_error is not None and quota_failures == 0:
+                    raise last_authentication_error
+                if last_authentication_error is not None:
+                    raise TikTokUpstreamError(
+                        "All selected accounts are unavailable because their sessions expired "
+                        "or their daily generation quota was exhausted",
+                        status_code=503,
+                        code="account_pool_unavailable",
+                    )
                 raise TikTokUpstreamError(
                     "All selected subaccounts have exhausted their daily generation quota",
                     status_code=429,

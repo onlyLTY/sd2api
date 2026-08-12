@@ -96,7 +96,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="sd2api",
-    version="0.1.0",
+    version="1.0",
     description=(
         "TikTok Symphony Seedance adapter with Seedance and OpenAI-compatible video APIs. "
         "当前 TikTok 网页协议只有 4–15 秒时长会真实生效；size、ratio、resolution "

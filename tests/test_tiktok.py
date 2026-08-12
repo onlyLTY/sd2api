@@ -1906,6 +1906,177 @@ async def test_pool_fails_over_when_subaccount_hits_daily_quota(
 
 
 @pytest.mark.asyncio
+async def test_pool_fails_over_to_another_login_when_session_expires(
+    tmp_path: Path,
+) -> None:
+    store = TaskStore(str(tmp_path / "authentication-failover.db"))
+    for account_id, advertiser_ids in (
+        ("expired", ("expired-a", "expired-b")),
+        ("healthy", ("healthy-a",)),
+    ):
+        store.create_account(account_id=account_id, name=account_id)
+        store.update_account(
+            account_id,
+            session_ciphertext=f"{account_id}-session",
+            session_updated_at=int(time.time()),
+            login_state="logged_in",
+        )
+        store.upsert_subaccounts(
+            account_id,
+            [
+                {
+                    "advertiser_id": advertiser_id,
+                    "name": advertiser_id,
+                    "account_type": "partner",
+                    "seedance_access": True,
+                    "credits": 100,
+                }
+                for advertiser_id in advertiser_ids
+            ],
+        )
+        for advertiser_id in advertiser_ids:
+            store.set_subaccount_enabled(account_id, advertiser_id, True)
+    pool = BrowserPoolClient(Settings(), store)
+
+    async def fake_list_accounts() -> list[dict[str, Any]]:
+        return [
+            {
+                "id": account_id,
+                "enabled": True,
+                "running": True,
+                "logged_in": True,
+                "session_available": True,
+                "subaccounts": pool._decorate_subaccounts(
+                    account_id, store.list_subaccounts(account_id)
+                ),
+            }
+            for account_id in ("expired", "healthy")
+        ]
+
+    class ExpiredClient:
+        load = 0
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def create_text_video(self, **kwargs: Any) -> str:
+            self.calls += 1
+            raise TikTokUpstreamError(
+                "TikTok session expired; the account must log in again",
+                status_code=401,
+                code="tiktok_authentication_error",
+            )
+
+    class HealthyClient:
+        load = 0
+
+        async def create_text_video(self, **kwargs: Any) -> str:
+            return "healthy-task"
+
+    expired_clients = {
+        advertiser_id: ExpiredClient()
+        for advertiser_id in ("expired-a", "expired-b")
+    }
+    clients: dict[str, Any] = {
+        **expired_clients,
+        "healthy-a": HealthyClient(),
+    }
+    pool.list_accounts = fake_list_accounts  # type: ignore[method-assign]
+    pool._protocol_client = (  # type: ignore[method-assign]
+        lambda _account_id, advertiser_id=None: clients[str(advertiser_id)]
+    )
+
+    task_id = await pool.create_text_video(
+        prompt="fail over after logout", model="seedance-2.0", duration=5
+    )
+
+    assert task_id == "healthy-task"
+    assert sum(client.calls for client in expired_clients.values()) == 1
+    assert pool.account_for_task(task_id) == "healthy"
+    expired_account = store.get_account("expired")
+    assert expired_account is not None
+    assert expired_account["login_state"] == "pending"
+    assert expired_account["session_available"] is False
+    assert expired_account["last_error"] == (
+        "TikTok session expired; the account must log in again"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pool_returns_authentication_error_only_after_all_logins_expire(
+    tmp_path: Path,
+) -> None:
+    store = TaskStore(str(tmp_path / "all-authentication-expired.db"))
+    for account_id in ("a", "b"):
+        advertiser_id = f"sub-{account_id}"
+        store.create_account(account_id=account_id, name=account_id)
+        store.update_account(
+            account_id,
+            session_ciphertext=f"{account_id}-session",
+            session_updated_at=int(time.time()),
+            login_state="logged_in",
+        )
+        store.upsert_subaccounts(
+            account_id,
+            [
+                {
+                    "advertiser_id": advertiser_id,
+                    "name": advertiser_id,
+                    "account_type": "partner",
+                    "seedance_access": True,
+                    "credits": 100,
+                }
+            ],
+        )
+        store.set_subaccount_enabled(account_id, advertiser_id, True)
+    pool = BrowserPoolClient(Settings(), store)
+
+    async def fake_list_accounts() -> list[dict[str, Any]]:
+        return [
+            {
+                "id": account_id,
+                "enabled": True,
+                "running": True,
+                "logged_in": True,
+                "session_available": True,
+                "subaccounts": pool._decorate_subaccounts(
+                    account_id, store.list_subaccounts(account_id)
+                ),
+            }
+            for account_id in ("a", "b")
+        ]
+
+    class ExpiredClient:
+        load = 0
+
+        async def create_text_video(self, **kwargs: Any) -> str:
+            raise TikTokUpstreamError(
+                "TikTok session expired; the account must log in again",
+                status_code=401,
+                code="tiktok_authentication_error",
+            )
+
+    clients = {f"sub-{account_id}": ExpiredClient() for account_id in ("a", "b")}
+    pool.list_accounts = fake_list_accounts  # type: ignore[method-assign]
+    pool._protocol_client = (  # type: ignore[method-assign]
+        lambda _account_id, advertiser_id=None: clients[str(advertiser_id)]
+    )
+
+    with pytest.raises(TikTokUpstreamError) as error:
+        await pool.create_text_video(
+            prompt="all logged out", model="seedance-2.0", duration=5
+        )
+
+    assert error.value.status_code == 401
+    assert error.value.code == "tiktok_authentication_error"
+    for account_id in ("a", "b"):
+        account = store.get_account(account_id)
+        assert account is not None
+        assert account["login_state"] == "pending"
+        assert account["session_available"] is False
+
+
+@pytest.mark.asyncio
 async def test_pool_returns_429_when_every_selected_subaccount_is_quota_blocked(
     tmp_path: Path,
 ) -> None:
