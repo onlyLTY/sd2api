@@ -28,6 +28,8 @@ from .tiktok import (
     TikTokUpstreamError,
     _deep_find,
     _first,
+    is_tiktok_authentication_error,
+    tiktok_authentication_error,
 )
 from .uploads import StagedMedia
 
@@ -487,11 +489,14 @@ class ProtocolTikTokClient:
                 if isinstance(forbidden_base, dict)
                 else None
             )
-            raise TikTokUpstreamError(
+            error = TikTokUpstreamError(
                 str(message or "TikTok denied access to this model or operation"),
                 status_code=403,
                 code=str(code or "tiktok_permission_denied"),
             )
+            if is_tiktok_authentication_error(error):
+                raise tiktok_authentication_error() from error
+            raise error
         if response.status_code >= 400:
             try:
                 rejected = response.json()
@@ -518,7 +523,7 @@ class ProtocolTikTokClient:
                 if isinstance(rejected_base, dict)
                 else None
             )
-            raise TikTokUpstreamError(
+            error = TikTokUpstreamError(
                 str(
                     rejected_message
                     or f"TikTok returned HTTP {response.status_code} for {path}"
@@ -526,6 +531,9 @@ class ProtocolTikTokClient:
                 status_code=response.status_code,
                 code=str(rejected_code or f"tiktok_http_{response.status_code}"),
             )
+            if is_tiktok_authentication_error(error):
+                raise tiktok_authentication_error() from error
+            raise error
         try:
             payload = response.json()
         except ValueError as exc:
@@ -548,13 +556,16 @@ class ProtocolTikTokClient:
                 )
                 or "TikTok rejected the request"
             )
-            raise TikTokUpstreamError(
+            error = TikTokUpstreamError(
                 str(message),
                 status_code=(
                     403 if str(effective) in MODEL_PERMISSION_CODES else 502
                 ),
                 code=str(effective),
             )
+            if is_tiktok_authentication_error(error):
+                raise tiktok_authentication_error() from error
+            raise error
         return payload
 
     async def validate(self) -> dict[str, Any]:

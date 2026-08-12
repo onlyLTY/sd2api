@@ -33,7 +33,42 @@ const state = {
   ttohTimer: null,
 };
 
+async function loadAppVersion() {
+  try {
+    const response = await fetch("/admin/version", { headers: { Accept: "application/json" } });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const payload = await response.json();
+    $("appVersion").textContent = `v${payload.version || "unknown"}`;
+  } catch {
+    $("appVersion").textContent = "未知";
+  }
+}
+
+loadAppVersion();
+
 const TTOH_HOME = "https://ttoh.app/";
+const TTOH_DISMISSED_DATE_KEY = "sd2api_ttoh_dismissed_date";
+
+function localDateKey() {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return year + "-" + month + "-" + day;
+}
+
+function ttohDismissedToday() {
+  return localStorage.getItem(TTOH_DISMISSED_DATE_KEY) === localDateKey();
+}
+
+function dismissTtohAdsToday() {
+  localStorage.setItem(TTOH_DISMISSED_DATE_KEY, localDateKey());
+  document.body.classList.remove("ttoh-mobile-visible");
+  $("ttohAdDesktop").classList.add("hidden");
+  $("ttohAdMobile").classList.add("hidden");
+  clearInterval(state.ttohTimer);
+}
+
 const defaultTtohOffer = {
   title: "发现适合你的 TikTok Ads 优惠",
   description: "聚合广告金、优惠券与限时活动，降低 TikTok For Business 投放成本。",
@@ -166,7 +201,7 @@ function ttohCardMarkup(offer, mobile = false) {
   const dots = offers.length > 1 ? `<div class="ttoh-ad-controls" aria-label="选择优惠">${offers.map((_, index) => `<button class="ttoh-dot ${index === state.ttohIndex ? "active" : ""}" data-ttoh-index="${index}" type="button" aria-label="第 ${index + 1} 个优惠"></button>`).join("")}</div>` : "";
   const endLabel = ttohDateLabel(offer.end);
   return `<article class="ttoh-ad">
-    ${mobile ? '<button class="ttoh-close" data-ttoh-close type="button" aria-label="关闭 ttoh 优惠">×</button>' : ""}
+    <button class="ttoh-close" data-ttoh-close type="button" aria-label="今天不再显示 ttoh 优惠">×</button>
     <div class="ttoh-ad-topline"><a class="ttoh-home-link" href="${TTOH_HOME}" target="_blank" rel="noopener noreferrer sponsored">ttoh.app</a><span class="ttoh-sponsored">TikTok Ads 优惠</span></div>
     <a class="ttoh-ad-link" href="${esc(offer.link || TTOH_HOME)}" target="_blank" rel="noopener noreferrer sponsored">
       <div class="ttoh-ad-copy">
@@ -221,7 +256,12 @@ async function loadTtohOffers() {
 }
 
 function initTtohAds() {
-  if (sessionStorage.getItem("sd2api_ttoh_dismissed") !== "1") document.body.classList.add("ttoh-mobile-visible");
+  if (ttohDismissedToday()) {
+    $("ttohAdDesktop").classList.add("hidden");
+    $("ttohAdMobile").classList.add("hidden");
+    return;
+  }
+  document.body.classList.add("ttoh-mobile-visible");
   renderTtohAds();
   const start = () => {
     if ("requestIdleCallback" in window) requestIdleCallback(loadTtohOffers, { timeout: 1800 });
@@ -290,6 +330,7 @@ function navigate(route, updateHash = true) {
 }
 
 function renderConfig(config) {
+  if (config.version) $("appVersion").textContent = "v" + config.version;
   const notes = [];
   if (config.mode !== "browser_pool") notes.push("当前模式不是 browser_pool，号池功能不可用。");
   if (!config.temp_mail_configured) notes.push("尚未配置 cf_temp_mail，邮箱验证码需要手动处理。");
@@ -1023,8 +1064,7 @@ function bindEvents() {
       scheduleTtohRotation();
     }
     if (event.target.closest("[data-ttoh-close]")) {
-      document.body.classList.remove("ttoh-mobile-visible");
-      sessionStorage.setItem("sd2api_ttoh_dismissed", "1");
+      dismissTtohAdsToday();
     }
   });
 }

@@ -3,7 +3,7 @@
 仓库内的 GitHub Actions 工作流会在以下情况自动构建并推送镜像：
 
 - `main` 分支有新提交
-- 推送 `v*` 版本标签，例如 `v1.2.0`
+- 推送版本标签，支持 `1.2.0` 和 `v1.2.0` 两种格式
 - 在 GitHub Actions 页面手动运行
 
 每个镜像标签都是同时包含 `linux/amd64` 和 `linux/arm64` 的多架构清单，x86 和 ARM VPS 使用同一个镜像地址即可。
@@ -19,7 +19,7 @@
 
 工作流会发布这些常用标签：
 
-- `coolqoo/sd2api:latest`：`main` 分支最新版本
+- `coolqoo/sd2api:latest`：`main` 分支或最新发布标签的版本
 - `coolqoo/sd2api:build-20260810-12`：带构建日期和 GitHub Actions 流水线序号的可追溯版本
 - `coolqoo/sd2api:1.2.0`、`1.2`、`1`：推送 `v1.2.0` 标签时生成
 

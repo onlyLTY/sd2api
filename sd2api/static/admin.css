@@ -54,6 +54,7 @@ strong { font-weight: 700; }
 .hidden { display: none !important; }
 .muted { color: var(--muted); }
 .small { font-size: 12px; }
+.app-version { margin-top: 6px; font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
 .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: 12px; }
 .eyebrow { margin-bottom: 5px; color: var(--brand); font-size: 10px; font-weight: 800; letter-spacing: .18em; text-transform: uppercase; }
 
@@ -140,7 +141,9 @@ strong { font-weight: 700; }
 .ttoh-ad-controls { position: relative; z-index: 2; display: flex; align-items: center; justify-content: center; gap: 5px; margin-top: 10px; }
 .ttoh-dot { width: 16px; height: 3px; border: 0; border-radius: 99px; background: rgba(23, 21, 10, .2); padding: 0; cursor: pointer; }
 .ttoh-dot.active { background: var(--ttoh-ink); }
-.ttoh-close { position: absolute; z-index: 3; top: 7px; right: 7px; display: none; width: 25px; height: 25px; place-items: center; border: 0; border-radius: 50%; background: rgba(23, 21, 10, .09); color: rgba(23, 21, 10, .68); cursor: pointer; }
+.ttoh-close { position: absolute; z-index: 3; top: 7px; right: 7px; display: grid; width: 25px; height: 25px; place-items: center; border: 0; border-radius: 50%; background: rgba(23, 21, 10, .09); color: rgba(23, 21, 10, .68); cursor: pointer; }
+.ttoh-close:hover { background: rgba(23, 21, 10, .16); color: var(--ttoh-ink); }
+.ttoh-ad-desktop .ttoh-ad-topline { padding-right: 25px; }
 .connection-row { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; font-size: 12px; }
 .connection-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); box-shadow: 0 0 0 4px rgba(140, 152, 170, .08); }
 .connection-dot.online { background: var(--brand); box-shadow: 0 0 0 4px var(--brand-soft); }

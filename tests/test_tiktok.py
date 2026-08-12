@@ -1124,6 +1124,78 @@ async def test_protocol_http_error_preserves_upstream_code_and_message() -> None
 
 
 @pytest.mark.asyncio
+async def test_protocol_invalid_login_business_error_is_authentication_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "BaseResp": {
+                    "StatusCode": "38001001",
+                    "StatusMessage": "InvalidLogin",
+                }
+            },
+        )
+
+    client = ProtocolTikTokClient(
+        Settings(),
+        protocol_session(),
+        account_id="account-a",
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(TikTokUpstreamError) as error:
+        await client.validate()
+    await client.close()
+
+    assert error.value.status_code == 401
+    assert error.value.code == "tiktok_authentication_error"
+    assert str(error.value) == (
+        "TikTok session expired; the account must log in again"
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_subaccounts_clears_session_on_invalid_login(
+    tmp_path: Path,
+) -> None:
+    store = TaskStore(str(tmp_path / "refresh-invalid-login.db"))
+    store.create_account(account_id="expired", name="Expired")
+    store.update_account(
+        "expired",
+        session_ciphertext="stored-session",
+        session_updated_at=int(time.time()),
+        login_state="logged_in",
+    )
+    pool = BrowserPoolClient(Settings(), store)
+
+    class InvalidLoginClient:
+        load = 0
+
+        async def discover_subaccounts(self) -> list[dict[str, Any]]:
+            raise TikTokUpstreamError(
+                "InvalidLogin",
+                status_code=502,
+                code="38001001",
+            )
+
+    pool._protocol_client = (  # type: ignore[method-assign]
+        lambda _account_id, advertiser_id=None: InvalidLoginClient()
+    )
+
+    with pytest.raises(TikTokUpstreamError) as error:
+        await pool.refresh_subaccounts("expired")
+
+    assert error.value.status_code == 401
+    assert error.value.code == "tiktok_authentication_error"
+    account = store.get_account("expired")
+    assert account is not None
+    assert account["login_state"] == "pending"
+    assert account["session_available"] is False
+    assert account["last_error"] == (
+        "TikTok session expired; the account must log in again"
+    )
+
+
+@pytest.mark.asyncio
 async def test_protocol_status_two_is_running_until_zero_with_vid() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -1962,9 +2034,9 @@ async def test_pool_fails_over_to_another_login_when_session_expires(
         async def create_text_video(self, **kwargs: Any) -> str:
             self.calls += 1
             raise TikTokUpstreamError(
-                "TikTok session expired; the account must log in again",
-                status_code=401,
-                code="tiktok_authentication_error",
+                "InvalidLogin",
+                status_code=502,
+                code="38001001",
             )
 
     class HealthyClient:
@@ -2265,6 +2337,7 @@ def test_admin_account_routes_without_starting_browser(
     listed = api.get("/admin/accounts", headers=headers)
     status = api.get("/admin/pool/status", headers=headers)
     dashboard = api.get("/admin")
+    version = api.get("/admin/version")
     styles = api.get("/admin/assets/admin.css")
     script = api.get("/admin/assets/admin.js")
     logs = api.get("/admin/logs", headers=headers)
@@ -2289,6 +2362,8 @@ def test_admin_account_routes_without_starting_browser(
     assert listed.json()["data"][0]["name"] == "primary@example.com"
     assert status.json()["max_parallel"] == 0
     assert dashboard.status_code == 200
+    assert version.json() == {"version": "1.0.1"}
+    assert 'id="appVersion"' in dashboard.text
     assert "sd2api 控制台" in dashboard.text
     assert all(label in dashboard.text for label in ("生视频", "号池管理", "日志", "视频管理", "系统配置"))
     assert 'name="email_address"' not in dashboard.text
@@ -2296,6 +2371,10 @@ def test_admin_account_routes_without_starting_browser(
     assert ".sidebar" in styles.text
     assert script.status_code == 200
     assert "refreshVideos" in script.text
+    assert "/admin/version" in script.text
+    assert "sd2api_ttoh_dismissed_date" in script.text
+    assert "dismissTtohAdsToday" in script.text
+    assert "data-ttoh-close" in script.text
     assert 'class="switch-track"' in script.text
     assert "加入调度" in script.text
     assert "待调度" not in script.text
@@ -2535,7 +2614,8 @@ def test_admin_duration_analytics(
 
     task_store = TaskStore(str(tmp_path / "analytics.db"))
     now = int(time.time())
-    local_day_start = now - ((now + 8 * 3600) % 86400)
+    # Use the previous complete local day so the test is stable before 14:00.
+    local_day_start = now - ((now + 8 * 3600) % 86400) - 86400
     for task_id, status, created_at, duration in [
         ("fast", "succeeded", local_day_start + 2 * 3600, 300),
         ("slow", "succeeded", local_day_start + 14 * 3600, 7200),

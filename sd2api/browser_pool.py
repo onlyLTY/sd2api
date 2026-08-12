@@ -16,7 +16,11 @@ from .protocol import ProtocolSession, ProtocolTikTokClient
 from .security import CredentialError, CredentialVault
 from .store import TaskStore
 from .temp_mail import TempMailClient
-from .tiktok import TikTokUpstreamError
+from .tiktok import (
+    TikTokUpstreamError,
+    is_tiktok_authentication_error,
+    tiktok_authentication_error,
+)
 from .uploads import StagedMedia
 
 
@@ -580,7 +584,7 @@ class BrowserPoolClient:
                 await self.refresh_subaccounts(account_id, check_access=True)
                 return await self.account_status(account_id)
             except TikTokUpstreamError as exc:
-                if exc.code != "tiktok_authentication_error":
+                if not is_tiktok_authentication_error(exc):
                     self.store.update_account(
                         account_id,
                         last_error=f"Protocol validation failed: {exc}",
@@ -761,7 +765,7 @@ class BrowserPoolClient:
                             await client.validate()
                         continue
                     except TikTokUpstreamError as exc:
-                        if exc.code != "tiktok_authentication_error":
+                        if not is_tiktok_authentication_error(exc):
                             self.store.update_account(
                                 account["id"],
                                 last_error=f"Protocol status failed: {exc}",
@@ -847,6 +851,15 @@ class BrowserPoolClient:
                             last_error=None,
                             last_checked_at=int(time.time()),
                         )
+                    except TikTokUpstreamError as exc:
+                        if is_tiktok_authentication_error(exc):
+                            raise
+                        checked.update(
+                            credits=None,
+                            seedance_access=False,
+                            last_error=f"{exc.__class__.__name__}: {exc}",
+                            last_checked_at=int(time.time()),
+                        )
                     except Exception as exc:
                         checked.update(
                             credits=None,
@@ -857,7 +870,10 @@ class BrowserPoolClient:
                     return checked
 
                 discovered = list(await asyncio.gather(*(inspect(item) for item in discovered)))
-        except TikTokUpstreamError:
+        except TikTokUpstreamError as exc:
+            if is_tiktok_authentication_error(exc):
+                await self._mark_account_session_expired(account_id, exc)
+                raise tiktok_authentication_error() from exc
             raise
         except Exception as exc:
             raise TikTokUpstreamError(
@@ -1139,7 +1155,7 @@ class BrowserPoolClient:
                                 kwargs["advertiser_id"] = advertiser_id
                             task_id = await target.create_text_video(**kwargs)
                     except TikTokUpstreamError as exc:
-                        if exc.code == "tiktok_authentication_error":
+                        if is_tiktok_authentication_error(exc):
                             last_authentication_error = exc
                             await self._mark_account_session_expired(account_id, exc)
                             candidates = [

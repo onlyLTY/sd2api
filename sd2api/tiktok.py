@@ -23,6 +23,19 @@ T2V_MODELS: dict[str, str] = {
 }
 
 MODEL_PERMISSION_CODES = {"10001100"}
+AUTHENTICATION_ERROR_CODES = {
+    "tiktok_authentication_error",
+    "invalidlogin",
+    "38001001",
+}
+AUTHENTICATION_ERROR_MARKERS = (
+    "invalidlogin",
+    "invalid login",
+    "not logged in",
+    "login required",
+    "session expired",
+    "log in again",
+)
 
 
 class TikTokUpstreamError(RuntimeError):
@@ -30,6 +43,25 @@ class TikTokUpstreamError(RuntimeError):
         super().__init__(message)
         self.status_code = status_code
         self.code = code
+
+
+def is_tiktok_authentication_error(exc: BaseException) -> bool:
+    """Recognize HTTP auth failures and TikTok's HTTP-200 login errors."""
+    code = str(getattr(exc, "code", "") or "").strip().lower()
+    message = str(exc).strip().lower()
+    if int(getattr(exc, "status_code", 0) or 0) == 401:
+        return True
+    if code in AUTHENTICATION_ERROR_CODES:
+        return True
+    return any(marker in code or marker in message for marker in AUTHENTICATION_ERROR_MARKERS)
+
+
+def tiktok_authentication_error() -> TikTokUpstreamError:
+    return TikTokUpstreamError(
+        "TikTok session expired; the account must log in again",
+        status_code=401,
+        code="tiktok_authentication_error",
+    )
 
 
 def _first(mapping: dict[str, Any], names: Iterable[str]) -> Any:

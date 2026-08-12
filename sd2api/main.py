@@ -37,6 +37,7 @@ from .models import (
 from .store import TaskRecord, TaskStore
 from .tiktok import TikTokClient, TikTokUpstreamError
 from .uploads import StagedMedia, UploadManager
+from . import __version__
 
 
 logger = logging.getLogger("sd2api")
@@ -96,7 +97,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="sd2api",
-    version="1.0",
+    version=__version__,
     description=(
         "TikTok Symphony Seedance adapter with Seedance and OpenAI-compatible video APIs. "
         "当前 TikTok 网页协议只有 4–15 秒时长会真实生效；size、ratio、resolution "
@@ -499,6 +500,11 @@ async def admin_dashboard() -> FileResponse:
     return FileResponse(admin_static_dir / "admin.html")
 
 
+@app.get("/admin/version", include_in_schema=False)
+async def admin_version() -> dict[str, str]:
+    return {"version": __version__}
+
+
 @app.get("/admin/assets/admin.css", include_in_schema=False)
 async def admin_styles() -> FileResponse:
     return FileResponse(admin_static_dir / "admin.css", media_type="text/css")
@@ -770,6 +776,7 @@ async def update_pool_subaccount(
 @app.get("/admin/config/status", dependencies=[Depends(require_admin_key)])
 async def admin_config_status() -> dict[str, Any]:
     return {
+        "version": __version__,
         "mode": settings.sd2api_mode,
         "auto_login": settings.sd2api_auto_login,
         "credential_encryption": bool(settings.credential_master_key),
