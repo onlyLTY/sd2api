@@ -115,9 +115,9 @@ strong { font-weight: 700; }
 .nav-badge { min-width: 21px; border-radius: 99px; background: #202a37; padding: 1px 6px; color: #cbd4df; font-size: 11px; text-align: center; }
 .nav-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--bad); box-shadow: 0 0 0 4px var(--bad-soft); }
 
-.sidebar-foot { border-top: 1px solid var(--line); padding: 18px 9px 2px; }
+.sidebar-foot { margin-top: auto; border-top: 1px solid var(--line); padding: 18px 9px 2px; }
 .ttoh-ad-slot { --ttoh-shift: 0px; }
-.ttoh-ad-desktop { margin-top: auto; padding: 18px 0 0; }
+.ttoh-ad-desktop { padding: 18px 0 0; }
 .ttoh-ad-mobile { display: none; }
 .ttoh-ad { position: relative; overflow: hidden; color: var(--ttoh-ink); border: 1px solid rgba(255, 232, 102, .8); background: radial-gradient(circle at 88% 8%, rgba(255, 255, 255, .62), transparent 25%), linear-gradient(145deg, #ffe857 0%, var(--ttoh-yellow) 48%, var(--ttoh-yellow-strong) 100%); box-shadow: 0 14px 36px rgba(255, 199, 0, .13); }
 .ttoh-ad:after { content: ""; position: absolute; width: 82px; height: 82px; right: -44px; bottom: -47px; border: 15px solid rgba(23, 21, 10, .08); border-radius: 50%; pointer-events: none; }
@@ -148,6 +148,11 @@ strong { font-weight: 700; }
 .connection-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); box-shadow: 0 0 0 4px rgba(140, 152, 170, .08); }
 .connection-dot.online { background: var(--brand); box-shadow: 0 0 0 4px var(--brand-soft); }
 .connection-dot.offline { background: var(--bad); box-shadow: 0 0 0 4px var(--bad-soft); }
+.sidebar-meta { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 6px; }
+.sidebar-meta .app-version { margin-top: 0; }
+.github-link { display: inline-grid; width: 25px; height: 25px; flex: 0 0 25px; place-items: center; border: 1px solid transparent; border-radius: 7px; color: var(--muted); transition: border-color .18s ease, background .18s ease, color .18s ease; }
+.github-link:hover { border-color: var(--line-strong); background: var(--surface-soft); color: var(--text); }
+.github-link svg { width: 16px; height: 16px; fill: currentColor; }
 
 .workspace { min-height: 100vh; margin-left: var(--sidebar); padding: 0 34px 48px; }
 .topbar {

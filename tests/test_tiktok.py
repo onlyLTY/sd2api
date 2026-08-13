@@ -2364,11 +2364,13 @@ def test_admin_account_routes_without_starting_browser(
     assert dashboard.status_code == 200
     assert version.json() == {"version": "1.0.1"}
     assert 'id="appVersion"' in dashboard.text
+    assert 'href="https://github.com/coolqoo/sd2api"' in dashboard.text
     assert "sd2api 控制台" in dashboard.text
     assert all(label in dashboard.text for label in ("生视频", "号池管理", "日志", "视频管理", "系统配置"))
     assert 'name="email_address"' not in dashboard.text
     assert styles.status_code == 200
     assert ".sidebar" in styles.text
+    assert ".sidebar-foot { margin-top: auto;" in styles.text
     assert script.status_code == 200
     assert "refreshVideos" in script.text
     assert "/admin/version" in script.text
