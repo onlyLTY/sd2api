@@ -2362,7 +2362,7 @@ def test_admin_account_routes_without_starting_browser(
     assert listed.json()["data"][0]["name"] == "primary@example.com"
     assert status.json()["max_parallel"] == 0
     assert dashboard.status_code == 200
-    assert version.json() == {"version": "1.0.1"}
+    assert version.json() == {"version": "1.1.0"}
     assert 'id="appVersion"' in dashboard.text
     assert 'href="https://github.com/coolqoo/sd2api"' in dashboard.text
     assert "sd2api 控制台" in dashboard.text
@@ -2470,6 +2470,66 @@ def test_runtime_config_file_round_trip_and_admin_update(
     assert persisted.temp_mail_poll_seconds == 4.0
     assert main.settings.sd2api_pool_subaccount_concurrency == 7
     main.settings.replace_runtime(previous_runtime, source=previous_source)
+
+
+def test_admin_can_manage_multiple_api_keys_and_tasks_record_masked_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sd2api.main as main
+
+    class FakeClient:
+        async def create_text_video(self, **kwargs: object) -> str:
+            return "managed-key-task"
+
+    task_store = TaskStore(str(tmp_path / "managed-keys.db"))
+    monkeypatch.setattr(main, "store", task_store)
+    monkeypatch.setattr(main, "client", FakeClient())
+    monkeypatch.setattr(main.settings, "sd2api_admin_key", "admin-key-for-api-key-management")
+    monkeypatch.setattr(main.settings, "sd2api_api_key", "legacy-api-key-for-compatibility")
+    api = TestClient(main.app)
+    admin_headers = {"Authorization": "Bearer admin-key-for-api-key-management"}
+
+    created = api.post(
+        "/admin/api-keys",
+        headers=admin_headers,
+        json={"name": "Render worker", "key": "worker-api-key-1234567890"},
+    )
+    assert created.status_code == 200
+    assert created.json()["key"] == "worker-api-key-1234567890"
+    assert created.json()["masked_key"] == "wo***90"
+
+    listed = api.get("/admin/api-keys", headers=admin_headers)
+    assert listed.status_code == 200
+    assert [item["masked_key"] for item in listed.json()["data"]] == [
+        "le***ty",
+        "wo***90",
+    ]
+    assert "worker-api-key-1234567890" not in listed.text
+
+    generated = api.post(
+        "/v1/videos",
+        headers={"Authorization": "Bearer worker-api-key-1234567890"},
+        json={"model": "seedance-2.0", "prompt": "A calm lake", "seconds": 5},
+    )
+    assert generated.status_code == 200
+    stored = task_store.get("managed-key-task")
+    assert stored is not None
+    assert stored.api_key_mask == "wo***90"
+
+    admin_tasks = api.get("/admin/tasks", headers=admin_headers)
+    assert admin_tasks.json()["data"][0]["api_key"] == "wo***90"
+    assert "worker-api-key-1234567890" not in admin_tasks.text
+
+    deleted = api.delete(
+        f"/admin/api-keys/{created.json()['id']}", headers=admin_headers
+    )
+    assert deleted.status_code == 200
+    denied = api.post(
+        "/v1/videos",
+        headers={"Authorization": "Bearer worker-api-key-1234567890"},
+        json={"model": "seedance-2.0", "prompt": "A calm lake", "seconds": 5},
+    )
+    assert denied.status_code == 401
 
 
 def test_runtime_config_migrates_old_dotenv_when_file_is_missing(

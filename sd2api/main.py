@@ -26,6 +26,7 @@ from .models import (
     AccountCreateRequest,
     AccountLoginRequest,
     AccountUpdateRequest,
+    ApiKeyCreateRequest,
     AudioURLContent,
     ImageURLContent,
     OpenAICreateVideoRequest,
@@ -297,28 +298,41 @@ OPENAI_MULTIPART_CREATE_SCHEMA: dict[str, Any] = {
 }
 
 
-def require_api_key(request: Request) -> None:
-    expected = settings.sd2api_api_key
-    if not expected:
-        return
+def mask_api_key(api_key: str) -> str:
+    return f"{api_key[:2]}***{api_key[-2:]}" if len(api_key) >= 4 else "***"
+
+
+def supplied_bearer(request: Request) -> str:
     authorization = request.headers.get("authorization", "")
-    supplied = authorization[7:] if authorization.lower().startswith("bearer ") else ""
-    candidates = [expected]
+    return authorization[7:] if authorization.lower().startswith("bearer ") else ""
+
+
+def require_api_key(request: Request) -> str | None:
+    supplied = supplied_bearer(request)
+    expected = settings.sd2api_api_key
+    managed_mask = store.api_key_mask_for(supplied) if supplied else None
+    if not expected and not settings.sd2api_admin_key and not store.list_api_keys():
+        request.state.api_key_mask = None
+        return
+    candidates = [expected] if expected else []
     if settings.sd2api_admin_key and settings.sd2api_admin_key != expected:
         candidates.append(settings.sd2api_admin_key)
-    if not supplied or not any(
+    if not managed_mask and (not supplied or not any(
         secrets.compare_digest(supplied, candidate) for candidate in candidates
-    ):
+    )):
         raise HTTPException(status_code=401, detail="Invalid API key")
+    matched_mask = managed_mask or mask_api_key(supplied)
+    request.state.api_key_mask = matched_mask
+    return matched_mask
 
 
 def require_admin_key(request: Request) -> None:
     expected = settings.sd2api_admin_key or settings.sd2api_api_key
-    if not expected:
+    supplied = supplied_bearer(request)
+    managed_mask = store.api_key_mask_for(supplied) if supplied and not settings.sd2api_admin_key else None
+    if not expected and not store.list_api_keys():
         return
-    authorization = request.headers.get("authorization", "")
-    supplied = authorization[7:] if authorization.lower().startswith("bearer ") else ""
-    if not supplied or not secrets.compare_digest(supplied, expected):
+    if not managed_mask and (not supplied or not expected or not secrets.compare_digest(supplied, expected)):
         raise HTTPException(status_code=401, detail="Invalid admin API key")
 
 
@@ -806,6 +820,65 @@ async def admin_runtime_config() -> dict[str, Any]:
     }
 
 
+@app.get("/admin/api-keys", dependencies=[Depends(require_admin_key)])
+async def list_admin_api_keys() -> dict[str, Any]:
+    data = store.list_api_keys()
+    if settings.sd2api_api_key:
+        data.insert(
+            0,
+            {
+                "id": "legacy-environment-key",
+                "name": "环境变量 API Key",
+                "masked_key": mask_api_key(settings.sd2api_api_key),
+                "created_at": None,
+                "managed": False,
+            },
+        )
+    return {"data": data}
+
+
+@app.post("/admin/api-keys", dependencies=[Depends(require_admin_key)])
+async def create_admin_api_key(body: ApiKeyCreateRequest) -> dict[str, Any]:
+    api_key = body.key.get_secret_value().strip() if body.key else secrets.token_urlsafe(32)
+    if len(api_key) < 16:
+        raise HTTPException(status_code=422, detail="API key must contain at least 16 characters")
+    fixed_keys = [settings.sd2api_api_key, settings.sd2api_admin_key]
+    if any(candidate and secrets.compare_digest(api_key, candidate) for candidate in fixed_keys):
+        raise HTTPException(status_code=409, detail="API key already exists")
+    try:
+        item = store.create_api_key(
+            key_id=f"key_{secrets.token_hex(8)}",
+            name=body.name.strip(),
+            api_key=api_key,
+            key_mask=mask_api_key(api_key),
+        )
+    except Exception as exc:
+        if "UNIQUE constraint failed" in str(exc):
+            raise HTTPException(status_code=409, detail="API key already exists") from exc
+        raise
+    audit_event("info", "system", "API Key 已添加", details={"key": item["masked_key"]})
+    return {**item, "key": api_key}
+
+
+@app.delete("/admin/api-keys/{key_id}", dependencies=[Depends(require_admin_key)])
+async def delete_admin_api_key(key_id: str) -> dict[str, Any]:
+    managed_keys = store.list_api_keys()
+    if not any(item["id"] == key_id for item in managed_keys):
+        raise HTTPException(status_code=404, detail="API key not found")
+    if (
+        len(managed_keys) == 1
+        and not settings.sd2api_api_key
+        and not settings.sd2api_admin_key
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot delete the last API key while no environment key is configured",
+        )
+    store.delete_api_key(key_id)
+    audit_event("warning", "system", "API Key 已删除")
+    return {"id": key_id, "deleted": True}
+
+
 @app.put("/admin/config", dependencies=[Depends(require_admin_key)])
 async def update_admin_runtime_config(body: RuntimeConfig) -> dict[str, Any]:
     previous = settings.runtime
@@ -856,11 +929,13 @@ async def pool_status() -> dict[str, Any]:
 
 
 def admin_task(record: TaskRecord) -> dict[str, Any]:
+    account = store.get_account(record.account_id) if record.account_id else None
     return {
         "id": record.id,
         "api": record.api,
-        "account_id": record.account_id,
+        "account_email": (account or {}).get("email_address") or (account or {}).get("username"),
         "advertiser_id": record.advertiser_id,
+        "api_key": record.api_key_mask,
         "status": record.status,
         "progress": record.progress,
         "model": record.model,
@@ -1039,6 +1114,10 @@ async def list_admin_logs(
     )
     selected_level = None if level == "all" else level
     selected_category = None if category == "all" else category
+    account_emails = {
+        account["id"]: account.get("email_address") or account.get("username")
+        for account in store.list_accounts()
+    }
     return {
         "data": [
             {
@@ -1047,7 +1126,7 @@ async def list_admin_logs(
                 "level": event.level,
                 "category": event.category,
                 "message": event.message,
-                "account_id": event.account_id,
+                "account_email": account_emails.get(event.account_id),
                 "task_id": event.task_id,
                 "details": event.details,
             }
@@ -1075,6 +1154,7 @@ async def list_admin_logs(
     },
 )
 async def create_seedance_video(
+    request: Request,
     body: SeedanceCreateRequest = Body(
         openapi_examples={
             "text_to_video": {
@@ -1170,6 +1250,7 @@ async def create_seedance_video(
         seconds=body.duration,
         ratio=body.ratio,
         resolution=body.resolution,
+        api_key_mask=getattr(request.state, "api_key_mask", None),
         account_id=client.account_for_task(task_id) if isinstance(client, BrowserPoolClient) else None,
         advertiser_id=(
             client.advertiser_for_task(task_id)
@@ -1477,6 +1558,7 @@ async def create_openai_video(request: Request) -> dict[str, Any]:
         prompt=body.prompt,
         seconds=seconds,
         size=body.size,
+        api_key_mask=getattr(request.state, "api_key_mask", None),
         account_id=client.account_for_task(task_id) if isinstance(client, BrowserPoolClient) else None,
         advertiser_id=(
             client.advertiser_for_task(task_id)

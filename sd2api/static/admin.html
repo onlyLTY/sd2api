@@ -256,14 +256,14 @@
         </div>
         <section class="panel filter-panel">
           <div class="filter-row video-filter-row">
-            <label class="field search-field"><span>搜索视频</span><input id="videoSearch" type="search" placeholder="任务 ID、提示词、模型或账号"></label>
+            <label class="field search-field"><span>搜索视频</span><input id="videoSearch" type="search" placeholder="任务 ID、提示词、模型、API Key 或账号"></label>
             <label class="field"><span>状态</span><select id="videoStatus"><option value="all">全部状态</option><option value="queued">排队中</option><option value="running">生成中</option><option value="succeeded">已完成</option><option value="failed">失败</option></select></label>
             <label class="toggle-field"><input id="videoAutoRefresh" type="checkbox" checked><span>自动刷新生成中任务</span></label>
           </div>
         </section>
         <section class="panel videos-panel">
           <div class="panel-heading compact"><div><p class="eyebrow">LIBRARY</p><h2>视频任务</h2></div><span id="videoCount" class="muted">0 条</span></div>
-          <div class="table-wrap"><table class="video-table"><thead><tr><th>任务</th><th>模型</th><th>状态</th><th>时长</th><th>账号 / 子账号</th><th>更新时间</th><th>操作</th></tr></thead><tbody id="tasks"></tbody></table></div>
+          <div class="table-wrap"><table class="video-table"><thead><tr><th>任务</th><th>模型</th><th>状态</th><th>时长</th><th>API Key</th><th>账号 / 子账号</th><th>更新时间</th><th>操作</th></tr></thead><tbody id="tasks"></tbody></table></div>
           <div id="videoPagination" class="pagination"></div>
         </section>
       </section>
@@ -271,13 +271,23 @@
       <section id="page-settings" class="page" data-page="settings">
         <section class="panel settings-panel">
           <div class="panel-heading">
-            <div><p class="eyebrow">RUNTIME CONFIG</p><h2>系统配置</h2><p class="muted">非敏感运行参数保存在独立 config.json。API Key、Admin Key、凭据加密 Key、cf_temp_mail 地址和邮箱 API Key 仍只从环境变量读取。</p></div>
+            <div><p class="eyebrow">RUNTIME CONFIG</p><h2>系统配置</h2><p class="muted">运行参数保存在 config.json；多个调用 API Key 可在此管理。Admin Key、凭据加密 Key 和邮箱服务密钥仍只从环境变量读取。</p></div>
             <span id="configSourceBadge" class="pill info">读取中</span>
           </div>
           <div class="parameter-note settings-note">
             <span class="note-icon">i</span>
             <div><strong id="configFilePath">config.json</strong><p>Docker 默认映射宿主机 ./config.json 到容器 /app/config.json。复制该文件即可复用非敏感配置。</p></div>
           </div>
+          <section class="settings-group api-key-manager">
+            <div class="settings-group-heading"><div><h3>API Key 管理</h3><p>Key 仅保存不可逆指纹；页面始终只显示前 2 位和后 2 位。</p></div></div>
+            <form id="apiKeyForm" class="api-key-form">
+              <label class="field"><span>名称</span><input name="name" maxlength="128" value="API Key" required></label>
+              <label class="field api-key-input"><span>Key（留空则安全生成）</span><input name="key" type="password" minlength="16" autocomplete="new-password" placeholder="留空自动生成，或输入至少 16 位的自定义 Key"></label>
+              <div class="button-group api-key-buttons"><button class="button ghost" type="submit">添加自定义 Key</button><button id="apiKeyGenerate" class="button primary" type="button">生成并添加 Key</button></div>
+            </form>
+            <p class="muted api-key-hint">自动生成的完整 Key 只返回一次，并直接复制到剪贴板，不会显示在页面或写入日志。</p>
+            <div id="apiKeys" class="api-key-list"></div>
+          </section>
           <form id="settingsForm">
             <div id="settingsGroups" class="settings-groups"></div>
             <div id="settingsError" class="form-error" role="alert"></div>

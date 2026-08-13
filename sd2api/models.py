@@ -248,6 +248,11 @@ class AccountUpdateRequest(BaseModel):
     auto_login: bool | None = None
 
 
+class ApiKeyCreateRequest(BaseModel):
+    name: str = Field(default="API Key", min_length=1, max_length=128)
+    key: SecretStr | None = None
+
+
 class AccountLoginRequest(BaseModel):
     wait: bool = False
 

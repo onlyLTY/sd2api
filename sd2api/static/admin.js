@@ -361,8 +361,64 @@ function renderSettings(data) {
   $("settingsRestartHint").textContent = data.restart_required ? "上次修改包含需重启项目" : "部分路径和运行模式修改保存后需要重启服务";
 }
 
+function renderApiKeys(items) {
+  const root = $("apiKeys");
+  if (!items.length) {
+    root.innerHTML = '<div class="table-empty">尚未配置 API Key。</div>';
+    return;
+  }
+  root.innerHTML = items.map((item) => `<div class="api-key-row">
+    <div><strong>${esc(item.name)}</strong><span class="cell-sub mono">${esc(item.masked_key)}</span></div>
+    <div><span class="cell-sub">${item.managed ? `创建于 ${formatTime(item.created_at)}` : "来自环境变量，需在部署配置中修改"}</span></div>
+    <div>${item.managed ? `<button class="button danger" data-api-key-delete="${esc(item.id)}" type="button">删除</button>` : '<span class="pill info">只读</span>'}</div>
+  </div>`).join("");
+}
+
+async function refreshApiKeys() {
+  const data = await api("/admin/api-keys");
+  renderApiKeys(data.data || []);
+}
+
 async function refreshSettings() {
-  renderSettings(await api("/admin/config"));
+  const [config, keys] = await Promise.all([api("/admin/config"), api("/admin/api-keys")]);
+  renderSettings(config);
+  renderApiKeys(keys.data || []);
+}
+
+async function addApiKey(event) {
+  event.preventDefault();
+  const form = new FormData(event.currentTarget);
+  const customKey = String(form.get("key") || "").trim();
+  const body = { name: String(form.get("name") || "API Key").trim() };
+  if (customKey) body.key = customKey;
+  try {
+    const result = await api("/admin/api-keys", { method: "POST", body: JSON.stringify(body) });
+    let copied = false;
+    if (!customKey && navigator.clipboard?.writeText) {
+      try { await navigator.clipboard.writeText(result.key); copied = true; } catch (_) {}
+    }
+    if (!customKey && !copied) {
+      await api(`/admin/api-keys/${encodeURIComponent(result.id)}`, { method: "DELETE" });
+      throw new Error("浏览器未允许写入剪贴板，本次生成已自动撤销；请授权剪贴板后重试，或输入自定义 Key");
+    }
+    event.currentTarget.reset();
+    event.currentTarget.elements.name.value = "API Key";
+    await refreshApiKeys();
+    toast("API Key 已添加", customKey ? `已保存为 ${result.masked_key}` : "完整 Key 已复制到剪贴板，请立即保存");
+  } catch (error) {
+    toast("添加失败", error.message, "error");
+  }
+}
+
+async function deleteApiKey(id) {
+  if (!confirm("删除这个 API Key？使用它的客户端会立即无法鉴权。")) return;
+  try {
+    await api(`/admin/api-keys/${encodeURIComponent(id)}`, { method: "DELETE" });
+    await refreshApiKeys();
+    toast("API Key 已删除");
+  } catch (error) {
+    toast("删除失败", error.message, "error");
+  }
 }
 
 async function saveSettings(event) {
@@ -493,7 +549,7 @@ function renderAccounts(items) {
   }
   body.innerHTML = items.map((account) => `
     <tr>
-      <td><span class="cell-title">${esc(account.name)}</span><span class="cell-sub">${esc(account.username || "")}</span><span class="cell-sub mono">${esc(account.id)}</span></td>
+      <td><span class="cell-title">${esc(account.username || account.email_address || account.name)}</span>${account.name && account.name !== account.username && !String(account.name).startsWith("account_") ? `<span class="cell-sub">${esc(account.name)}</span>` : ""}</td>
       <td>${pill(account.login_state)}<span class="cell-sub">${account.logged_in ? "协议会话有效" : "会话不可用"}</span></td>
       <td>${backendLabel(account)}</td>
       <td><strong>${(account.subaccounts || []).filter((sub) => sub.enabled).length}</strong> / ${(account.subaccounts || []).length}<span class="cell-sub">已加入调度 / 已发现</span></td>
@@ -547,7 +603,7 @@ function renderLogs(items) {
   }
   $("logs").innerHTML = items.map((item) => {
     const details = item.details ? JSON.stringify(item.details, null, 2) : "";
-    const context = [item.account_id && `账号 ${item.account_id}`, item.task_id && `任务 ${item.task_id}`].filter(Boolean).join("\n");
+    const context = [item.account_email && `账号 ${item.account_email}`, item.task_id && `任务 ${item.task_id}`].filter(Boolean).join("\n");
     return `<article class="log-entry">
       <time class="log-time">${formatTime(item.created_at)}</time>
       <div><span class="log-level ${esc(item.level)}">${esc(logLevelLabel(item.level))}</span></div>
@@ -698,7 +754,7 @@ function renderTasks(items) {
   $("videoCount").textContent = `共 ${state.videoTotal} 条`;
   const body = $("tasks");
   if (!items.length) {
-    body.innerHTML = '<tr><td colspan="7" class="table-empty">没有匹配的视频任务。</td></tr>';
+    body.innerHTML = '<tr><td colspan="8" class="table-empty">没有匹配的视频任务。</td></tr>';
     return;
   }
   body.innerHTML = items.map((task) => {
@@ -709,7 +765,8 @@ function renderTasks(items) {
       <td class="model-label"><strong>${esc(task.upstream_model || task.model)}</strong>${alias}<span class="cell-sub">${esc(String(task.api || "").toUpperCase())}</span></td>
       <td>${pill(task.status)}<span class="cell-sub">${Number(task.progress || 0)}%</span></td>
       <td><strong>${task.seconds}s</strong><span class="cell-sub">${esc(task.resolution || "720p")}</span></td>
-      <td><span class="cell-title">${esc(task.account_id || "—")}</span><span class="cell-sub mono">${esc(task.advertiser_id || "—")}</span></td>
+      <td><span class="cell-title mono">${esc(task.api_key || "—")}</span></td>
+      <td><span class="cell-title">${esc(task.account_email || "—")}</span><span class="cell-sub mono">${esc(task.advertiser_id || "—")}</span></td>
       <td><span class="cell-title">${formatTime(task.updated_at)}</span><span class="cell-sub">创建于 ${formatTime(task.created_at)}</span></td>
       <td><div class="row-actions">
         ${task.downloadable ? `<button class="button primary" data-task-action="download" data-task-id="${esc(task.id)}" type="button">下载</button>` : ""}
@@ -872,7 +929,7 @@ function openEditAccount(id) {
   $("accountForm").elements.name.required = true;
   $("accountForm").elements.password.required = false;
   $("startField").classList.add("hidden");
-  $("accountForm").elements.name.value = account.name || "";
+  $("accountForm").elements.name.value = account.name && !String(account.name).startsWith("account_") ? account.name : (account.username || account.email_address || "");
   $("accountForm").elements.username.value = account.username || "";
   $("accountForm").elements.auto_login.checked = Boolean(account.auto_login);
   $("formError").textContent = "";
@@ -902,7 +959,9 @@ async function saveAccount(event) {
 
 async function accountAction(action, id) {
   if (action === "edit") return openEditAccount(id);
-  if (action === "delete" && !confirm(`删除账号 ${id} 的管理记录？浏览器 Profile 会保留。`)) return;
+  const account = state.accounts.find((item) => item.id === id);
+  const email = account?.username || account?.email_address || "该账号";
+  if (action === "delete" && !confirm(`删除账号 ${email} 的管理记录？浏览器 Profile 会保留。`)) return;
   try {
     if (action === "delete") await api(`/admin/accounts/${encodeURIComponent(id)}`, { method: "DELETE" });
     else if (action === "refresh") await api(`/admin/accounts/${encodeURIComponent(id)}/subaccounts/refresh`, { method: "POST", body: JSON.stringify({ check_access: true }) });
@@ -1012,6 +1071,15 @@ function bindEvents() {
   $("addAccountButton").addEventListener("click", openAddAccount);
   $("accountForm").addEventListener("submit", saveAccount);
   $("settingsForm").addEventListener("submit", saveSettings);
+  $("apiKeyForm").addEventListener("submit", addApiKey);
+  $("apiKeyGenerate").addEventListener("click", () => {
+    $("apiKeyForm").elements.key.value = "";
+    $("apiKeyForm").requestSubmit();
+  });
+  $("apiKeys").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-api-key-delete]");
+    if (button) deleteApiKey(button.dataset.apiKeyDelete);
+  });
   $$('[data-dialog-close]').forEach((button) => button.addEventListener("click", () => $("accountDialog").close()));
   $("accounts").addEventListener("click", (event) => {
     const button = event.target.closest("[data-account-action]");

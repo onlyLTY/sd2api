@@ -455,6 +455,14 @@ tbody > tr:not(.detail-row):not(.subaccount-row):hover > td { background: rgba(2
 .setting-toggle small { margin-top: 2px; color: #596575; font: 9px "SFMono-Regular", Consolas, monospace; }
 .settings-actions { position: sticky; bottom: 0; display: flex; align-items: center; justify-content: space-between; gap: 15px; border-top: 1px solid var(--line); background: rgba(14, 19, 27, .96); margin: 18px -2px -2px; padding: 15px 2px 2px; }
 .settings-actions .muted { font-size: 11px; }
+.api-key-manager { margin-bottom: 14px; }
+.api-key-form { display: grid; grid-template-columns: minmax(160px, .7fr) minmax(260px, 1.3fr) auto; align-items: end; gap: 12px; }
+.api-key-form .field { margin: 0; }
+.api-key-buttons { align-self: end; flex-wrap: nowrap; }
+.api-key-hint { margin: 10px 0 14px; font-size: 10px; }
+.api-key-list { display: grid; gap: 8px; }
+.api-key-row { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(220px, 1fr) auto; align-items: center; gap: 14px; border: 1px solid var(--line); border-radius: 9px; background: rgba(19, 26, 36, .6); padding: 10px 12px; }
+.api-key-row strong, .api-key-row .cell-sub { display: block; }
 
 .auth-screen { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; background: rgba(5, 8, 12, .97); padding: 20px; }
 .auth-card { width: min(430px, 100%); border: 1px solid var(--line); border-radius: 19px; background: var(--surface); padding: 29px; box-shadow: 0 32px 100px rgba(0, 0, 0, .45); }
@@ -523,6 +531,7 @@ dialog::backdrop { background: rgba(3, 5, 8, .76); backdrop-filter: blur(5px); }
 }
 
 @media (max-width: 680px) {
+  .api-key-form, .api-key-row { grid-template-columns: 1fr; }
   .workspace { padding-inline: 13px; padding-bottom: 30px; }
   body.ttoh-mobile-visible .workspace { padding-bottom: 124px; }
   .topbar { align-items: center; }

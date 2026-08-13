@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import threading
 import time
@@ -23,6 +24,7 @@ class TaskRecord:
     progress: int
     created_at: int
     updated_at: int
+    api_key_mask: str | None = None
     account_id: str | None = None
     advertiser_id: str | None = None
     completed_at: int | None = None
@@ -75,6 +77,7 @@ class TaskStore:
                     progress INTEGER NOT NULL,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
+                    api_key_mask TEXT,
                     account_id TEXT,
                     advertiser_id TEXT,
                     completed_at INTEGER,
@@ -94,6 +97,19 @@ class TaskStore:
                 connection.execute("ALTER TABLE tasks ADD COLUMN account_id TEXT")
             if "advertiser_id" not in columns:
                 connection.execute("ALTER TABLE tasks ADD COLUMN advertiser_id TEXT")
+            if "api_key_mask" not in columns:
+                connection.execute("ALTER TABLE tasks ADD COLUMN api_key_mask TEXT")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS api_keys (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    key_hash TEXT NOT NULL UNIQUE,
+                    key_mask TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                )
+                """
+            )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS accounts (
@@ -212,6 +228,7 @@ class TaskStore:
         size: str = "720x1280",
         ratio: str = "adaptive",
         resolution: str = "720p",
+        api_key_mask: str | None = None,
         account_id: str | None = None,
         advertiser_id: str | None = None,
     ) -> TaskRecord:
@@ -229,6 +246,7 @@ class TaskStore:
             progress=0,
             created_at=now,
             updated_at=now,
+            api_key_mask=api_key_mask,
             account_id=account_id,
             advertiser_id=advertiser_id,
         )
@@ -239,11 +257,11 @@ class TaskStore:
                 """
                 INSERT INTO tasks (
                     id, api, model, prompt, seconds, size, ratio, resolution,
-                    status, progress, created_at, updated_at, account_id, advertiser_id, completed_at,
+                    status, progress, created_at, updated_at, api_key_mask, account_id, advertiser_id, completed_at,
                     video_id, video_url, poster_url, error_code, error_message, raw
                 ) VALUES (
                     :id, :api, :model, :prompt, :seconds, :size, :ratio, :resolution,
-                    :status, :progress, :created_at, :updated_at, :account_id, :advertiser_id, :completed_at,
+                    :status, :progress, :created_at, :updated_at, :api_key_mask, :account_id, :advertiser_id, :completed_at,
                     :video_id, :video_url, :poster_url, :error_code, :error_message, :raw
                 )
                 """,
@@ -315,11 +333,11 @@ class TaskStore:
             params.append(status)
         if search:
             conditions.append(
-                "(id LIKE ? OR prompt LIKE ? OR model LIKE ? OR account_id LIKE ? "
-                "OR advertiser_id LIKE ?)"
+                "(id LIKE ? OR prompt LIKE ? OR model LIKE ? OR api_key_mask LIKE ? "
+                "OR account_id LIKE ? OR advertiser_id LIKE ?)"
             )
             pattern = f"%{search}%"
-            params.extend([pattern] * 5)
+            params.extend([pattern] * 6)
         where = "WHERE " + " AND ".join(conditions) if conditions else ""
         params.extend([limit, offset])
         with self._lock, self._connect() as connection:
@@ -346,11 +364,11 @@ class TaskStore:
             params.append(status)
         if search:
             conditions.append(
-                "(id LIKE ? OR prompt LIKE ? OR model LIKE ? OR account_id LIKE ? "
-                "OR advertiser_id LIKE ?)"
+                "(id LIKE ? OR prompt LIKE ? OR model LIKE ? OR api_key_mask LIKE ? "
+                "OR account_id LIKE ? OR advertiser_id LIKE ?)"
             )
             pattern = f"%{search}%"
-            params.extend([pattern] * 5)
+            params.extend([pattern] * 6)
         where = "WHERE " + " AND ".join(conditions) if conditions else ""
         with self._lock, self._connect() as connection:
             row = connection.execute(
@@ -525,6 +543,58 @@ class TaskStore:
     def delete(self, task_id: str) -> bool:
         with self._lock, self._connect() as connection:
             result = connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        return result.rowcount > 0
+
+    @staticmethod
+    def api_key_hash(api_key: str) -> str:
+        return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+
+    def create_api_key(
+        self, *, key_id: str, name: str, api_key: str, key_mask: str
+    ) -> dict[str, Any]:
+        created_at = int(time.time())
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                "INSERT INTO api_keys (id, name, key_hash, key_mask, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (key_id, name, self.api_key_hash(api_key), key_mask, created_at),
+            )
+        return {
+            "id": key_id,
+            "name": name,
+            "masked_key": key_mask,
+            "created_at": created_at,
+            "managed": True,
+        }
+
+    def list_api_keys(self) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id, name, key_mask, created_at FROM api_keys "
+                "ORDER BY created_at ASC, id ASC"
+            ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "masked_key": row["key_mask"],
+                "created_at": row["created_at"],
+                "managed": True,
+            }
+            for row in rows
+        ]
+
+    def api_key_mask_for(self, api_key: str) -> str | None:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT key_mask FROM api_keys WHERE key_hash = ?",
+                (self.api_key_hash(api_key),),
+            ).fetchone()
+        return str(row["key_mask"]) if row else None
+
+    def delete_api_key(self, key_id: str) -> bool:
+        with self._lock, self._connect() as connection:
+            result = connection.execute("DELETE FROM api_keys WHERE id = ?", (key_id,))
         return result.rowcount > 0
 
     def create_account(
