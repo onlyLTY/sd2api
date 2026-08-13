@@ -8,6 +8,8 @@
 
 每个镜像标签都是同时包含 `linux/amd64` 和 `linux/arm64` 的多架构清单，x86 和 ARM VPS 使用同一个镜像地址即可。
 
+版本发布只生成精确版本标签（例如 `1.0.2`）和 `latest`，不生成 `1`、`1.0` 这类浮动版本标签。`main` 分支构建仍会生成 `build-日期-序号` 标签用于定位具体构建。
+
 ## 首次配置
 
 先在 Docker Hub 创建名为 `sd2api` 的仓库，再创建一个只用于 CI 的 Personal Access Token。
