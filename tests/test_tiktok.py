@@ -1949,6 +1949,123 @@ async def test_pool_schedules_concurrent_jobs_across_accounts(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_pool_request_waits_until_only_account_finishes_keepalive(
+    tmp_path: Path,
+) -> None:
+    pool = BrowserPoolClient(
+        Settings(sd2api_database=str(tmp_path / "keepalive-wait.db")),
+        TaskStore(str(tmp_path / "keepalive-wait.db")),
+    )
+    keepalive_active = True
+    account = {
+        "id": "login-a",
+        "enabled": True,
+        "running": True,
+        "logged_in": True,
+        "session_available": True,
+        "subaccounts": [{
+            "advertiser_id": "sub-a",
+            "enabled": True,
+            "seedance_access": True,
+            "credits": 100,
+        }],
+    }
+
+    async def fake_list_accounts() -> list[dict[str, Any]]:
+        return [{**account, "keepalive_active": keepalive_active}]
+
+    class FakeProtocol:
+        load = 0
+
+        async def create_text_video(self, **kwargs: Any) -> str:
+            self.load += 1
+            return "sub-a-task"
+
+    protocol = FakeProtocol()
+    pool.list_accounts = fake_list_accounts  # type: ignore[method-assign]
+    pool._protocol_client = lambda *_args, **_kwargs: protocol  # type: ignore[method-assign]
+
+    request = asyncio.create_task(
+        pool.create_text_video(prompt="wait", model="seedance-2.0", duration=5)
+    )
+    for _ in range(20):
+        if pool._keepalive_waiters == 1:
+            break
+        await asyncio.sleep(0)
+
+    assert pool._keepalive_waiters == 1
+    assert request.done() is False
+
+    keepalive_active = False
+    await pool._notify_keepalive_finished()
+
+    assert await asyncio.wait_for(request, timeout=1) == "sub-a-task"
+    assert pool._keepalive_waiters == 0
+
+
+@pytest.mark.asyncio
+async def test_pool_uses_other_account_without_waiting_for_keepalive(
+    tmp_path: Path,
+) -> None:
+    pool = BrowserPoolClient(
+        Settings(sd2api_database=str(tmp_path / "keepalive-failover.db")),
+        TaskStore(str(tmp_path / "keepalive-failover.db")),
+    )
+
+    async def fake_list_accounts() -> list[dict[str, Any]]:
+        return [
+            {
+                "id": "login-a",
+                "enabled": True,
+                "running": True,
+                "logged_in": True,
+                "session_available": True,
+                "keepalive_active": True,
+                "subaccounts": [{
+                    "advertiser_id": "sub-a",
+                    "enabled": True,
+                    "seedance_access": True,
+                    "credits": 100,
+                }],
+            },
+            {
+                "id": "login-b",
+                "enabled": True,
+                "running": True,
+                "logged_in": True,
+                "session_available": True,
+                "keepalive_active": False,
+                "subaccounts": [{
+                    "advertiser_id": "sub-b",
+                    "enabled": True,
+                    "seedance_access": True,
+                    "credits": 100,
+                }],
+            },
+        ]
+
+    class FakeProtocol:
+        load = 0
+
+        async def create_text_video(self, **kwargs: Any) -> str:
+            self.load += 1
+            return "sub-b-task"
+
+    protocol = FakeProtocol()
+    pool.list_accounts = fake_list_accounts  # type: ignore[method-assign]
+    pool._protocol_client = lambda *_args, **_kwargs: protocol  # type: ignore[method-assign]
+
+    task_id = await asyncio.wait_for(
+        pool.create_text_video(prompt="fail over", model="seedance-2.0", duration=5),
+        timeout=1,
+    )
+
+    assert task_id == "sub-b-task"
+    assert pool.account_for_task(task_id) == "login-b"
+    assert pool._keepalive_waiters == 0
+
+
+@pytest.mark.asyncio
 async def test_protocol_pool_balances_concurrency_across_same_login_subaccounts(
     tmp_path: Path,
 ) -> None:

@@ -130,7 +130,7 @@ ssh -L 8765:127.0.0.1:8765 -L 6080:127.0.0.1:6080 user@your-vps
 
 协议请求由 `curl_cffi` 使用 Chrome TLS/HTTP2 指纹发送；素材上传支持 ImageX/VOD 直传和分片，不需要后台保留 Chromium 进程。会话密文只使用 `SD2API_CREDENTIAL_KEY`（或回退的 Admin Key）解密，管理 API 永远不会返回 Cookie、密码或密文。
 
-已登录账号默认每 21600 秒执行一次浏览器保活，可通过 `session_keepalive_interval` 调整。保活只在账号空闲时串行启动对应持久化 Profile，访问无查询参数的 `https://ads.tiktok.com/creative/creativestudio/image-to-video`，等待 `/passport/web/account/info/` 返回 HTTP 200，再导出最新会话并进行协议验证，完成后立即关闭 Chromium。号池会显示保活状态、错误和下次时间，开始、成功、失败及重启中断都会写入日志；保活中的账号暂不接收新任务。
+已登录账号默认每 21600 秒执行一次浏览器保活，可通过 `session_keepalive_interval` 调整。保活只在账号空闲时串行启动对应持久化 Profile，访问无查询参数的 `https://ads.tiktok.com/creative/creativestudio/image-to-video`，等待 `/passport/web/account/info/` 返回 HTTP 200，再导出最新会话并进行协议验证，完成后立即关闭 Chromium。号池会显示保活状态、错误和下次时间，开始、成功、失败及重启中断都会写入日志。新请求会优先使用其他可用账号；如果唯一可用账号正在保活，请求会在服务端等待，保活结束后自动继续调度，不会把正常保活当成账号故障返回错误。
 
 图形验证码属于 TikTok 的交互式安全验证：程序会把账号状态标记为 `captcha_required` 并保持对应浏览器页面，管理员通过 noVNC 完成验证后，登录状态机会自动继续邮箱接码和后续登录。自动接码在后台并行进行，管理员仍可手动输入验证码；只要页面进入已登录状态，程序会立即确认成功。登录过程中关闭页面或 Chromium 后，程序最多自动重建三次并复用同一持久化 Profile。项目不包含验证码破解或绕过逻辑。
 

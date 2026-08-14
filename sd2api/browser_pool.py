@@ -24,6 +24,10 @@ from .tiktok import (
 from .uploads import StagedMedia
 
 
+class _KeepalivePending(Exception):
+    """Internal signal that scheduling should wait for browser maintenance."""
+
+
 class BrowserPoolClient:
     """Schedules jobs across isolated, persistent browser account profiles."""
 
@@ -42,6 +46,9 @@ class BrowserPoolClient:
         self._monitor_task: asyncio.Task[None] | None = None
         self._keepalive_task: asyncio.Task[None] | None = None
         self._keepalive_accounts: set[str] = set()
+        self._keepalive_condition = asyncio.Condition()
+        self._keepalive_revision = 0
+        self._keepalive_waiters = 0
 
     def _vault(self) -> CredentialVault:
         return CredentialVault(self.settings.credential_master_key)
@@ -266,7 +273,11 @@ class BrowserPoolClient:
                     for item in account["subaccounts"]
                     if self._subaccount_eligible(item)
                 )
-                if account.get("enabled") and account.get("logged_in")
+                if (
+                    account.get("enabled")
+                    and account.get("logged_in")
+                    and not account.get("keepalive_active")
+                )
                 else 0
                 for account in accounts
             ),
@@ -286,6 +297,7 @@ class BrowserPoolClient:
             "captcha_required": sum(
                 account.get("login_state") == "captcha_required" for account in accounts
             ),
+            "keepalive_waiting_requests": self._keepalive_waiters,
         }
 
     async def list_accounts(self) -> list[dict[str, Any]]:
@@ -991,6 +1003,22 @@ class BrowserPoolClient:
                 finally:
                     self._workers.pop(account_id, None)
                     self._keepalive_accounts.discard(account_id)
+                    await self._notify_keepalive_finished()
+
+    async def _notify_keepalive_finished(self) -> None:
+        async with self._keepalive_condition:
+            self._keepalive_revision += 1
+            self._keepalive_condition.notify_all()
+
+    async def _wait_for_keepalive(self, revision: int) -> None:
+        self._keepalive_waiters += 1
+        try:
+            async with self._keepalive_condition:
+                await self._keepalive_condition.wait_for(
+                    lambda: self._keepalive_revision != revision
+                )
+        finally:
+            self._keepalive_waiters -= 1
 
     async def diagnostics(
         self,
@@ -1200,11 +1228,45 @@ class BrowserPoolClient:
         mode: str,
         media: list[StagedMedia],
     ) -> str:
+        while True:
+            revision = self._keepalive_revision
+            try:
+                return await self._schedule_once(
+                    prompt=prompt,
+                    model=model,
+                    duration=duration,
+                    mode=mode,
+                    media=media,
+                )
+            except _KeepalivePending:
+                await self._wait_for_keepalive(revision)
+
+    async def _schedule_once(
+        self,
+        *,
+        prompt: str,
+        model: str,
+        duration: int,
+        mode: str,
+        media: list[StagedMedia],
+    ) -> str:
         async with self._scheduler_lock:
             cleanup_protocol_media = False
             statuses = await self.list_accounts()
             eligible: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            keepalive_eligible = False
             for status in statuses:
+                if (
+                    status["enabled"]
+                    and status["running"]
+                    and status["logged_in"]
+                    and status.get("keepalive_active")
+                    and any(
+                        self._subaccount_eligible(subaccount)
+                        for subaccount in status["subaccounts"]
+                    )
+                ):
+                    keepalive_eligible = True
                 if not (
                     status["enabled"]
                     and status["running"]
@@ -1218,6 +1280,8 @@ class BrowserPoolClient:
                     if self._subaccount_eligible(subaccount)
                 )
             if not eligible:
+                if keepalive_eligible:
+                    raise _KeepalivePending
                 online_subaccounts = [
                     subaccount
                     for status in statuses
@@ -1289,6 +1353,8 @@ class BrowserPoolClient:
                 if pair_load(pair) < self.settings.sd2api_pool_subaccount_concurrency
             ]
             if not candidates:
+                if keepalive_eligible:
+                    raise _KeepalivePending
                 raise TikTokUpstreamError(
                     "All selected subaccounts are at their concurrency limit",
                     status_code=429,
@@ -1298,6 +1364,7 @@ class BrowserPoolClient:
             try:
                 last_authentication_error: TikTokUpstreamError | None = None
                 quota_failures = 0
+                preserve_media = False
                 while candidates:
                     selected_account, selected_subaccount = min(
                         candidates,
@@ -1407,6 +1474,9 @@ class BrowserPoolClient:
                             last_error=None,
                         )
                     return task_id
+                if keepalive_eligible:
+                    preserve_media = True
+                    raise _KeepalivePending
                 if last_authentication_error is not None and quota_failures == 0:
                     raise last_authentication_error
                 if last_authentication_error is not None:
@@ -1422,7 +1492,7 @@ class BrowserPoolClient:
                     code="subaccount_daily_quota_exhausted",
                 )
             finally:
-                if cleanup_protocol_media:
+                if cleanup_protocol_media and not preserve_media:
                     upload_root = Path(self.settings.sd2api_upload_dir).resolve()
                     for item in media:
                         path = Path(item.path).resolve()

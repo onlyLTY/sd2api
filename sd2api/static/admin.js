@@ -552,8 +552,11 @@ function keepaliveLabel(account) {
   };
   const state = account.keepalive_active ? "running" : (account.keepalive_state || "idle");
   const next = account.keepalive_next_at ? ` · 下次 ${formatTime(account.keepalive_next_at)}` : "";
+  const waiting = account.keepalive_active && Number(state.pool?.keepalive_waiting_requests || 0)
+    ? ` · ${Number(state.pool.keepalive_waiting_requests)} 个请求等待`
+    : "";
   const error = account.keepalive_error ? ` · ${account.keepalive_error}` : "";
-  return `<span class="cell-sub">${esc(labels[state] || state)}${esc(next)}${esc(error)}</span>`;
+  return `<span class="cell-sub">${esc(labels[state] || state)}${esc(waiting)}${esc(next)}${esc(error)}</span>`;
 }
 
 function renderAccounts(items) {
