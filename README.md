@@ -25,7 +25,7 @@
 - OpenAI 兼容状态对象和 MP4 流式下载
 - SQLite 任务持久化
 - 可选 Bearer API Key
-- 登录账号浏览器 Profile 隔离、加密协议会话与中央调度
+- 登录账号浏览器 Profile 隔离、加密协议会话、每 6 小时自动保活与中央调度
 - 自动发现 Client/Partner 子账号，并由用户选择哪些加入生成池
 - 逐子账号显示 Seedance 2 权限、Credits 和检查错误
 - 每个子账号独立 CookieJar；同一登录账号下多个已启用子账号也可并发
@@ -130,6 +130,8 @@ ssh -L 8765:127.0.0.1:8765 -L 6080:127.0.0.1:6080 user@your-vps
 
 协议请求由 `curl_cffi` 使用 Chrome TLS/HTTP2 指纹发送；素材上传支持 ImageX/VOD 直传和分片，不需要后台保留 Chromium 进程。会话密文只使用 `SD2API_CREDENTIAL_KEY`（或回退的 Admin Key）解密，管理 API 永远不会返回 Cookie、密码或密文。
 
+已登录账号默认每 21600 秒执行一次浏览器保活，可通过 `session_keepalive_interval` 调整。保活只在账号空闲时串行启动对应持久化 Profile，访问无查询参数的 `https://ads.tiktok.com/creative/creativestudio/image-to-video`，等待 `/passport/web/account/info/` 返回 HTTP 200，再导出最新会话并进行协议验证，完成后立即关闭 Chromium。号池会显示保活状态、错误和下次时间，开始、成功、失败及重启中断都会写入日志；保活中的账号暂不接收新任务。
+
 图形验证码属于 TikTok 的交互式安全验证：程序会把账号状态标记为 `captcha_required` 并保持对应浏览器页面，管理员通过 noVNC 完成验证后，登录状态机会自动继续邮箱接码和后续登录。自动接码在后台并行进行，管理员仍可手动输入验证码；只要页面进入已登录状态，程序会立即确认成功。登录过程中关闭页面或 Chromium 后，程序最多自动重建三次并复用同一持久化 Profile。项目不包含验证码破解或绕过逻辑。
 
 首次使用子账号时，如果出现 TikTok Creative GenAI Terms，程序会自动滚动条款并点击 “Accept”；未出现条款时直接继续后续流程。该行为固定启用，不需要后台设置或环境变量。
@@ -157,7 +159,7 @@ curl http://127.0.0.1:8765/admin/pool/status \
   -H "Authorization: Bearer $SD2API_ADMIN_KEY"
 ```
 
-返回值包含每个登录账号的 `enabled`、`running`、`logged_in`、`login_state`、`busy`、`queued` 和 `subaccounts`。每个子账号包含 `advertiser_id`、`account_type`、`enabled`、`seedance_access`、`credits`、`active_tasks`、`concurrency_limit`、`available_slots`、`tasks_today` 与每日额度熔断状态；汇总状态还包含 `max_parallel`、`enabled_subaccounts`、`quota_blocked_subaccounts`、`logging_in` 和 `captcha_required`。
+返回值包含每个登录账号的 `enabled`、`running`、`logged_in`、`login_state`、`busy`、`queued`、`keepalive_state`、`keepalive_next_at`、`keepalive_error` 和 `subaccounts`。每个子账号包含 `advertiser_id`、`account_type`、`enabled`、`seedance_access`、`credits`、`active_tasks`、`concurrency_limit`、`available_slots`、`tasks_today` 与每日额度熔断状态；汇总状态还包含 `max_parallel`、`enabled_subaccounts`、`quota_blocked_subaccounts`、`logging_in` 和 `captcha_required`。
 
 ### 并发规则
 
@@ -171,7 +173,7 @@ curl http://127.0.0.1:8765/admin/pool/status \
 - 刷新子账号、权限与 Credits 使用独立 HTTP 请求，不再因为该登录账号存在排队或生成任务而返回 `account_busy`。
 - 如果在线账号没有 Seedance 权限，或 TikTok 返回 `10001100`（没有模型使用权限），生成 API 返回 HTTP 403，并在错误体中保留原始错误码和信息。
 - `pool_max_pending` 限制全池等待与运行任务总量，超限返回 HTTP 429。
-- 容器重启时最多并发验证 `pool_start_concurrency` 个账号；有效协议会话不会启动浏览器，只有缺失或过期时才拉起对应 Chromium。
+- 容器重启时最多并发验证 `pool_start_concurrency` 个账号；有效协议会话不会在启动验证时拉起浏览器。若重启发生在保活过程中，关停流程会取消保活并关闭 Chromium，下次启动把该次状态标记为中断，避免 Profile 被遗留进程锁住。
 - 已经在 TikTok 页面提交的任务不会自动换号重试，避免重复扣点；账号离线时只会停止接收新任务。
 - 有运行或排队任务的账号不能被停用、停止或删除，管理 API 会返回 HTTP 409。
 - 容器重建不会丢失账号登录 Profile、加密协议会话和已落库任务；已提交任务可在重启后继续查询。
@@ -348,6 +350,6 @@ pytest
 
 - [x] 子账号级并发槽位：默认 5 个活动任务，并按实时负载分配。
 - [x] 单日额度动态熔断：识别上游额度错误，暂停该子账号并自动改投其他账号。
-- [ ] 制定 TikTok 登录 Cookie 的保活策略：登录后 Cookie 过期较快，需要主动续期、失效检测和恢复机制。
+- [x] TikTok 登录 Cookie 每 6 小时通过持久化 Chromium Profile 主动续期，续期后导出并验证协议会话。
 - [ ] 增加通知设置：覆盖账号登出、需要打码等需要人工处理的事件。
 - [ ] 实现多 Key 策略。

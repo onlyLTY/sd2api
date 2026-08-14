@@ -104,6 +104,7 @@ const settingsSchema = [
     ["auto_login", "自动登录", "boolean"],
     ["login_timeout", "登录超时（秒）", "number", { min: 60, max: 3600 }],
     ["relogin_interval", "登录状态检查间隔（秒）", "number", { min: 30, max: 86400 }],
+    ["session_keepalive_interval", "浏览器保活间隔（秒）", "number", { min: 3600, max: 86400 }],
     ["temp_mail_poll_seconds", "邮箱轮询间隔（秒）", "number", { min: 1, max: 30, step: 0.5 }],
     ["temp_mail_timeout", "邮箱验证码超时（秒）", "number", { min: 30, max: 900 }],
   ]},
@@ -138,7 +139,7 @@ const stateMap = {
   not_logged_in: ["未登录", "wait"], not_started: ["尚未启动", "wait"],
   pending: ["等待登录", "wait"], queued: ["排队中", "wait"], running: ["生成中", "info"],
   in_progress: ["生成中", "info"], succeeded: ["已完成", "ok"], completed: ["已完成", "ok"],
-  failed: ["失败", "bad"],
+  keepalive: ["保活中", "info"], failed: ["失败", "bad"],
 };
 
 function normalizeStatus(status) {
@@ -541,6 +542,20 @@ function renderSubaccounts(account) {
   }).join("")}</div>`;
 }
 
+function keepaliveLabel(account) {
+  const labels = {
+    running: "保活中，Chromium 已启动",
+    succeeded: "最近保活成功",
+    failed: "最近保活失败",
+    interrupted: "保活被重启中断",
+    idle: "等待首次保活",
+  };
+  const state = account.keepalive_active ? "running" : (account.keepalive_state || "idle");
+  const next = account.keepalive_next_at ? ` · 下次 ${formatTime(account.keepalive_next_at)}` : "";
+  const error = account.keepalive_error ? ` · ${account.keepalive_error}` : "";
+  return `<span class="cell-sub">${esc(labels[state] || state)}${esc(next)}${esc(error)}</span>`;
+}
+
 function renderAccounts(items) {
   const body = $("accounts");
   if (!items.length) {
@@ -550,7 +565,7 @@ function renderAccounts(items) {
   body.innerHTML = items.map((account) => `
     <tr>
       <td><span class="cell-title">${esc(account.username || account.email_address || account.name)}</span>${account.name && account.name !== account.username && !String(account.name).startsWith("account_") ? `<span class="cell-sub">${esc(account.name)}</span>` : ""}</td>
-      <td>${pill(account.login_state)}<span class="cell-sub">${account.logged_in ? "协议会话有效" : "会话不可用"}</span></td>
+      <td>${pill(account.keepalive_active ? "keepalive" : account.login_state)}<span class="cell-sub">${account.logged_in ? "协议会话有效" : "会话不可用"}</span>${keepaliveLabel(account)}</td>
       <td>${backendLabel(account)}</td>
       <td><strong>${(account.subaccounts || []).filter((sub) => sub.enabled).length}</strong> / ${(account.subaccounts || []).length}<span class="cell-sub">已加入调度 / 已发现</span></td>
       <td>${account.busy ? '<span class="pill info">运行中</span>' : '<span class="muted">空闲</span>'}<span class="cell-sub">队列 ${account.queued || 0}</span></td>

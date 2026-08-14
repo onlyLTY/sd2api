@@ -127,7 +127,12 @@ class TaskStore:
                     last_login_at INTEGER,
                     last_login_attempt INTEGER,
                     session_ciphertext TEXT,
-                    session_updated_at INTEGER
+                    session_updated_at INTEGER,
+                    keepalive_state TEXT NOT NULL DEFAULT 'idle',
+                    keepalive_started_at INTEGER,
+                    keepalive_finished_at INTEGER,
+                    keepalive_next_at INTEGER,
+                    keepalive_error TEXT
                 )
                 """
             )
@@ -144,6 +149,11 @@ class TaskStore:
                 "last_login_attempt": "INTEGER",
                 "session_ciphertext": "TEXT",
                 "session_updated_at": "INTEGER",
+                "keepalive_state": "TEXT NOT NULL DEFAULT 'idle'",
+                "keepalive_started_at": "INTEGER",
+                "keepalive_finished_at": "INTEGER",
+                "keepalive_next_at": "INTEGER",
+                "keepalive_error": "TEXT",
             }
             for name, declaration in migrations.items():
                 if name not in account_columns:
@@ -680,6 +690,11 @@ class TaskStore:
             "last_login_attempt",
             "session_ciphertext",
             "session_updated_at",
+            "keepalive_state",
+            "keepalive_started_at",
+            "keepalive_finished_at",
+            "keepalive_next_at",
+            "keepalive_error",
         }
         invalid = set(changes) - allowed
         if invalid:

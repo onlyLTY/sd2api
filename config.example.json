@@ -20,6 +20,7 @@
   "auto_login": true,
   "login_timeout": 600,
   "relogin_interval": 300,
+  "session_keepalive_interval": 21600,
   "temp_mail_poll_seconds": 3.0,
   "temp_mail_timeout": 180,
   "upload_dir": "/data/uploads",

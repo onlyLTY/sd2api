@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from sd2api.config import Settings
-from sd2api.browser_client import BrowserTikTokClient
+from sd2api.browser_client import BrowserTikTokClient, IMAGE_STUDIO_URL
 from sd2api.browser_pool import BrowserPoolClient
 from sd2api.models import OpenAICreateVideoRequest, SeedanceCreateRequest, UpstreamTask
 from sd2api.protocol import ProtocolSession, ProtocolTikTokClient, _sign_gateway_request
@@ -510,6 +510,83 @@ async def test_start_reopens_a_closed_browser_page(tmp_path: Path) -> None:
     assert isinstance(client._page, OpenPage)
     assert client._page.default_timeout == 30_000
     await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_browser_session_keepalive_uses_exact_image_studio_url(
+    tmp_path: Path,
+) -> None:
+    class Response:
+        url = "https://ads.tiktok.com/passport/web/account/info/"
+        status = 200
+
+    class ResponseInfo:
+        async def value(self):
+            return Response()
+
+    class ExpectResponse:
+        def __init__(self, predicate) -> None:
+            assert predicate(Response()) is True
+
+        async def __aenter__(self):
+            info = ResponseInfo()
+            info.value = info.value()
+            return info
+
+        async def __aexit__(self, *_args) -> None:
+            pass
+
+    class Context:
+        calls = 0
+
+        async def cookies(self, urls):
+            assert urls == ["https://ads.tiktok.com"]
+            self.calls += 1
+            return [{
+                "name": "sessionid_ads",
+                "value": f"session-{self.calls}",
+                "expires": 100 + self.calls,
+            }]
+
+    class Page:
+        url = "about:blank"
+        navigations: list[str] = []
+
+        @staticmethod
+        def is_closed() -> bool:
+            return False
+
+        def expect_response(self, predicate, timeout):
+            assert timeout == 90_000
+            return ExpectResponse(predicate)
+
+        async def goto(self, url, **kwargs):
+            self.navigations.append(url)
+            self.url = url
+
+        async def wait_for_timeout(self, value):
+            assert value == 1500
+
+    class KeepaliveClient(BrowserTikTokClient):
+        async def start(self, *, target_url="unused") -> dict:
+            assert target_url is None
+            return {}
+
+        async def _is_logged_in(self, page) -> bool:
+            return True
+
+    client = KeepaliveClient(
+        Settings(sd2api_browser_profile=str(tmp_path / "keepalive")),
+        account_id="keepalive",
+    )
+    client._page = Page()  # type: ignore[assignment]
+    client._context = Context()  # type: ignore[assignment]
+
+    result = await client.renew_protocol_session()
+
+    assert client._page.navigations == [IMAGE_STUDIO_URL]
+    assert result["account_info_status"] == 200
+    assert result["rotated_cookie_names"] == ["sessionid_ads"]
 
 
 @pytest.mark.asyncio
@@ -1662,6 +1739,123 @@ async def test_pool_returns_403_when_online_accounts_have_no_seedance_access(
 
 
 @pytest.mark.asyncio
+async def test_pool_keepalive_tracks_success_and_closes_browser(
+    tmp_path: Path,
+) -> None:
+    store = TaskStore(str(tmp_path / "keepalive-pool.db"))
+    now = 1_800_000_000
+    store.create_account(account_id="due", name="due")
+    store.update_account(
+        "due",
+        session_ciphertext="encrypted-due",
+        session_updated_at=now - 21600,
+        login_state="logged_in",
+    )
+    pool = BrowserPoolClient(
+        Settings(
+            sd2api_browser_profile=str(tmp_path / "profiles"),
+            sd2api_session_keepalive_interval=21600,
+        ),
+        store,
+    )
+    pool._started_accounts.add("due")
+
+    class Worker:
+        load = 0
+        stopped = 0
+
+        async def renew_protocol_session(self):
+            return {
+                "url": IMAGE_STUDIO_URL,
+                "account_info_status": 200,
+                "core_cookie_count": 8,
+                "rotated_cookie_names": ["sessionid_ads"],
+            }
+
+        async def stop(self):
+            self.stopped += 1
+
+    worker = Worker()
+    pool._worker = lambda _account_id: worker  # type: ignore[method-assign]
+    pool._protocol_session = lambda _account_id: ProtocolSession(  # type: ignore[method-assign]
+        cookies=({"name": "sessionid_ads", "value": "old"},),
+        device_id="device-12345678",
+        user_agent="Mozilla/5.0",
+        fp_id="fp-12345678",
+    )
+
+    async def capture(account_id, browser, **kwargs):
+        assert account_id == "due"
+        assert browser is worker
+        assert kwargs == {
+            "bootstrap_identity": False,
+            "identity_fallback": pool._protocol_session(account_id),
+            "validate": True,
+        }
+        store.update_account(account_id, session_updated_at=now)
+        return pool._protocol_session(account_id)
+
+    pool._capture_protocol_session = capture  # type: ignore[method-assign]
+
+    await pool._run_session_keepalive_once(now=now)
+
+    account = store.get_account("due")
+    assert account is not None
+    assert account["keepalive_state"] == "succeeded"
+    assert account["keepalive_error"] is None
+    assert worker.stopped == 1
+    assert "due" not in pool._keepalive_accounts
+    messages = [event.message for event in store.list_events(limit=10)]
+    assert "Session keepalive started; Chromium profile is opening" in messages
+    assert "Session keepalive completed and protocol validation passed" in messages
+
+
+@pytest.mark.asyncio
+async def test_pool_keepalive_failure_does_not_schedule_login(tmp_path: Path) -> None:
+    store = TaskStore(str(tmp_path / "keepalive-failure.db"))
+    store.create_account(account_id="due", name="Due")
+    store.update_account(
+        "due",
+        session_ciphertext="encrypted-session",
+        session_updated_at=1,
+        login_state="logged_in",
+    )
+    pool = BrowserPoolClient(Settings(sd2api_session_keepalive_interval=3600), store)
+    pool._started_accounts.add("due")
+
+    class Worker:
+        load = 0
+        stopped = False
+
+        async def renew_protocol_session(self):
+            raise TikTokUpstreamError(
+                "Profile signed out", status_code=401, code="browser_login_required"
+            )
+
+        async def stop(self):
+            self.stopped = True
+
+    worker = Worker()
+    pool._worker = lambda _account_id: worker  # type: ignore[method-assign]
+    pool._protocol_session = lambda _account_id: ProtocolSession(  # type: ignore[method-assign]
+        cookies=({"name": "sessionid_ads", "value": "old"},),
+        device_id="device-12345678",
+        user_agent="Mozilla/5.0",
+    )
+    scheduled: list[str] = []
+    pool._schedule_login = lambda account_id: scheduled.append(account_id)  # type: ignore[method-assign]
+
+    await pool._run_session_keepalive_once(now=7201)
+
+    account = store.get_account("due")
+    assert scheduled == []
+    assert worker.stopped is True
+    assert account is not None and account["session_available"] is True
+    assert account["keepalive_state"] == "failed"
+    assert "Profile signed out" in account["keepalive_error"]
+
+
+@pytest.mark.asyncio
 async def test_pool_schedules_concurrent_jobs_across_accounts(tmp_path: Path) -> None:
     store = TaskStore(str(tmp_path / "pool.db"))
     store.create_account(account_id="a", name="Account A")
@@ -2362,7 +2556,7 @@ def test_admin_account_routes_without_starting_browser(
     assert listed.json()["data"][0]["name"] == "primary@example.com"
     assert status.json()["max_parallel"] == 0
     assert dashboard.status_code == 200
-    assert version.json() == {"version": "1.1.0"}
+    assert version.json() == {"version": "1.2.0"}
     assert 'id="appVersion"' in dashboard.text
     assert 'href="https://github.com/coolqoo/sd2api"' in dashboard.text
     assert "sd2api 控制台" in dashboard.text

@@ -40,6 +40,8 @@ class BrowserPoolClient:
         self._selection_counter = 0
         self._login_tasks: dict[str, asyncio.Task[None]] = {}
         self._monitor_task: asyncio.Task[None] | None = None
+        self._keepalive_task: asyncio.Task[None] | None = None
+        self._keepalive_accounts: set[str] = set()
 
     def _vault(self) -> CredentialVault:
         return CredentialVault(self.settings.credential_master_key)
@@ -135,24 +137,58 @@ class BrowserPoolClient:
         return worker
 
     async def _capture_protocol_session(
-        self, account_id: str, worker: BrowserTikTokClient
+        self,
+        account_id: str,
+        worker: BrowserTikTokClient,
+        *,
+        bootstrap_identity: bool = True,
+        identity_fallback: ProtocolSession | None = None,
+        validate: bool = False,
     ) -> ProtocolSession:
-        exported = await worker.export_protocol_session()
+        exported = await worker.export_protocol_session(
+            bootstrap_identity=bootstrap_identity
+        )
+        if identity_fallback is not None:
+            for name in (
+                "device_id",
+                "user_agent",
+                "fp_id",
+                "sec_ch_ua",
+                "sec_ch_ua_mobile",
+                "sec_ch_ua_platform",
+            ):
+                if not exported.get(name):
+                    exported[name] = getattr(identity_fallback, name)
         session = ProtocolSession.from_dict(exported)
+        if validate:
+            validator = ProtocolTikTokClient(
+                self.settings, session, account_id=account_id
+            )
+            try:
+                await validator.validate()
+            finally:
+                await validator.close()
         ciphertext = self._vault().encrypt(
             json.dumps(session.to_dict(), ensure_ascii=False, separators=(",", ":"))
         )
         await self._close_protocol_clients(account_id)
+        captured_at = int(time.time())
         self.store.update_account(
             account_id,
             session_ciphertext=ciphertext,
-            session_updated_at=int(time.time()),
+            session_updated_at=captured_at,
             login_state="logged_in",
             last_error=None,
+            keepalive_state="idle",
+            keepalive_next_at=(
+                captured_at + self.settings.sd2api_session_keepalive_interval
+            ),
+            keepalive_error=None,
         )
         return session
 
     async def start(self) -> dict[str, Any]:
+        self._ensure_background_tasks()
         accounts = [account for account in self.store.list_accounts() if account["enabled"]]
 
         semaphore = asyncio.Semaphore(self.settings.sd2api_pool_start_concurrency)
@@ -170,13 +206,24 @@ class BrowserPoolClient:
             for account, result in zip(accounts, results, strict=True)
             if isinstance(result, Exception)
         }
+        return {"mode": "browser_pool", "accounts": await self.list_accounts(), "errors": errors}
+
+    def _ensure_background_tasks(self) -> None:
         if self._monitor_task is None:
             self._monitor_task = asyncio.create_task(
                 self._login_monitor_loop(), name="sd2api-account-login-monitor"
             )
-        return {"mode": "browser_pool", "accounts": await self.list_accounts(), "errors": errors}
+        if self._keepalive_task is None:
+            self._recover_interrupted_keepalives()
+            self._keepalive_task = asyncio.create_task(
+                self._session_keepalive_loop(), name="sd2api-session-keepalive"
+            )
 
     async def stop(self) -> None:
+        if self._keepalive_task:
+            self._keepalive_task.cancel()
+            await asyncio.gather(self._keepalive_task, return_exceptions=True)
+            self._keepalive_task = None
         if self._monitor_task:
             self._monitor_task.cancel()
             await asyncio.gather(self._monitor_task, return_exceptions=True)
@@ -191,6 +238,7 @@ class BrowserPoolClient:
         self._workers.clear()
         await self._close_protocol_clients()
         self._started_accounts.clear()
+        self._keepalive_accounts.clear()
 
     async def status(self) -> dict[str, Any]:
         accounts = await self.list_accounts()
@@ -276,6 +324,7 @@ class BrowserPoolClient:
                 )
             runtime.setdefault("browser_running", bool(worker))
             runtime.setdefault("backend", "browser" if worker else "stopped")
+            runtime["keepalive_active"] = account["id"] in self._keepalive_accounts
             result.append(
                 {
                     **account,
@@ -527,6 +576,7 @@ class BrowserPoolClient:
             )
 
     async def start_account(self, account_id: str) -> dict[str, Any]:
+        self._ensure_background_tasks()
         account = self.store.get_account(account_id)
         if account is None:
             raise TikTokUpstreamError(
@@ -797,6 +847,151 @@ class BrowserPoolClient:
                 if not status["logged_in"]:
                     self._schedule_login(account["id"])
 
+    def _recover_interrupted_keepalives(self) -> None:
+        for account in self.store.list_accounts():
+            if account.get("keepalive_state") != "running":
+                continue
+            now = int(time.time())
+            self.store.update_account(
+                account["id"],
+                keepalive_state="interrupted",
+                keepalive_finished_at=now,
+                keepalive_error="Service restarted before keepalive finished",
+            )
+            self.store.add_event(
+                level="warning",
+                category="account",
+                message="Session keepalive was interrupted by a service restart",
+                account_id=account["id"],
+            )
+
+    async def _session_keepalive_loop(self) -> None:
+        while True:
+            interval = self.settings.sd2api_session_keepalive_interval
+            await asyncio.sleep(min(300, max(30, interval // 12)))
+            await self._run_session_keepalive_once()
+
+    async def _run_session_keepalive_once(self, *, now: int | None = None) -> None:
+        """Renew due, idle sessions serially without triggering login."""
+        current_time = int(time.time()) if now is None else now
+        interval = self.settings.sd2api_session_keepalive_interval
+        for account in self.store.list_accounts():
+            account_id = str(account["id"])
+            updated_at = account.get("session_updated_at")
+            default_due_at = (
+                int(updated_at) + interval if isinstance(updated_at, int) else None
+            )
+            due_at = (
+                int(account["keepalive_next_at"])
+                if isinstance(account.get("keepalive_next_at"), int)
+                else default_due_at
+            )
+            if due_at is not None and account.get("keepalive_next_at") is None:
+                self.store.update_account(account_id, keepalive_next_at=due_at)
+            if not (
+                account.get("enabled")
+                and account_id in self._started_accounts
+                and account.get("session_available")
+                and due_at is not None
+                and current_time >= due_at
+            ):
+                continue
+            async with self._scheduler_lock:
+                login_task = self._login_tasks.get(account_id)
+                if login_task is not None and not login_task.done():
+                    continue
+                worker = self._workers.get(account_id)
+                if worker is not None and worker.load > 0:
+                    continue
+                if self._account_load(account_id) > 0:
+                    continue
+                self._keepalive_accounts.add(account_id)
+                started_at = int(time.time())
+                self.store.update_account(
+                    account_id,
+                    keepalive_state="running",
+                    keepalive_started_at=started_at,
+                    keepalive_finished_at=None,
+                    keepalive_error=None,
+                )
+            self.store.add_event(
+                level="info",
+                category="account",
+                message="Session keepalive started; Chromium profile is opening",
+                account_id=account_id,
+                details={"url": "https://ads.tiktok.com/creative/creativestudio/image-to-video"},
+            )
+            worker = self._worker(account_id)
+            try:
+                existing_session = self._protocol_session(account_id)
+                result = await worker.renew_protocol_session()
+                await self._capture_protocol_session(
+                    account_id,
+                    worker,
+                    bootstrap_identity=False,
+                    identity_fallback=existing_session,
+                    validate=True,
+                )
+                finished_at = int(time.time())
+                self.store.update_account(
+                    account_id,
+                    keepalive_state="succeeded",
+                    keepalive_finished_at=finished_at,
+                    keepalive_next_at=finished_at + interval,
+                    keepalive_error=None,
+                )
+                self.store.add_event(
+                    level="success",
+                    category="account",
+                    message="Session keepalive completed and protocol validation passed",
+                    account_id=account_id,
+                    details={
+                        "url": result.get("url"),
+                        "account_info_status": result.get("account_info_status"),
+                        "core_cookie_count": result.get("core_cookie_count"),
+                        "rotated_cookie_names": result.get("rotated_cookie_names", []),
+                    },
+                )
+            except asyncio.CancelledError:
+                finished_at = int(time.time())
+                self.store.update_account(
+                    account_id,
+                    keepalive_state="interrupted",
+                    keepalive_finished_at=finished_at,
+                    keepalive_error="Service stopped while keepalive was running",
+                )
+                self.store.add_event(
+                    level="warning",
+                    category="account",
+                    message="Session keepalive interrupted; Chromium is being closed",
+                    account_id=account_id,
+                )
+                raise
+            except Exception as exc:
+                finished_at = int(time.time())
+                message = f"{exc.__class__.__name__}: {exc}"
+                self.store.update_account(
+                    account_id,
+                    keepalive_state="failed",
+                    keepalive_finished_at=finished_at,
+                    keepalive_next_at=finished_at + min(1800, interval),
+                    keepalive_error=message,
+                    last_error=f"Session keepalive failed: {message}",
+                )
+                self.store.add_event(
+                    level="error",
+                    category="account",
+                    message="Session keepalive failed; Chromium is being closed",
+                    account_id=account_id,
+                    details={"error": message},
+                )
+            finally:
+                try:
+                    await worker.stop()
+                finally:
+                    self._workers.pop(account_id, None)
+                    self._keepalive_accounts.discard(account_id)
+
     async def diagnostics(
         self,
         *,
@@ -954,6 +1149,7 @@ class BrowserPoolClient:
         return {
             **account,
             **runtime,
+            "keepalive_active": account_id in self._keepalive_accounts,
             "subaccounts": self._decorate_subaccounts(
                 account_id, self.store.list_subaccounts(account_id)
             ),
@@ -1009,7 +1205,12 @@ class BrowserPoolClient:
             statuses = await self.list_accounts()
             eligible: list[tuple[dict[str, Any], dict[str, Any]]] = []
             for status in statuses:
-                if not (status["enabled"] and status["running"] and status["logged_in"]):
+                if not (
+                    status["enabled"]
+                    and status["running"]
+                    and status["logged_in"]
+                    and not status.get("keepalive_active")
+                ):
                     continue
                 eligible.extend(
                     (status, subaccount)
