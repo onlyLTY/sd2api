@@ -86,7 +86,7 @@ class BrowserTikTokClient:
         self._last_login_at: int | None = None
         self._active_advertiser_id: str | None = None
 
-    async def start(self, *, target_url: str | None = STUDIO_URL) -> dict[str, Any]:
+    async def start(self) -> dict[str, Any]:
         async with self._start_lock:
             if self._context is not None and (
                 self._page is None or self._page.is_closed()
@@ -121,10 +121,8 @@ class BrowserTikTokClient:
             if self._worker is None or self._worker.done():
                 self._worker = asyncio.create_task(self._worker_loop(), name="sd2api-browser-worker")
             page = self._require_page()
-            if target_url is not None and not page.url.startswith(
-                "https://ads.tiktok.com/"
-            ):
-                await page.goto(target_url, wait_until="domcontentloaded", timeout=90_000)
+            if not page.url.startswith("https://ads.tiktok.com/"):
+                await page.goto(STUDIO_URL, wait_until="domcontentloaded", timeout=90_000)
         return await self.status()
 
     async def stop(self) -> None:
@@ -363,93 +361,7 @@ class BrowserTikTokClient:
         await self.start()
         await self._require_page().bring_to_front()
 
-    async def renew_protocol_session(self) -> dict[str, Any]:
-        """Refresh the Ads session through the authenticated page context.
-
-        This uses only the exact Image Studio URL proven by the longevity
-        experiment. It never attempts a login.
-        """
-        await self.start(target_url=None)
-        page = self._require_page()
-        context = self._context
-        if context is None:
-            raise TikTokUpstreamError(
-                "The Chromium context closed before session keepalive",
-                status_code=503,
-                code="browser_closed",
-            )
-
-        core_names = {
-            "sessionid_ads",
-            "sessionid_ss_ads",
-            "sid_tt_ads",
-            "uid_tt_ads",
-            "uid_tt_ss_ads",
-            "sid_ucp_v1_ads",
-            "ssid_ucp_v1_ads",
-            "tt_session_tlb_tag_ads",
-        }
-        before = {
-            str(cookie.get("name")): (
-                str(cookie.get("value") or ""),
-                float(cookie.get("expires") or -1),
-            )
-            for cookie in await context.cookies([self.settings.tiktok_base_url])
-            if str(cookie.get("name")) in core_names
-        }
-
-        def is_account_info(response: Any) -> bool:
-            return urlparse(response.url).path == "/passport/web/account/info/"
-
-        try:
-            async with page.expect_response(is_account_info, timeout=90_000) as response_info:
-                await page.goto(
-                    IMAGE_STUDIO_URL,
-                    wait_until="domcontentloaded",
-                    timeout=90_000,
-                )
-            response = await response_info.value
-        except PlaywrightTimeoutError as exc:
-            raise TikTokUpstreamError(
-                "TikTok did not complete its account-info bootstrap during keepalive",
-                status_code=504,
-                code="session_keepalive_timeout",
-            ) from exc
-        if response.status != 200:
-            raise TikTokUpstreamError(
-                f"TikTok account-info bootstrap returned HTTP {response.status}",
-                status_code=502,
-                code="session_keepalive_failed",
-            )
-        await page.wait_for_timeout(1500)
-        if not await self._is_logged_in(page):
-            raise TikTokUpstreamError(
-                "The persistent Chromium profile is no longer logged in",
-                status_code=401,
-                code="browser_login_required",
-            )
-
-        after = {
-            str(cookie.get("name")): (
-                str(cookie.get("value") or ""),
-                float(cookie.get("expires") or -1),
-            )
-            for cookie in await context.cookies([self.settings.tiktok_base_url])
-            if str(cookie.get("name")) in core_names
-        }
-        return {
-            "url": IMAGE_STUDIO_URL,
-            "account_info_status": response.status,
-            "core_cookie_count": len(after),
-            "rotated_cookie_names": sorted(
-                name for name, state in after.items() if before.get(name) != state
-            ),
-            "logged_in": True,
-        }
-
-    async def export_protocol_session(
-        self, *, bootstrap_identity: bool = True
-    ) -> dict[str, Any]:
+    async def export_protocol_session(self) -> dict[str, Any]:
         """Capture the TikTok web session needed by the protocol client.
 
         The caller must encrypt the returned value before persistence. Only
@@ -582,9 +494,7 @@ class BrowserTikTokClient:
 
         try:
             browser_state = await read_browser_state()
-            if bootstrap_identity and (
-                not browser_state.get("device_id") or not observed["fp_id"]
-            ):
+            if not browser_state.get("device_id") or not observed["fp_id"]:
                 # A fresh Studio navigation triggers the bootstrap requests
                 # which contain the public web device ID and fingerprint ID.
                 await page.goto(STUDIO_URL, wait_until="domcontentloaded", timeout=90_000)

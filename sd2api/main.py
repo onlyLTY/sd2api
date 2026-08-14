@@ -800,7 +800,6 @@ async def admin_config_status() -> dict[str, Any]:
         "temp_mail_base_url": settings.sd2api_temp_mail_base_url,
         "login_timeout": settings.sd2api_login_timeout,
         "relogin_interval": settings.sd2api_relogin_interval,
-        "session_keepalive_interval": settings.sd2api_session_keepalive_interval,
         "protocol_transport": "curl_cffi/chrome",
         "protocol_upload_concurrency": settings.sd2api_protocol_upload_concurrency,
         "subaccount_concurrency": settings.sd2api_pool_subaccount_concurrency,

@@ -40,7 +40,6 @@ class RuntimeConfig(BaseModel):
     auto_login: bool = True
     login_timeout: int = Field(default=600, ge=60, le=3600)
     relogin_interval: int = Field(default=300, ge=30, le=86400)
-    session_keepalive_interval: int = Field(default=21600, ge=3600, le=86400)
     temp_mail_poll_seconds: float = Field(default=3.0, ge=1, le=30)
     temp_mail_timeout: int = Field(default=180, ge=30, le=900)
     upload_dir: str = "uploads"
@@ -83,7 +82,6 @@ LEGACY_ENV_FIELDS = {
     "SD2API_AUTO_LOGIN": "auto_login",
     "SD2API_LOGIN_TIMEOUT": "login_timeout",
     "SD2API_RELOGIN_INTERVAL": "relogin_interval",
-    "SD2API_SESSION_KEEPALIVE_INTERVAL": "session_keepalive_interval",
     "SD2API_TEMP_MAIL_POLL_SECONDS": "temp_mail_poll_seconds",
     "SD2API_TEMP_MAIL_TIMEOUT": "temp_mail_timeout",
     "SD2API_UPLOAD_DIR": "upload_dir",
