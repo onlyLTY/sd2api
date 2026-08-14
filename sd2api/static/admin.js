@@ -104,6 +104,7 @@ const settingsSchema = [
     ["auto_login", "自动登录", "boolean"],
     ["login_timeout", "登录超时（秒）", "number", { min: 60, max: 3600 }],
     ["relogin_interval", "登录状态检查间隔（秒）", "number", { min: 30, max: 86400 }],
+    ["session_keepalive_interval", "浏览器保活间隔（秒）", "number", { min: 3600, max: 86400 }],
     ["temp_mail_poll_seconds", "邮箱轮询间隔（秒）", "number", { min: 1, max: 30, step: 0.5 }],
     ["temp_mail_timeout", "邮箱验证码超时（秒）", "number", { min: 30, max: 900 }],
   ]},

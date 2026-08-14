@@ -40,6 +40,7 @@ class BrowserPoolClient:
         self._selection_counter = 0
         self._login_tasks: dict[str, asyncio.Task[None]] = {}
         self._monitor_task: asyncio.Task[None] | None = None
+        self._keepalive_task: asyncio.Task[None] | None = None
 
     def _vault(self) -> CredentialVault:
         return CredentialVault(self.settings.credential_master_key)
@@ -135,9 +136,29 @@ class BrowserPoolClient:
         return worker
 
     async def _capture_protocol_session(
-        self, account_id: str, worker: BrowserTikTokClient
+        self,
+        account_id: str,
+        worker: BrowserTikTokClient,
+        *,
+        bootstrap_identity: bool = True,
+        identity_fallback: ProtocolSession | None = None,
     ) -> ProtocolSession:
-        exported = await worker.export_protocol_session()
+        exported = (
+            await worker.export_protocol_session()
+            if bootstrap_identity
+            else await worker.export_protocol_session(bootstrap_identity=False)
+        )
+        if identity_fallback is not None:
+            for name in (
+                "device_id",
+                "user_agent",
+                "fp_id",
+                "sec_ch_ua",
+                "sec_ch_ua_mobile",
+                "sec_ch_ua_platform",
+            ):
+                if not exported.get(name):
+                    exported[name] = getattr(identity_fallback, name)
         session = ProtocolSession.from_dict(exported)
         ciphertext = self._vault().encrypt(
             json.dumps(session.to_dict(), ensure_ascii=False, separators=(",", ":"))
@@ -174,9 +195,17 @@ class BrowserPoolClient:
             self._monitor_task = asyncio.create_task(
                 self._login_monitor_loop(), name="sd2api-account-login-monitor"
             )
+        if self._keepalive_task is None:
+            self._keepalive_task = asyncio.create_task(
+                self._session_keepalive_loop(), name="sd2api-session-keepalive"
+            )
         return {"mode": "browser_pool", "accounts": await self.list_accounts(), "errors": errors}
 
     async def stop(self) -> None:
+        if self._keepalive_task:
+            self._keepalive_task.cancel()
+            await asyncio.gather(self._keepalive_task, return_exceptions=True)
+            self._keepalive_task = None
         if self._monitor_task:
             self._monitor_task.cancel()
             await asyncio.gather(self._monitor_task, return_exceptions=True)
@@ -796,6 +825,74 @@ class BrowserPoolClient:
                     continue
                 if not status["logged_in"]:
                     self._schedule_login(account["id"])
+
+    async def _session_keepalive_loop(self) -> None:
+        while True:
+            interval = self.settings.sd2api_session_keepalive_interval
+            await asyncio.sleep(min(300, max(30, interval // 12)))
+            await self._run_session_keepalive_once()
+
+    async def _run_session_keepalive_once(self, *, now: int | None = None) -> None:
+        """Renew due, idle sessions serially without triggering a login."""
+        current_time = int(time.time()) if now is None else now
+        interval = self.settings.sd2api_session_keepalive_interval
+        for account in self.store.list_accounts():
+            account_id = str(account["id"])
+            updated_at = account.get("session_updated_at")
+            if not (
+                account.get("enabled")
+                and account_id in self._started_accounts
+                and account.get("session_available")
+                and isinstance(updated_at, int)
+                and current_time - updated_at >= interval
+            ):
+                continue
+            login_task = self._login_tasks.get(account_id)
+            if login_task is not None and not login_task.done():
+                continue
+            worker = self._workers.get(account_id)
+            if worker is not None and worker.load > 0:
+                continue
+            if any(
+                key[0] == account_id and client.load > 0
+                for key, client in self._protocol_clients.items()
+            ):
+                continue
+            worker = self._worker(account_id)
+            try:
+                existing_session = self._protocol_session(account_id)
+                result = await worker.renew_protocol_session()
+                await self._capture_protocol_session(
+                    account_id,
+                    worker,
+                    bootstrap_identity=False,
+                    identity_fallback=existing_session,
+                )
+                self.store.add_event(
+                    level="info",
+                    category="account",
+                    message="TikTok browser session keepalive completed",
+                    account_id=account_id,
+                    details={
+                        "url": result.get("url"),
+                        "account_info_status": result.get("account_info_status"),
+                        "core_cookie_count": result.get("core_cookie_count"),
+                        "rotated_cookie_names": result.get("rotated_cookie_names", []),
+                    },
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.store.update_account(
+                    account_id,
+                    last_error=(
+                        "Session keepalive failed without automatic login: "
+                        f"{exc.__class__.__name__}: {exc}"
+                    ),
+                )
+            finally:
+                await worker.stop()
+                self._workers.pop(account_id, None)
 
     async def diagnostics(
         self,
