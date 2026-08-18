@@ -1,355 +1,365 @@
+<div align="center">
+
 # sd2api
 
-想获得 Seedance 2 权限，通常需要 TikTok Ads 账户在过去 30 天累计广告花费超过 $5,000。若本来就有投放计划，可通过 [ttoh](https://ttoh.app) 查询广告金、优惠券与活动资格，尽量降低达成这一门槛的实际成本。
+**TikTok Symphony Creative Studio (Seedance 2.0) 视频生成 API 网关**
 
-把 TikTok Symphony Creative Studio 的 Seedance 文生视频与图生视频能力包装成两个本地 HTTP 接口：
+提供兼容 **OpenAI Videos API** 与 **Seedance / ModelArk API** 的标准接口，支持文生视频、图生视频与多模态参考生视频。<br>
+内置多账号/子账号并发池、协议级调度、自动会话保活、临时邮箱自动接码与现代化 Web 管理控制台。
 
-- Seedance / ModelArk 风格：`/api/v3/contents/generations/tasks`
-- OpenAI Videos 风格：`/v1/videos`
+[![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.116+-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-协议端实测基线：Dreamina Seedance 2.0 的文生视频、单图图生视频、2 图 + 视频 + 音频的 Reference to video，均使用 5 秒任务完成了素材上传、创建、轮询和原始 MP4 下载。Chromium 只在登录、图形验证码和条款确认时启动；登录完成后生成服务不依赖浏览器 UI。每次 5 秒测试消耗 5 点，实际完成时间取决于 TikTok 队列。
+[✨ 特性一览](#-特性一览) • [🚀 快速开始](#-快速开始) • [📖 API 调用示例](#-api-调用示例) • [🖥️ 管理控制台](#-web-管理控制台) • [⚙️ 配置说明](#-配置说明) • [📊 参数与状态映射](#-参数与状态映射)
 
-> 这是对 TikTok 网页内部接口的非官方适配器。接口、内部模型 ID 和鉴权字段可能随网页更新而变化。只应用于你有权访问的账号，并遵守 TikTok 的服务条款。`sora-2` 在本项目中只是 OpenAI SDK 兼容别名，实际调用的是账号内的 Dreamina Seedance 2.0，不是 OpenAI 的 Sora 服务。
+</div>
 
-## 当前范围
+---
 
-已支持：
+> [!TIP]
+> **💡 Seedance 2.0 权限与广告金获取**：
+> TikTok 官方通常要求 Ads 账户在过去 30 天内累计广告花费满 $5,000 才会开放 Seedance 2 权限。如果有投放计划，可通过 **[ttoh.app](https://ttoh.app)** 实时查询最新的广告金活动、优惠券与开户资格，有效降低获取权限的实际门槛与成本。
 
-- 文生视频，Seedance 2.0（已实测）
-- 单张首帧图生视频，Seedance 2.0（已实测）
-- Reference to video：多图片、视频、音频混合参考（已实测）
-- OpenAI multipart 多文件上传，以及 OpenAI/Seedance 的远程 URL 和图片/音频 data URL
-- Seedance 2.5 内部模型映射（未在本账号实测）
-- 4–15 秒时长
-- 创建、查询、列表、删除本地任务记录
-- OpenAI 兼容状态对象和 MP4 流式下载
-- SQLite 任务持久化
-- 可选 Bearer API Key
-- 登录账号浏览器 Profile 隔离、加密协议会话、每 6 小时自动保活与中央调度
-- 自动发现 Client/Partner 子账号，并由用户选择哪些加入生成池
-- 逐子账号显示 Seedance 2 权限、Credits 和检查错误
-- 每个子账号独立 CookieJar；同一登录账号下多个已启用子账号也可并发
+---
 
-暂未支持：
+## ✨ 特性一览
 
-- OpenAI `file_id` 和严格的首帧+尾帧模式
-- 取消已经提交到 TikTok 的任务（DELETE 只删除本地记录）
-- 自定义分辨率或画幅；网页生成请求当前没有暴露这些参数
+- 🎯 **双重 API 兼容**
+  - **OpenAI Videos 规范** (`/v1/videos`)：原生兼容 OpenAI 官方 Python SDK，无缝对接各类 AI 聚合网关及上层应用。
+  - **Seedance / ModelArk 规范** (`/api/v3/contents/generations/tasks`)：兼容火山引擎/字节 Seedance 接口风格。
+- 🎬 **全模态视频生成能力**
+  - **文生视频 (T2V)**：支持 4～15 秒时长指定与自由文本提示词。
+  - **图生视频 (I2V)**：支持首帧图片输入（支持远程 URL、Base64 Data URL 或 Multipart 上传）。
+  - **多模态参考生视频 (R2V)**：支持混合参考输入（最多 9 张图片 + 3 个视频 + 3 段音频）。
+- ⚡ **高性能协议直连**
+  - 采用 Chrome TLS / HTTP2 指纹协议直连，仅在登录及定时保活时按需启动 Chromium，正常生成不依赖浏览器 DOM，并发更高、内存占用极低。
+- 🏢 **多账号 & 子账号智能池**
+  - 自动发现主账号下的全部 Client / Partner 子账号与 Seedance 2.0 权限。
+  - 支持多子账号并发调度，每个子账号独立 CookieJar 隔离。
+  - 智能负载均衡调度，支持上游每日额度（Quota Limit）自动熔断降级。
+- 🔄 **全自动化无人值守运维**
+  - **自动接码**：对接 [coolqoo/cf_temp_mail](https://github.com/coolqoo/cf_temp_mail)（或兼容该 API 标准的临时邮箱服务）实现登录邮件验证码全自动提取。
+  - **自动保活**：定时静默会话保活并自动刷新加密协议凭证。
+  - **noVNC 极简交互**：内置 noVNC，遇到图形验证码时可通过 Web 界面轻松完成手动验证。
+- 🖥️ **现代化 Admin WebUI**
+  - 提供视频在线生成与调试、号池状态实时监控、任务检索与原始 MP4 下载、日志检索及系统配置管理。
 
-## 安装
+---
 
-```powershell
+## 🚀 快速开始
+
+### 方式 1：Docker Compose 部署（推荐）
+
+1. **克隆项目并准备配置文件**：
+
+   ```bash
+   git clone https://github.com/your-username/sd2api.git
+   cd sd2api
+   cp .env.docker.example .env.docker
+   cp config.example.json config.json
+   ```
+
+2. **配置环境变量 (`.env.docker`)**：
+
+   ```dotenv
+   SD2API_API_KEY=your-custom-api-key          # 调用生视频 API 的密钥
+   SD2API_ADMIN_KEY=your-custom-admin-key      # 访问 Web 管理后台的密钥
+   SD2API_CREDENTIAL_KEY=                      # 凭据加密密钥（留空则自动生成）
+   NOVNC_PASSWORD=your-novnc-password          # noVNC 访问密码
+   SD2API_TEMP_MAIL_BASE_URL=                  # [可选] cf_temp_mail 邮件服务地址 (https://github.com/coolqoo/cf_temp_mail)
+   SD2API_TEMP_MAIL_API_KEY=                   # [可选] cf_temp_mail 的 API_SECRET
+   ```
+
+3. **启动服务**：
+
+   ```bash
+   docker compose up -d
+   ```
+
+4. **访问服务**：
+   - **Web 管理控制台**：`http://127.0.0.1:8765/admin`（使用 `SD2API_ADMIN_KEY` 登录）
+   - **noVNC 远程桌面**：`http://127.0.0.1:6080/vnc.html?autoconnect=1&resize=scale`
+   - **Swagger API 文档**：`http://127.0.0.1:8765/docs`
+
+5. **添加账号与首次登录**：
+   - 进入 Web 控制台（`/admin`）的 **号池管理** 页面，添加 TikTok Ads 登录邮箱与密码。
+   - 连接 **noVNC 远程桌面**（端口 `6080`，输入 `NOVNC_PASSWORD`），在弹出的浏览器窗口中**手动完成图形滑块/点选打码**。
+   - 打码完成后系统会自动完成邮箱接码并加密保存会话；在号池中为具有 Seedance 权限的子账号开启 **加入调度** 开关即可开始调用 API。
+
+> [!NOTE]
+> 如果部署在远程 VPS 上且未配置反向代理，可以通过 SSH 隧道将端口映射到本地访问：
+> ```bash
+> ssh -L 8765:127.0.0.1:8765 -L 6080:127.0.0.1:6080 user@your-vps-ip
+> ```
+
+---
+
+### 方式 2：本地源码运行
+
+```bash
+# 1. 创建并激活虚拟环境
 python -m venv .venv
+# Windows:
 .\.venv\Scripts\Activate.ps1
-python -m pip install -e ".[test]"
-Copy-Item .env.example .env
-Copy-Item config.example.json config.json
-```
+# Linux/macOS:
+source .venv/bin/activate
 
-`.env` 只保存 API Key、Admin Key、凭据加密 Key、`cf_temp_mail` 地址及邮箱 API Key 等部署环境信息；其余运行参数保存在 `config.json`，也可在 `/admin#/settings` 的“系统配置”页面修改。推荐保持 `mode` 为 `browser_pool`，再通过 `/admin` 添加 TikTok Ads 登录邮箱和密码。程序会在 Chromium 中完成账号密码和邮箱验证码步骤，只把图形验证码交给管理员；登录成功后自动捕获 Cookie、CSRF、fp ID、Client Hints 和 device ID，加密写入 SQLite 并关闭 Chromium。
+# 2. 安装依赖
+pip install -e ".[test]"
+playwright install chromium
 
-启动：
+# 3. 初始化配置
+cp .env.example .env
+cp config.example.json config.json
 
-```powershell
+# 4. 启动服务
 uvicorn sd2api.main:app --host 127.0.0.1 --port 8765
 ```
 
-接口文档：`http://127.0.0.1:8765/docs`
+---
 
-### 旧 UI 浏览器模式
+## 📖 API 调用示例
 
-在 `config.json` 中设置：
+### 1. OpenAI 兼容接口 (`/v1/videos`)
 
-```json
-{
-  "mode": "browser",
-  "browser_channel": "",
-  "browser_profile": ".browser-profile"
-}
-```
-
-配置项 `mode=browser` 保留为 UI 自动化回退模式：调用 `POST /browser/start` 后，任务会依次操作网页。新部署应使用 `browser_pool`，它在登录后将会话加密保存，扫描、上传、生成、轮询和下载都直接调用协议，不受生成页 DOM 变化影响。
-
-浏览器模式的限制：任务串行执行，容易受到网页 UI 更新影响，吞吐量低于直接 HTTP 模式。开发结束后可在该 Chromium 窗口登出；如需彻底移除本地会话，应先停止服务，再手动删除 `.browser-profile`。
-
-## Docker / VPS 多账号池
-
-Docker 模式在一个容器中运行 API、按需 Chromium、Xvfb 和 noVNC。每个 TikTok Ads 登录账号使用独立 Profile；账号凭据、加密协议会话、子账号选择和任务记录存放在 SQLite。Chromium 登录完成后自动关闭，正常生成时不会常驻，也无需导出 Cookie。
-
-准备配置：
-
-```bash
-cp .env.docker.example .env.docker
-cp config.example.json config.json
-```
-
-至少修改这些值：
-
-```dotenv
-SD2API_API_KEY=调用视频 API 的长随机密钥
-SD2API_ADMIN_KEY=管理账号池的另一条长随机密钥
-NOVNC_PASSWORD=noVNC 登录密码
-SD2API_CREDENTIAL_KEY=用于加密账号密码的长期随机密钥
-SD2API_TEMP_MAIL_BASE_URL=https://你的-cf_temp_mail-worker
-SD2API_TEMP_MAIL_API_KEY=cf_temp_mail 的 API_SECRET
-```
-
-`cf_temp_mail` 地址与 API 密钥都从 `.env.docker` 读取，不会出现在可在线修改的系统配置里。Compose 会把宿主机的 `./config.json` 映射到容器 `/app/config.json`；迁移到另一台 VPS 时可直接复制 `.env.docker` 和 `config.json`，其中前者包含 API、密钥和外部服务地址，后者保存其余非敏感运行参数。
-
-启动：
-
-```bash
-docker compose up -d --build
-docker compose ps
-```
-
-Compose 默认只绑定 VPS 的 `127.0.0.1`。从本机建立 SSH 隧道：
-
-```bash
-ssh -L 8765:127.0.0.1:8765 -L 6080:127.0.0.1:6080 user@your-vps
-```
-
-然后打开：
-
-- 管理控制台：`http://127.0.0.1:8765/admin`
-- noVNC：`http://127.0.0.1:6080/vnc.html?autoconnect=1&resize=scale`
-- API 文档：`http://127.0.0.1:8765/docs`
-
-管理控制台按功能分为四个菜单：
-
-- **生视频**：直接创建 T2V、单首帧 I2V 和多模态 R2V 任务，显示可用 Credits、预计消耗和当前任务状态。
-- **号池管理**：添加登录账号、处理登录、扫描 Client/Partner 子账号，并选择哪些有 Seedance 权限的子账号参与调度。
-- **日志**：查看持久化的系统、账号、登录和视频事件，可按级别、分类及关键词筛选。
-- **视频管理**：搜索和筛选全部任务，页面打开时会主动刷新排队中与生成中任务的 TikTok 状态，并支持下载成功视频或删除本地记录。
-
-控制台使用 `SD2API_ADMIN_KEY` 登录；配置了独立的 `SD2API_API_KEY` 时，Admin Key 也可以从控制台调用视频生成与下载端点。删除视频任务只删除本地记录，不会取消已经提交到 TikTok 的上游任务。
-
-推荐在账号池面板中添加账号，只需填写 TikTok Ads 登录邮箱和密码。登录邮箱同时用于接收验证码，内部账号 ID 自动生成；加入号池后可在“编辑”中设置备注名称。密码经 Fernet 加密后才写入 SQLite，管理 API 和面板不会回传密码或密文。容器启动、账号掉线或点击“登录”时会自动执行账号密码登录，并通过 `cf_temp_mail` 的 `GET /api/emails?to_address=...` 获取本次登录产生的邮件验证码（支持纯数字及字母数字验证码）。
-
-登录成功后程序保存加密协议会话，并通过 TikTok 的结构化 JSON 接口读取全部 Client/Partner 子账号、Dreamina Seedance 2.0 权限、用户层级与 Credits，不再展开账号菜单或操作模型下拉框。每个子账号使用独立 CookieJar 和公开账号上下文 `s_aio_client_id`；Cookie、CSRF、fp ID、Client Hints 和 device ID 都从登录会话自动获得，不对管理 API 或用户配置暴露。子账号默认不加入生成池；管理员在面板中打开一个或多个“SD2 可用”子账号的“加入调度”开关后才会参与调度，无权限子账号的开关保持禁用。重新扫描会更新名称、权限和 Credits，但保留已有开关状态。
-
-协议请求由 `curl_cffi` 使用 Chrome TLS/HTTP2 指纹发送；素材上传支持 ImageX/VOD 直传和分片，不需要后台保留 Chromium 进程。会话密文只使用 `SD2API_CREDENTIAL_KEY`（或回退的 Admin Key）解密，管理 API 永远不会返回 Cookie、密码或密文。
-
-已登录账号默认每 21600 秒执行一次浏览器保活，可通过 `session_keepalive_interval` 调整。保活只在账号空闲时串行启动对应持久化 Profile，访问无查询参数的 `https://ads.tiktok.com/creative/creativestudio/image-to-video`，等待 `/passport/web/account/info/` 返回 HTTP 200，再导出最新会话并进行协议验证，完成后立即关闭 Chromium。号池会显示保活状态、错误和下次时间，开始、成功、失败及重启中断都会写入日志。新请求会优先使用其他可用账号；如果唯一可用账号正在保活，请求会在服务端等待，保活结束后自动继续调度，不会把正常保活当成账号故障返回错误。
-
-图形验证码属于 TikTok 的交互式安全验证：程序会把账号状态标记为 `captcha_required` 并保持对应浏览器页面，管理员通过 noVNC 完成验证后，登录状态机会自动继续邮箱接码和后续登录。自动接码在后台并行进行，管理员仍可手动输入验证码；只要页面进入已登录状态，程序会立即确认成功。登录过程中关闭页面或 Chromium 后，程序最多自动重建三次并复用同一持久化 Profile。项目不包含验证码破解或绕过逻辑。
-
-首次使用子账号时，如果出现 TikTok Creative GenAI Terms，程序会自动滚动条款并点击 “Accept”；未出现条款时直接继续后续流程。该行为固定启用，不需要后台设置或环境变量。
-
-也可以通过 API 添加账号：
-
-```bash
-curl -X POST http://127.0.0.1:8765/admin/accounts \
-  -H "Authorization: Bearer $SD2API_ADMIN_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"username":"login@example.com","password":"your-password","auto_login":true,"start":true}'
-```
-
-为避免密码进入 shell history，实际部署优先使用账号池面板。继续添加 `account_002`、`account_003` 即可；noVNC 底部任务栏用于切换窗口，也可以调用聚焦端点：
-
-```bash
-curl -X POST http://127.0.0.1:8765/admin/accounts/account_002/focus \
-  -H "Authorization: Bearer $SD2API_ADMIN_KEY"
-```
-
-查看账号池：
-
-```bash
-curl http://127.0.0.1:8765/admin/pool/status \
-  -H "Authorization: Bearer $SD2API_ADMIN_KEY"
-```
-
-返回值包含每个登录账号的 `enabled`、`running`、`logged_in`、`login_state`、`busy`、`queued`、`keepalive_state`、`keepalive_next_at`、`keepalive_error` 和 `subaccounts`。每个子账号包含 `advertiser_id`、`account_type`、`enabled`、`seedance_access`、`credits`、`active_tasks`、`concurrency_limit`、`available_slots`、`tasks_today` 与每日额度熔断状态；汇总状态还包含 `max_parallel`、`enabled_subaccounts`、`quota_blocked_subaccounts`、`logging_in` 和 `captcha_required`。
-
-### 并发规则
-
-- 协议模式不切换网页上下文；每个已启用子账号都有隔离的 CookieJar，可与同一登录账号下的其他子账号并发。
-- 每个子账号默认允许同时保有 5 个排队或生成中的上游任务，可通过配置项 `pool_subaccount_concurrency` 调整。`max_parallel` 表示全池当前剩余槽位，不再等同于子账号数量。
-- 素材上传在每个协议客户端内受 `protocol_upload_concurrency` 限制；大文件超过 `protocol_direct_upload_bytes` 后按 `protocol_slice_bytes` 分片。
-- 调度器先选择当前活动任务最少的子账号；负载相同时优先当日已提交任务较少者，再比较 credits 并轮转，从而避免少数账号过早撞到单日上限。
-- 页面可见 credits 为 0 的账号不会接收新任务；无法读取余额时仍可参与调度。
-- 如果创建请求返回包含 daily limit / quota / 今日次数上限等语义的上游错误，程序会将该子账号动态熔断，并立刻尝试同一号池的下一个可用子账号。默认暂停 86400 秒，可通过 `pool_quota_cooldown` 调整；不会假定所有账号都有固定的 20 或 50 次额度。
-- 若生产日志中出现只有错误码、没有明确额度文案的上游响应，可把确认过的错误码写入 `pool_daily_quota_codes`，无需改代码即可纳入熔断。
-- 刷新子账号、权限与 Credits 使用独立 HTTP 请求，不再因为该登录账号存在排队或生成任务而返回 `account_busy`。
-- 如果在线账号没有 Seedance 权限，或 TikTok 返回 `10001100`（没有模型使用权限），生成 API 返回 HTTP 403，并在错误体中保留原始错误码和信息。
-- `pool_max_pending` 限制全池等待与运行任务总量，超限返回 HTTP 429。
-- 容器重启时最多并发验证 `pool_start_concurrency` 个账号；有效协议会话不会在启动验证时拉起浏览器。若重启发生在保活过程中，关停流程会取消保活并关闭 Chromium，下次启动把该次状态标记为中断，避免 Profile 被遗留进程锁住。
-- 已经在 TikTok 页面提交的任务不会自动换号重试，避免重复扣点；账号离线时只会停止接收新任务。
-- 有运行或排队任务的账号不能被停用、停止或删除，管理 API 会返回 HTTP 409。
-- 容器重建不会丢失账号登录 Profile、加密协议会话和已落库任务；已提交任务可在重启后继续查询。
-
-删除账号管理记录不会删除对应 Profile，响应中的 `profile_retained` 会明确标记这一点。需要彻底移除登录态时，应先停止账号，再由管理员单独清理相应的 volume 目录。
-
-## 生成参数说明
-
-以下结论来自 2026-08-02 对当前 TikTok Symphony Creative Studio 页面、实际创建请求和 T2V/I2V/R2V 成功任务的交叉验证。TikTok 内部网页接口可能更新，升级后应重新核对。
-
-| 能力 | Seedance 风格字段 | OpenAI 风格字段 | 当前行为 |
-|---|---|---|---|
-| 模型 | `model` | `model` | `seedance-2.0` 已实测；`sora-2` 只是它的 OpenAI 兼容别名。代码包含 Seedance 2.5 映射，但当前账号网页没有展示 2.5，因此未实测且仍取决于账号权限。网页还展示 `Video 1.5 Pro`，本适配器不支持。 |
-| 时长 | `duration` | `seconds` | **真实生效**。支持 4–15 秒的任意整数，步长 1；会写入 TikTok 请求正文和 `settings`。当前页面显示 Seedance 2.0 的预估 Credits 与秒数相同，例如 4 秒为 4 Credits、15 秒为 15 Credits。 |
-| 分辨率 | `resolution` | `size` | **不控制上游**。TikTok 页面没有分辨率控件，请求也不包含这些字段。当前适配器只保存并回显它们，方便兼容 SDK。 |
-| 画幅 | `ratio` | 包含在 `size` 的宽高方向中 | **不控制上游**。页面没有画幅控件，请求不包含该字段。 |
-| 随机种子 | `seed` | 无 | TikTok 页面没有对应控件；当前仅作为兼容字段接收，不会发给上游。 |
-| 固定镜头 | `camera_fixed` | 无 | Seedance 2.0 没有相机控制开关；页面所示 Camera control 属于另一个 `Video 1.5 Pro` 模型。当前字段不会发给上游。需要固定镜头时只能写进 prompt。 |
-| 水印 | `watermark` | 无 | 页面没有生成水印开关。TikTok 同时返回原始 VID 与 watermark VID，适配器固定下载原始 VID；字段不会发给上游。 |
-| 音频生成 | `generate_audio` | 无 | Seedance 2.0 在页面中标注 `Includes audio`，但没有开关；是否包含音频由模型决定，该字段不能启用或禁用音频。R2V 仍可上传参考音频。 |
-| 提示词增强 | 无 | 无 | 当前网页请求固定发送 `useEnhancePrompt=false`；适配器没有暴露开关。 |
-| 首尾帧 | `role=first_frame/last_frame` | `input_reference` 仅单图 | 网页支持 First frame only 和 First and last frame；当前适配器只实现单首帧。首尾帧双图请求会返回 HTTP 501。 |
-
-当前实测的三类任务都返回了 `720 × 1280` 的原始视频：T2V 即使请求记录中写入 `ratio=16:9`，以及 I2V/R2V 即使 OpenAI 请求写入 `size=1280x720`，最终仍为竖屏 `720 × 1280`。其中 I2V 输入图是 `1254 × 1254` 方图，也没有改变输出画幅。因此，在 TikTok 网页增加相应控件并确认协议字段之前，应把输出视为固定的竖屏 720p；不要依赖 `ratio`、`resolution` 或 `size` 改变结果。
-
-分辨率/画幅兼容字段仍会出现在任务响应中，它们表示调用方提交的记录值，不代表实际 MP4 尺寸。下载端点优先返回 TikTok 的 original video（本轮实测为 `720 × 1280`），而不是 360p/480p/540p 转码版本。
-
-## Seedance 风格调用
-
-```powershell
-$headers = @{ Authorization = "Bearer change-me" }
-$body = @{
-  model = "seedance-2.0"
-  content = @(@{ type = "text"; text = "一颗红球在白色桌面上缓慢滚动，固定镜头" })
-  duration = 5
-} | ConvertTo-Json -Depth 5
-
-$task = Invoke-RestMethod `
-  -Method Post `
-  -Uri http://127.0.0.1:8765/api/v3/contents/generations/tasks `
-  -Headers $headers `
-  -ContentType application/json `
-  -Body $body
-
-Invoke-RestMethod `
-  -Uri "http://127.0.0.1:8765/api/v3/contents/generations/tasks/$($task.id)" `
-  -Headers $headers
-```
-
-成功状态为 `succeeded`，视频地址位于 `content.video_url`。
-
-图生视频在 `content` 中增加一个 `image_url` 项。URL 必须是公网 HTTP(S) 图片，也可使用 `data:image/...;base64,...`：
-
-```json
-{
-  "model": "seedance-2.0",
-  "content": [
-    {"type": "text", "text": "The blue cube slowly rotates"},
-    {"type": "image_url", "image_url": {"url": "https://example.com/cube.png"}}
-  ],
-  "duration": 5
-}
-```
-
-Reference to video 使用 Seedance 多模态 `content`。图片角色为 `reference_image`，视频角色为 `reference_video`，音频角色为 `reference_audio`：
-
-```json
-{
-  "model": "seedance-2.0",
-  "content": [
-    {"type": "text", "text": "Use Image 1 and Image 2 as subjects, follow Video 1, and use Audio 1."},
-    {"type": "image_url", "image_url": {"url": "https://example.com/cube.png"}, "role": "reference_image"},
-    {"type": "image_url", "image_url": {"url": "https://example.com/sphere.png"}, "role": "reference_image"},
-    {"type": "video_url", "video_url": {"url": "https://example.com/motion.mp4"}, "role": "reference_video"},
-    {"type": "audio_url", "audio_url": {"url": "https://example.com/tone.wav"}, "role": "reference_audio"}
-  ],
-  "duration": 5
-}
-```
-
-当前按 Seedance 参考输入上限校验：最多 9 张图片、3 个视频、3 段音频；音频不能单独使用，至少还要有一张图片或一个视频。
-
-## OpenAI 兼容调用
-
-原生 HTTP（JSON 与 `multipart/form-data` 都可用）：
-
-```powershell
-$headers = @{ Authorization = "Bearer change-me" }
-$body = @{
-  model = "sora-2"
-  prompt = "A red ball rolls slowly across a clean white tabletop, static camera."
-  seconds = 5
-  size = "720x1280"
-} | ConvertTo-Json
-
-$video = Invoke-RestMethod `
-  -Method Post `
-  -Uri http://127.0.0.1:8765/v1/videos `
-  -Headers $headers `
-  -ContentType application/json `
-  -Body $body
-
-Invoke-RestMethod -Uri "http://127.0.0.1:8765/v1/videos/$($video.id)" -Headers $headers
-Invoke-WebRequest -Uri "http://127.0.0.1:8765/v1/videos/$($video.id)/content" -Headers $headers -OutFile result.mp4
-```
-
-OpenAI multipart 图生视频：
-
-```powershell
-curl.exe -X POST http://127.0.0.1:8765/v1/videos `
-  -H "Authorization: Bearer change-me" `
-  -F "model=sora-2" `
-  -F "prompt=The blue cube slowly rotates" `
-  -F "seconds=5" `
-  -F "size=720x1280" `
-  -F "input_reference=@C:\path\to\cube.png;type=image/png"
-```
-
-OpenAI 官方的 `input_reference` 是单个图片对象。为了在同一路径上暴露 TikTok Reference to video，本项目增加了可重复的 multipart `reference_media` 字段（也可以分别使用 `reference_image`、`reference_video`、`reference_audio`）：
-
-```powershell
-curl.exe -X POST http://127.0.0.1:8765/v1/videos `
-  -H "Authorization: Bearer change-me" `
-  -F "model=sora-2" `
-  -F "prompt=Use Image 1 and Image 2 as subjects, follow Video 1, and use Audio 1." `
-  -F "seconds=5" `
-  -F "reference_media=@C:\path\to\cube.png;type=image/png" `
-  -F "reference_media=@C:\path\to\sphere.png;type=image/png" `
-  -F "reference_media=@C:\path\to\motion.mp4;type=video/mp4" `
-  -F "reference_media=@C:\path\to\tone.wav;type=audio/wav"
-```
-
-JSON 调用可使用扩展字段 `references`，其中元素结构与上面的 Seedance 多模态内容一致。`input_reference` 和 `references/reference_media` 互斥。
-
-支持 JPEG、PNG、WebP、BMP、TIFF、GIF、MP4、MOV、WAV 和 MP3。默认图片上限 30 MiB/4000 万像素，视频上限 200 MiB，音频上限 15 MiB。远程素材会阻止私网和本机地址；视频 data URL 不接受，图片和音频可以使用 data URL。暂存文件会在浏览器任务结束后自动清理。素材模式需要配置 `mode` 为 `browser` 或 `browser_pool`。
-
-OpenAI Python SDK 可以通过自定义 `base_url` 使用创建和查询接口（SDK 版本需包含 Videos 资源）：
+#### Python SDK 调用
 
 ```python
 from openai import OpenAI
 
-client = OpenAI(api_key="change-me", base_url="http://127.0.0.1:8765/v1")
-video = client.videos.create(
-    model="sora-2",
-    prompt="A red ball rolls across a white tabletop.",
-    seconds="5",
-    size="720x1280",
+client = OpenAI(
+    api_key="your-custom-api-key",
+    base_url="http://127.0.0.1:8765/v1",
 )
-print(video.id, video.status)
+
+# 1. 创建文生视频任务
+video = client.videos.create(
+    model="sora-2",  # 或 seedance-2.0
+    prompt="A red ball rolling slowly on a clean white tabletop, static camera.",
+    seconds="5",  # 支持 4-15 秒
+)
+print(f"Task ID: {video.id}, Status: {video.status}")
+
+# 2. 查询任务状态
+status = client.videos.retrieve(video.id)
+print(f"Current Status: {status.status}")
 ```
 
-OpenAI 官方只列出部分固定时长；本适配器为了暴露 Seedance 网页能力，把 `seconds` 扩展为 4–15 的任意整数。`size` 保留用于 OpenAI SDK 兼容，但如上表所述，它当前不会改变 TikTok 输出尺寸。
+#### cURL 调用示例
 
-## 状态映射
+##### 文生视频 (T2V)
 
-| TikTok 任务状态 | Seedance 响应 | OpenAI 响应 |
+```bash
+curl -X POST http://127.0.0.1:8765/v1/videos \
+  -H "Authorization: Bearer your-custom-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "sora-2",
+    "prompt": "一颗红球在白色桌面上缓慢滚动，固定镜头",
+    "seconds": 5
+  }'
+```
+
+##### 图生视频 (I2V - Multipart 上传)
+
+```bash
+curl -X POST http://127.0.0.1:8765/v1/videos \
+  -H "Authorization: Bearer your-custom-api-key" \
+  -F "model=sora-2" \
+  -F "prompt=让小猫转头看向镜头" \
+  -F "seconds=5" \
+  -F "input_reference=@./cat.png;type=image/png"
+```
+
+##### 多模态参考生视频 (R2V - Reference to Video)
+
+```bash
+curl -X POST http://127.0.0.1:8765/v1/videos \
+  -H "Authorization: Bearer your-custom-api-key" \
+  -F "model=sora-2" \
+  -F "prompt=以图1与图2为角色主体，参考视频1的动作运镜，并匹配音频1的节奏" \
+  -F "seconds=5" \
+  -F "reference_media=@./char1.png;type=image/png" \
+  -F "reference_media=@./char2.png;type=image/png" \
+  -F "reference_media=@./motion.mp4;type=video/mp4" \
+  -F "reference_media=@./bgm.mp3;type=audio/mpeg"
+```
+
+##### 状态查询与视频下载
+
+```bash
+# 查询任务状态
+curl http://127.0.0.1:8765/v1/videos/{video_id} \
+  -H "Authorization: Bearer your-custom-api-key"
+
+# 下载原始 MP4 视频
+curl http://127.0.0.1:8765/v1/videos/{video_id}/content \
+  -H "Authorization: Bearer your-custom-api-key" \
+  -o result.mp4
+```
+
+---
+
+### 2. Seedance / ModelArk 风格接口 (`/api/v3/contents/generations/tasks`)
+
+#### 创建任务 (JSON)
+
+```bash
+curl -X POST http://127.0.0.1:8765/api/v3/contents/generations/tasks \
+  -H "Authorization: Bearer your-custom-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "seedance-2.0",
+    "content": [
+      {
+        "type": "text",
+        "text": "以图1与图2为主角，参考视频1动作"
+      },
+      {
+        "type": "image_url",
+        "image_url": { "url": "https://example.com/character1.png" },
+        "role": "reference_image"
+      },
+      {
+        "type": "image_url",
+        "image_url": { "url": "https://example.com/character2.png" },
+        "role": "reference_image"
+      },
+      {
+        "type": "video_url",
+        "video_url": { "url": "https://example.com/dance.mp4" },
+        "role": "reference_video"
+      }
+    ],
+    "duration": 5
+  }'
+```
+
+#### 查询任务
+
+```bash
+curl http://127.0.0.1:8765/api/v3/contents/generations/tasks/{task_id} \
+  -H "Authorization: Bearer your-custom-api-key"
+```
+
+---
+
+## 🖥️ Web 管理控制台
+
+打开浏览器访问 `http://127.0.0.1:8765/admin` 并输入 `SD2API_ADMIN_KEY`：
+
+| 功能模块 | 说明 |
+|---|---|
+| 🎬 **生视频** | 提供可视化的 T2V、单图 I2V、多模态 R2V 任务创建面板，实时查看可用额度与任务状态 |
+| 🏢 **号池管理** | 添加 TikTok Ads 账号、执行登录/登出、扫描 Client/Partner 子账号并勾选加入调度池 |
+| 📊 **视频管理** | 统一管理所有视频任务，支持按状态筛选、自动刷新上游生成进度、预览与下载原始 MP4 |
+| 📝 **系统日志** | 实时查看系统运行、账号登录、会话保活与视频生成的结构化持久日志 |
+| ⚙️ **系统配置** | 在线调整账号池并发限制、任务等待超时、保活周期等运行参数 |
+
+### 账号登录与验证流程
+
+```mermaid
+flowchart LR
+    A[后台添加账号] --> B[Chromium 自动填写账密]
+    B --> C{是否触发验证码?}
+    C -->|图形验证码| D[打开 noVNC 手动完成验证]
+    C -->|邮箱验证码| E[对接 cf_temp_mail 自动接码填入]
+    D --> E
+    E --> F[登录成功: 加密保存会话 & 关闭浏览器]
+    F --> G[后台定时静默保活]
+```
+
+1. **添加账号**：在号池管理面板输入 TikTok Ads 登录邮箱与密码（密码经 Fernet 加密后写入 SQLite，不会明文泄露）。
+2. **自动接码**：配置 `SD2API_TEMP_MAIL_BASE_URL` 后，程序自动对接 [coolqoo/cf_temp_mail](https://github.com/coolqoo/cf_temp_mail) 标准 API（调用 `GET /api/emails?to_address=...`）轮询并填入邮件验证码。
+3. **图形验证码处理 (noVNC)**：若遇到 TikTok 图形滑块或点选验证，系统将标记为 `captcha_required`。管理员只需打开 noVNC 远程桌面（默认端口 `6080`，输入 `NOVNC_PASSWORD` 登录），在弹出的浏览器窗口中**手动拖动滑块/点击完成验证**，系统将自动接管后续流程并关闭 Chromium。
+4. **子账号发现与启用**：登录成功后自动获取全部 Client / Partner 子账号与 Seedance 权限，管理员在面板中为可用子账号开启“加入调度”即可。
+
+---
+
+## 📊 参数与状态映射
+
+### 1. 生成参数说明
+
+| 功能 | Seedance 字段 | OpenAI 字段 | 说明 |
+|---|---|---|---|
+| **模型** | `model` | `model` | 支持 `seedance-2.0`（实测支持）与兼容别名 `sora-2` |
+| **时长** | `duration` | `seconds` | **生效**。支持 `4`～`15` 的任意整数（秒），TikTok 消耗点数等于生成秒数 |
+| **首帧图** | `role=first_frame` | `input_reference` | **生效**。单张首帧图片用于图生视频 |
+| **多素材参考** | `content` 数组 | `reference_media` / `references` | **生效**。支持最多 9 张图片、3 个视频、3 段音频混合输入 |
+| **分辨率/画幅** | `resolution` / `ratio` | `size` | 兼容性字段。TikTok 网页端固定输出 720p 竖屏视频（`720x1280`） |
+| **水印控制** | `watermark` | - | 兼容性字段。程序默认自动下载无水印原始高清视频（Original VID） |
+
+### 2. 任务状态映射
+
+| TikTok 状态 | Seedance 响应状态 | OpenAI 响应状态 | 说明 |
+|---|---|---|---|
+| 等待排队中 | `queued` | `queued` | 任务已提交，等待上游分配 GPU 算力 |
+| 生成 / 渲染中 | `running` | `in_progress` | TikTok 正在生成与渲染视频片段 |
+| 生成成功 | `succeeded` | `completed` | 视频生成完毕，已获取原始视频下载 URL |
+| 生成失败 | `failed` | `failed` | 上游生成失败或超出重试限制 |
+
+---
+
+## ⚙️ 配置说明
+
+### 环境变量 (`.env.docker` / `.env`)
+
+| 环境变量 | 必填 | 默认值 | 说明 |
+|---|---|---|---|
+| `SD2API_API_KEY` | 否 | `change-me` | 调用 `/v1/videos` 与 `/api/v3/...` 视频生成接口的 Bearer 密钥 |
+| `SD2API_ADMIN_KEY` | 否 | `change-me-admin` | 访问 `/admin` Web 控制台与管理接口的管理员密钥 |
+| `SD2API_CREDENTIAL_KEY` | 否 | 随机生成 | 用于加解密保存到 SQLite 的账号凭证密钥 |
+| `NOVNC_PASSWORD` | 否 | `change-me-vnc` | Docker 容器中 noVNC 远程桌面的登录密码 |
+| `SD2API_TEMP_MAIL_BASE_URL` | 否 | - | [coolqoo/cf_temp_mail](https://github.com/coolqoo/cf_temp_mail) 服务地址（支持该 API 标准的任意临时邮箱），用于自动读取验证码 |
+| `SD2API_TEMP_MAIL_API_KEY` | 否 | - | `cf_temp_mail` 服务的 `API_SECRET` |
+
+### 运行配置 (`config.json`)
+
+系统主要运行参数保存在 `config.json`，也可在 Web 控制台的“系统配置”页面在线修改：
+
+| 配置项 | 默认值 | 说明 |
 |---|---|---|
-| 等待 | `queued` | `queued` |
-| 生成或渲染 | `running` | `in_progress` |
-| 生成与渲染都成功，且存在视频 ID | `succeeded` | `completed` |
-| 任一阶段失败 | `failed` | `failed` |
+| `mode` | `browser_pool` | 运行模式，推荐保持 `browser_pool`（纯协议调度 + 按需浏览器登录） |
+| `pool_subaccount_concurrency` | `5` | 单个子账号允许同时并发进行的最大任务数 |
+| `pool_quota_cooldown` | `86400` | 子账号触发每日上限（Quota Limit）后的熔断冷却时间（秒） |
+| `session_keepalive_interval` | `21600` | 会话自动保活周期（默认 6 小时） |
+| `request_timeout` | `60.0` | 上游 HTTP 请求超时时间（秒） |
+| `upload_max_bytes` | `209715200` | 素材上传最大文件限制（200MB） |
 
-TikTok 会分别报告生成状态和渲染状态。本适配器只有在两个阶段都成功并拿到视频 ID 后才报告完成。
+---
 
-## 测试
+## 🛠️ 本地测试
 
-单元测试全部使用模拟上游，不会消耗 TikTok 点数：
+项目包含完整的单元测试，均使用 Mock 上游接口，不会消耗实际 TikTok 点数：
 
-```powershell
+```bash
 pytest
 ```
 
-## Roadmap
+---
 
-- [x] 子账号级并发槽位：默认 5 个活动任务，并按实时负载分配。
-- [x] 单日额度动态熔断：识别上游额度错误，暂停该子账号并自动改投其他账号。
-- [x] TikTok 登录 Cookie 每 6 小时通过持久化 Chromium Profile 主动续期，续期后导出并验证协议会话。
-- [ ] 增加通知设置：覆盖账号登出、需要打码等需要人工处理的事件。
-- [ ] 实现多 Key 策略。
+## 📌 Roadmap
+
+- [x] 多子账号并发调度与槽位管理
+- [x] 上游单日额度（Quota Limit）自动熔断与换号重试
+- [x] 定时无感会话保活与会话凭证加密存储
+- [x] 临时邮箱自动接码与 noVNC 图形打码支持
+- [x] 多 API Key 授权管理支持
+- [ ] 账号掉线、需人工打码等异常事件 Webhook 通知（Telegram / 企业微信 / 飞书）
+
+---
+
+## ⚠️ 免责声明
+
+1. 本项目为开源的非官方逆向适配器，仅供个人学习、技术研究与自动化测试使用。
+2. 请仅将本项目应用于您拥有合法访问权限的 TikTok Ads 账户，并严格遵守 TikTok 的相关服务条款与法律法规。
+3. 作者不对因使用本项目导致的任何账户受限、封禁或数据丢失承担责任。
+4. `sora-2` 仅为兼容 OpenAI SDK 的模型别名，底层实际调用的是账号内的 Dreamina Seedance 2.0 模型。
+
+---
+
+## 📄 开源许可
+
+本项目基于 [MIT License](LICENSE) 开源。
