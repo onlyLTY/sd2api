@@ -2673,9 +2673,9 @@ def test_admin_account_routes_without_starting_browser(
     assert listed.json()["data"][0]["name"] == "primary@example.com"
     assert status.json()["max_parallel"] == 0
     assert dashboard.status_code == 200
-    assert version.json() == {"version": "1.2.0"}
+    assert version.json() == {"version": "1.2.1"}
     assert 'id="appVersion"' in dashboard.text
-    assert 'href="https://github.com/coolqoo/sd2api"' in dashboard.text
+    assert 'href="https://github.com/usdfan/sd2api"' in dashboard.text
     assert "sd2api 控制台" in dashboard.text
     assert all(label in dashboard.text for label in ("生视频", "号池管理", "日志", "视频管理", "系统配置"))
     assert 'name="email_address"' not in dashboard.text

@@ -10,7 +10,7 @@
 [![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.116+-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-CC_BY--NC_4.0-red.svg)](LICENSE)
 
 [✨ 特性一览](#-特性一览) • [🚀 快速开始](#-快速开始) • [📖 API 调用示例](#-api-调用示例) • [🖥️ 管理控制台](#-web-管理控制台) • [⚙️ 配置说明](#-配置说明) • [📊 参数与状态映射](#-参数与状态映射)
 
@@ -55,7 +55,7 @@
 1. **克隆项目并准备配置文件**：
 
    ```bash
-   git clone https://github.com/your-username/sd2api.git
+   git clone https://github.com/usdfan/sd2api.git
    cd sd2api
    cp .env.docker.example .env.docker
    cp config.example.json config.json
@@ -395,6 +395,15 @@ pytest
 
 ---
 
+## 🙏 Acknowledgments
+
+Thanks to the linux.do community for the support.
+
+---
+
 ## 📄 开源许可
 
-本项目基于 [MIT License](LICENSE) 开源。
+本项目遵循 [CC BY-NC 4.0](LICENSE)（知识共享署名-非商业性使用 4.0 国际许可协议）开源：
+
+- ✅ **允许**：个人免费学习、研究、代码修改及非营利性自用部署。
+- ❌ **禁止**：严禁将本项目、其衍生版本或基于本项目搭建的任何服务用于任何**商业盈利、转售、分发收费 API** 等商业化运营行为。
