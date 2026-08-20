@@ -258,6 +258,41 @@ curl http://127.0.0.1:8765/api/v3/contents/generations/tasks/{task_id} \
 | 📝 **系统日志** | 实时查看系统运行、账号登录、会话保活与视频生成的结构化持久日志 |
 | ⚙️ **系统配置** | 在线调整账号池并发限制、任务等待超时、保活周期等运行参数 |
 
+### 控制台预览
+
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <strong>文生视频</strong><br>
+      <img src="docs/images/admin-generate.png" alt="sd2api 文生视频控制台">
+    </td>
+    <td width="50%" align="center">
+      <strong>多模态参考生视频</strong><br>
+      <img src="docs/images/admin-reference.png" alt="sd2api 多模态参考生视频控制台">
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <strong>视频管理</strong><br>
+      <img src="docs/images/admin-videos.png" alt="sd2api 视频任务管理">
+    </td>
+    <td width="50%" align="center">
+      <strong>运行日志</strong><br>
+      <img src="docs/images/admin-logs.png" alt="sd2api 结构化运行日志">
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <strong>最佳生成时段</strong><br>
+      <img src="docs/images/admin-best-time.png" alt="sd2api 最佳生成时段统计">
+    </td>
+    <td width="50%" align="center">
+      <strong>系统配置</strong><br>
+      <img src="docs/images/admin-config.png" alt="sd2api 系统配置管理">
+    </td>
+  </tr>
+</table>
+
 ### 账号登录与验证流程
 
 ```mermaid
