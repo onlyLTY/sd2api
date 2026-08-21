@@ -397,7 +397,7 @@ pytest
 
 ## 🙏 Acknowledgments
 
-Thanks to the linux.do community for the support.
+Thanks to the [linux.do](https://linux.do) community for the support.
 
 ---
 
