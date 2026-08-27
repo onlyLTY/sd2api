@@ -360,6 +360,7 @@ flowchart LR
 | `pool_subaccount_concurrency` | `5` | 单个子账号允许同时并发进行的最大任务数 |
 | `pool_quota_cooldown` | `86400` | 子账号触发每日上限（Quota Limit）后的熔断冷却时间（秒） |
 | `session_keepalive_interval` | `21600` | 会话自动保活周期（默认 6 小时） |
+| `novnc_public_port` | `6080` | 管理端“打开 noVNC”按钮使用的公网端口；端口映射不同时需同步修改 |
 | `request_timeout` | `60.0` | 上游 HTTP 请求超时时间（秒） |
 | `upload_max_bytes` | `209715200` | 素材上传最大文件限制（200MB） |
 
