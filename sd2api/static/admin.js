@@ -109,11 +109,12 @@ const settingsSchema = [
     ["temp_mail_poll_seconds", "邮箱轮询间隔（秒）", "number", { min: 1, max: 30, step: 0.5 }],
     ["temp_mail_timeout", "邮箱验证码超时（秒）", "number", { min: 30, max: 900 }],
   ]},
-  { title: "号池调度", description: "控制全池排队、单子账号并发和每日额度熔断。", fields: [
+  { title: "号池调度", description: "控制全池活动任务、启动并发和每日额度熔断。", fields: [
     ["pool_max_pending", "全池最大活动任务", "number", { min: 1, max: 100000 }],
-    ["pool_subaccount_concurrency", "单子账号并发", "number", { min: 1, max: 20 }],
     ["pool_quota_cooldown", "额度熔断时间（秒）", "number", { min: 300, max: 604800 }],
     ["pool_daily_quota_codes", "每日额度错误码", "text", { placeholder: "多个错误码用逗号分隔" }],
+    ["pool_rate_limit_cooldown", "RPM 限流冷却（秒）", "number", { min: 1, max: 3600 }],
+    ["pool_generation_limit_cooldown", "5 分钟限流冷却（秒）", "number", { min: 1, max: 3600 }],
     ["pool_start_concurrency", "号池启动并发", "number", { min: 1, max: 50 }],
   ]},
   { title: "协议上传", description: "素材上传并发、直传阈值和分片大小，字节数可直接复制。", fields: [
@@ -527,12 +528,14 @@ function renderSubaccounts(account) {
   if (!items.length) return '<div class="table-empty">尚未发现子账号。登录后点击“刷新子账号”获取权限与 Credits。</div>';
   return `<div class="subaccounts"><div class="subaccounts-head"><span>子账号</span><span>Seedance 权限</span><span>余额</span><span>加入调度</span><span>说明</span></div>${items.map((sub) => {
     const canSchedule = sub.seedance_access === true;
-    const switchLabel = sub.quota_blocked ? "额度熔断中" : sub.enabled ? "已加入调度" : canSchedule ? "未加入调度" : "不可加入调度";
+    const switchLabel = sub.quota_blocked ? "额度熔断中" : sub.rate_limited ? "频率冷却中" : sub.enabled ? "已加入调度" : canSchedule ? "未加入调度" : "不可加入调度";
     const note = canSchedule
       ? (sub.quota_blocked
         ? `今日额度受限，暂停至 ${formatUnix(sub.quota_blocked_until)}`
+        : sub.rate_limited
+          ? `TikTok 频率限制，暂停至 ${formatUnix(sub.rate_limited_until)}`
         : sub.enabled
-          ? `运行中 ${sub.active_tasks || 0} / ${sub.concurrency_limit || 5} · 今日已提交 ${sub.tasks_today || 0}`
+          ? `运行中 ${sub.active_tasks || 0} · 今日已提交 ${sub.tasks_today || 0}`
           : "不会接收新任务")
       : "缺少 Seedance 权限";
     const schedulable = canSchedule;
@@ -548,7 +551,7 @@ function renderSubaccounts(account) {
         </span>
         <span class="switch-label">${esc(switchLabel)}</span>
       </label>
-      <div><span class="sub-note ${canSchedule && !sub.quota_blocked ? "" : "denied"}">${esc(note)}</span>${sub.last_error && !sub.quota_blocked ? `<span class="sub-error">${esc(sub.last_error)}</span>` : ""}</div>
+      <div><span class="sub-note ${canSchedule && !sub.quota_blocked && !sub.rate_limited ? "" : "denied"}">${esc(note)}</span>${sub.last_error && !sub.quota_blocked && !sub.rate_limited ? `<span class="sub-error">${esc(sub.last_error)}</span>` : ""}</div>
     </div>`;
   }).join("")}</div>`;
 }

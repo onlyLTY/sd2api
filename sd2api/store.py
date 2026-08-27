@@ -176,6 +176,9 @@ class TaskStore:
                     quota_blocked_until INTEGER,
                     quota_reason TEXT,
                     quota_updated_at INTEGER,
+                    rate_limited_until INTEGER,
+                    rate_limit_reason TEXT,
+                    rate_limit_updated_at INTEGER,
                     PRIMARY KEY (account_id, advertiser_id)
                 )
                 """
@@ -190,6 +193,9 @@ class TaskStore:
                 "quota_blocked_until": "INTEGER",
                 "quota_reason": "TEXT",
                 "quota_updated_at": "INTEGER",
+                "rate_limited_until": "INTEGER",
+                "rate_limit_reason": "TEXT",
+                "rate_limit_updated_at": "INTEGER",
             }
             for name, declaration in subaccount_migrations.items():
                 if name not in subaccount_columns:
@@ -840,6 +846,9 @@ class TaskStore:
             "quota_blocked_until",
             "quota_reason",
             "quota_updated_at",
+            "rate_limited_until",
+            "rate_limit_reason",
+            "rate_limit_updated_at",
         }
         invalid = set(changes) - allowed
         if invalid:

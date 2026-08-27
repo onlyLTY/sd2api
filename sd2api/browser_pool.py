@@ -250,6 +250,17 @@ class BrowserPoolClient:
     async def status(self) -> dict[str, Any]:
         accounts = await self.list_accounts()
         subaccounts = [item for account in accounts for item in account["subaccounts"]]
+        schedulable_subaccounts = [
+            item
+            for account in accounts
+            if (
+                account.get("enabled")
+                and account.get("logged_in")
+                and not account.get("keepalive_active")
+            )
+            for item in account["subaccounts"]
+            if self._subaccount_eligible(item)
+        ]
         return {
             "mode": "browser_pool",
             "accounts": accounts,
@@ -257,29 +268,14 @@ class BrowserPoolClient:
             "logged_in": sum(bool(account.get("logged_in")) for account in accounts),
             "running_jobs": sum(int(account.get("queued", 0)) for account in accounts),
             "queued_jobs": sum(int(account.get("queued", 0)) for account in accounts),
-            "max_parallel": sum(
-                sum(
-                    (
-                        int(item["available_slots"])
-                        if item.get("available_slots") is not None
-                        else max(
-                            0,
-                            self.settings.sd2api_pool_subaccount_concurrency
-                            - self._subaccount_load(
-                                account["id"], item["advertiser_id"]
-                            ),
-                        )
-                    )
-                    for item in account["subaccounts"]
-                    if self._subaccount_eligible(item)
+            "max_parallel": (
+                max(
+                    0,
+                    self.settings.sd2api_pool_max_pending
+                    - self._pool_load(accounts),
                 )
-                if (
-                    account.get("enabled")
-                    and account.get("logged_in")
-                    and not account.get("keepalive_active")
-                )
+                if schedulable_subaccounts
                 else 0
-                for account in accounts
             ),
             "subaccounts": len(subaccounts),
             "enabled_subaccounts": sum(bool(item["enabled"]) for item in subaccounts),
@@ -288,6 +284,9 @@ class BrowserPoolClient:
             ),
             "quota_blocked_subaccounts": sum(
                 bool(item.get("quota_blocked")) for item in subaccounts
+            ),
+            "rate_limited_subaccounts": sum(
+                bool(item.get("rate_limited")) for item in subaccounts
             ),
             "logging_in": sum(
                 account.get("login_state")
@@ -371,7 +370,10 @@ class BrowserPoolClient:
     def _subaccount_eligible(item: dict[str, Any]) -> bool:
         return bool(item.get("enabled")) and item.get("seedance_access") is True and (
             item.get("credits") is None or int(item["credits"]) > 0
-        ) and int(item.get("quota_blocked_until") or 0) <= int(time.time())
+        ) and max(
+            int(item.get("quota_blocked_until") or 0),
+            int(item.get("rate_limited_until") or 0),
+        ) <= int(time.time())
 
     def _subaccount_load(self, account_id: str, advertiser_id: str) -> int:
         stored = len(self.store.active_task_ids(account_id, advertiser_id))
@@ -389,6 +391,19 @@ class BrowserPoolClient:
             if owner == account_id and advertiser_id is None
         )
         return stored + client_only
+
+    def _pool_load(self, statuses: list[dict[str, Any]]) -> int:
+        total = 0
+        for status in statuses:
+            if status.get("session_available"):
+                total += sum(
+                    self._subaccount_load(status["id"], item["advertiser_id"])
+                    for item in status.get("subaccounts", [])
+                )
+                continue
+            worker = self._workers.get(status["id"])
+            total += worker.load if worker is not None else int(status.get("queued") or 0)
+        return total
 
     @staticmethod
     def _today_start() -> int:
@@ -422,6 +437,63 @@ class BrowserPoolClient:
             "生成额度",
         )
         return any(marker in text for marker in markers)
+
+    @staticmethod
+    def _rate_limit_cooldown(exc: TikTokUpstreamError, settings: Settings) -> int:
+        text = f"{exc.code} {exc}".lower()
+        if not (
+            "10043101" in text
+            or "10001113" in text
+            or "endpointaccountrpmratelimitexceeded" in text
+            or "requests per minute" in text
+            or "too many requests" in text
+            or ("rpm" in text and ("limit" in text or "exceeded" in text))
+            or "user generation 5min limit" in text
+        ):
+            return 0
+        if (
+            "10001113" in text
+            or "5min limit" in text
+            or "user generation 5min limit" in text
+        ):
+            return settings.sd2api_pool_generation_limit_cooldown
+        return settings.sd2api_pool_rate_limit_cooldown
+
+    @staticmethod
+    def _is_concurrency_full_error(exc: TikTokUpstreamError) -> bool:
+        text = f"{exc.code} {exc}".lower()
+        slot_markers = (
+            "concurrent",
+            "concurrency",
+            "parallel",
+            "simultaneous",
+            "in progress",
+            "processing",
+            "generating",
+            "running",
+            "queue",
+            "queued",
+            "pending",
+            "并发",
+            "生成中",
+            "处理中",
+            "进行中",
+            "排队",
+        )
+        full_markers = (
+            "5 videos",
+            "five videos",
+            "5 tasks",
+            "five tasks",
+            "5条",
+            "5 个",
+            "五条",
+            "full",
+            "满",
+        )
+        return any(marker in text for marker in slot_markers) and any(
+            marker in text for marker in full_markers
+        )
 
     async def _mark_account_session_expired(
         self, account_id: str, exc: TikTokUpstreamError
@@ -467,19 +539,11 @@ class BrowserPoolClient:
             active_tasks = self._subaccount_load(account_id, advertiser_id)
             blocked_until = int(item.get("quota_blocked_until") or 0)
             quota_blocked = blocked_until > now
+            rate_limited_until = int(item.get("rate_limited_until") or 0)
             decorated.update(
                 active_tasks=active_tasks,
-                concurrency_limit=self.settings.sd2api_pool_subaccount_concurrency,
-                available_slots=(
-                    0
-                    if quota_blocked
-                    else max(
-                        0,
-                        self.settings.sd2api_pool_subaccount_concurrency
-                        - active_tasks,
-                    )
-                ),
                 quota_blocked=quota_blocked,
+                rate_limited=rate_limited_until > now,
                 tasks_today=self.store.task_count_since(
                     account_id, advertiser_id, self._today_start()
                 ),
@@ -1133,6 +1197,12 @@ class BrowserPoolClient:
                 status_code=429,
                 code="subaccount_daily_quota_exhausted",
             )
+        if enabled and int(target.get("rate_limited_until") or 0) > int(time.time()):
+            raise TikTokUpstreamError(
+                f"Subaccount {advertiser_id!r} is temporarily rate limited",
+                status_code=429,
+                code="subaccount_rate_limited",
+            )
         updated = self.store.set_subaccount_enabled(account_id, advertiser_id, enabled)
         return updated
 
@@ -1308,6 +1378,18 @@ class BrowserPoolClient:
                         status_code=429,
                         code="subaccount_daily_quota_exhausted",
                     )
+                if selected_subaccounts and all(
+                    max(
+                        int(subaccount.get("quota_blocked_until") or 0),
+                        int(subaccount.get("rate_limited_until") or 0),
+                    ) > int(time.time())
+                    for subaccount in selected_subaccounts
+                ):
+                    raise TikTokUpstreamError(
+                        "All selected subaccounts are temporarily rate limited",
+                        status_code=429,
+                        code="subaccount_rate_limited",
+                    )
                 if online_subaccounts and not any(
                     subaccount.get("seedance_access") is True
                     for subaccount in online_subaccounts
@@ -1339,7 +1421,7 @@ class BrowserPoolClient:
                     )
                 return self._worker(status["id"]).load
 
-            total_pending = sum(pair_load(pair) for pair in eligible)
+            total_pending = self._pool_load(statuses)
             if total_pending >= self.settings.sd2api_pool_max_pending:
                 raise TikTokUpstreamError(
                     "The browser account pool queue is full",
@@ -1347,23 +1429,12 @@ class BrowserPoolClient:
                     code="pool_queue_full",
                 )
 
-            candidates = [
-                pair
-                for pair in eligible
-                if pair_load(pair) < self.settings.sd2api_pool_subaccount_concurrency
-            ]
-            if not candidates:
-                if keepalive_eligible:
-                    raise _KeepalivePending
-                raise TikTokUpstreamError(
-                    "All selected subaccounts are at their concurrency limit",
-                    status_code=429,
-                    code="subaccount_concurrency_full",
-                )
+            candidates = list(eligible)
 
             try:
                 last_authentication_error: TikTokUpstreamError | None = None
                 quota_failures = 0
+                transient_limit_failures = 0
                 preserve_media = False
                 while candidates:
                     selected_account, selected_subaccount = min(
@@ -1430,25 +1501,45 @@ class BrowserPoolClient:
                                 pair for pair in candidates if pair[0]["id"] != account_id
                             ]
                             continue
-                        if not self._is_daily_quota_error(exc):
-                            raise
-                        quota_failures += 1
-                        blocked_until = (
-                            int(time.time())
-                            + self.settings.sd2api_pool_quota_cooldown
-                        )
-                        self.store.update_subaccount(
-                            account_id,
-                            advertiser_id,
-                            quota_blocked_until=blocked_until,
-                            quota_reason=str(exc),
-                            quota_updated_at=int(time.time()),
-                            last_error=str(exc),
-                        )
+                        if self._is_daily_quota_error(exc):
+                            quota_failures += 1
+                            blocked_until = (
+                                int(time.time())
+                                + self.settings.sd2api_pool_quota_cooldown
+                            )
+                            self.store.update_subaccount(
+                                account_id,
+                                advertiser_id,
+                                quota_blocked_until=blocked_until,
+                                quota_reason=str(exc),
+                                quota_updated_at=int(time.time()),
+                                last_error=str(exc),
+                            )
+                            event_message = "Subaccount daily generation quota exhausted"
+                        else:
+                            cooldown = self._rate_limit_cooldown(exc, self.settings)
+                            if cooldown:
+                                transient_limit_failures += 1
+                                blocked_until = int(time.time()) + cooldown
+                                self.store.update_subaccount(
+                                    account_id,
+                                    advertiser_id,
+                                    rate_limited_until=blocked_until,
+                                    rate_limit_reason=str(exc),
+                                    rate_limit_updated_at=int(time.time()),
+                                    last_error=str(exc),
+                                )
+                                event_message = "Subaccount temporarily rate limited"
+                            elif self._is_concurrency_full_error(exc):
+                                transient_limit_failures += 1
+                                blocked_until = None
+                                event_message = "Subaccount upstream concurrency is full"
+                            else:
+                                raise
                         self.store.add_event(
                             level="warning",
                             category="account",
-                            message="Subaccount daily generation quota exhausted",
+                            message=event_message,
                             account_id=account_id,
                             details={
                                 "advertiser_id": advertiser_id,
@@ -1473,11 +1564,24 @@ class BrowserPoolClient:
                             quota_updated_at=None,
                             last_error=None,
                         )
+                    if selected_subaccount.get("rate_limit_reason"):
+                        self.store.update_subaccount(
+                            account_id,
+                            advertiser_id,
+                            rate_limited_until=None,
+                            rate_limit_reason=None,
+                            rate_limit_updated_at=None,
+                            last_error=None,
+                        )
                     return task_id
                 if keepalive_eligible:
                     preserve_media = True
                     raise _KeepalivePending
-                if last_authentication_error is not None and quota_failures == 0:
+                if (
+                    last_authentication_error is not None
+                    and quota_failures == 0
+                    and transient_limit_failures == 0
+                ):
                     raise last_authentication_error
                 if last_authentication_error is not None:
                     raise TikTokUpstreamError(
@@ -1485,6 +1589,12 @@ class BrowserPoolClient:
                         "or their daily generation quota was exhausted",
                         status_code=503,
                         code="account_pool_unavailable",
+                    )
+                if transient_limit_failures:
+                    raise TikTokUpstreamError(
+                        "All selected subaccounts are temporarily limited by TikTok",
+                        status_code=429,
+                        code="subaccount_rate_limited",
                     )
                 raise TikTokUpstreamError(
                     "All selected subaccounts have exhausted their daily generation quota",
