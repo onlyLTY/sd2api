@@ -2221,14 +2221,14 @@ async def test_protocol_pool_balances_concurrency_across_same_login_subaccounts(
     ]
     assert clients["sub-a"].load == clients["sub-b"].load == 2
     status = await pool.status()
-    assert status["max_parallel"] == 6
+    assert status["max_parallel"] == 496
 
 
 @pytest.mark.asyncio
-async def test_protocol_pool_limits_each_subaccount_to_five_active_tasks(
+async def test_protocol_pool_allows_one_subaccount_until_global_limit(
     tmp_path: Path,
 ) -> None:
-    store = TaskStore(str(tmp_path / "five-slots.db"))
+    store = TaskStore(str(tmp_path / "global-limit.db"))
     store.create_account(account_id="login-a", name="Login A")
     store.upsert_subaccounts(
         "login-a",
@@ -2240,20 +2240,10 @@ async def test_protocol_pool_limits_each_subaccount_to_five_active_tasks(
                 "seedance_access": True,
                 "credits": 100,
             },
-            {
-                "advertiser_id": "sub-b",
-                "name": "Sub B",
-                "account_type": "partner",
-                "seedance_access": True,
-                "credits": 100,
-            },
         ],
     )
     store.set_subaccount_enabled("login-a", "sub-a", True)
-    store.set_subaccount_enabled("login-a", "sub-b", True)
-    pool = BrowserPoolClient(
-        Settings(sd2api_pool_subaccount_concurrency=5), store
-    )
+    pool = BrowserPoolClient(Settings(sd2api_pool_max_pending=7), store)
 
     async def fake_list_accounts() -> list[dict[str, Any]]:
         return [
@@ -2278,26 +2268,128 @@ async def test_protocol_pool_limits_each_subaccount_to_five_active_tasks(
             self.load += 1
             return f"{self.advertiser_id}-task-{self.load}"
 
-    clients = {name: FakeProtocol(name) for name in ("sub-a", "sub-b")}
+    clients = {"sub-a": FakeProtocol("sub-a")}
+    pool._protocol_clients = {  # type: ignore[assignment]
+        ("login-a", "sub-a"): clients["sub-a"]
+    }
     pool.list_accounts = fake_list_accounts  # type: ignore[method-assign]
     pool._protocol_client = (  # type: ignore[method-assign]
         lambda _account_id, advertiser_id=None: clients[str(advertiser_id)]
     )
 
     tasks = []
-    for index in range(10):
+    for index in range(7):
         tasks.append(
             await pool.create_text_video(
                 prompt=f"slot-{index}", model="seedance-2.0", duration=5
             )
         )
-    assert clients["sub-a"].load == clients["sub-b"].load == 5
+    assert len(tasks) == 7
+    assert clients["sub-a"].load == 7
     with pytest.raises(TikTokUpstreamError) as error:
         await pool.create_text_video(
             prompt="overflow", model="seedance-2.0", duration=5
         )
     assert error.value.status_code == 429
-    assert error.value.code == "subaccount_concurrency_full"
+    assert error.value.code == "pool_queue_full"
+
+
+@pytest.mark.parametrize(
+    ("upstream_error", "minimum_cooldown"),
+    [
+        (
+            TikTokUpstreamError(
+                "EndpointAccountRpmRateLimitExceeded",
+                status_code=429,
+                code="10043101",
+            ),
+            80,
+        ),
+        (
+            TikTokUpstreamError(
+                "User generation 5min limit",
+                status_code=429,
+                code="10001113",
+            ),
+            290,
+        ),
+        (
+            TikTokUpstreamError(
+                "Concurrent generation full: 5 videos are still processing",
+                status_code=429,
+                code="concurrency_full",
+            ),
+            0,
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_protocol_pool_uses_upstream_limits_to_fail_over_subaccounts(
+    tmp_path: Path,
+    upstream_error: TikTokUpstreamError,
+    minimum_cooldown: int,
+) -> None:
+    store = TaskStore(str(tmp_path / f"response-limit-{minimum_cooldown}.db"))
+    for account_id, advertiser_id in (("a", "sub-a"), ("b", "sub-b")):
+        store.create_account(account_id=account_id, name=account_id)
+        store.upsert_subaccounts(
+            account_id,
+            [{
+                "advertiser_id": advertiser_id,
+                "name": advertiser_id,
+                "account_type": "partner",
+                "seedance_access": True,
+                "credits": 100,
+            }],
+        )
+        store.set_subaccount_enabled(account_id, advertiser_id, True)
+    pool = BrowserPoolClient(Settings(), store)
+
+    async def fake_list_accounts() -> list[dict[str, Any]]:
+        return [
+            {
+                "id": account_id,
+                "enabled": True,
+                "running": True,
+                "logged_in": True,
+                "session_available": True,
+                "subaccounts": pool._decorate_subaccounts(
+                    account_id, store.list_subaccounts(account_id)
+                ),
+            }
+            for account_id in ("a", "b")
+        ]
+
+    class LimitedClient:
+        load = 0
+
+        async def create_text_video(self, **kwargs: Any) -> str:
+            raise upstream_error
+
+    class HealthyClient:
+        load = 0
+
+        async def create_text_video(self, **kwargs: Any) -> str:
+            self.load += 1
+            return "healthy-task"
+
+    clients = {"sub-a": LimitedClient(), "sub-b": HealthyClient()}
+    pool.list_accounts = fake_list_accounts  # type: ignore[method-assign]
+    pool._protocol_client = (  # type: ignore[method-assign]
+        lambda _account_id, advertiser_id=None: clients[str(advertiser_id)]
+    )
+
+    assert await pool.create_text_video(
+        prompt="response-driven failover", model="seedance-2.0", duration=5
+    ) == "healthy-task"
+    limited = store.list_subaccounts("a")[0]
+    remaining = int(limited.get("rate_limited_until") or 0) - int(time.time())
+    if minimum_cooldown:
+        assert remaining >= minimum_cooldown
+        assert limited["rate_limit_reason"] == str(upstream_error)
+    else:
+        assert limited["rate_limited_until"] is None
+        assert limited["rate_limit_reason"] is None
 
 
 @pytest.mark.asyncio
@@ -2825,7 +2917,7 @@ def test_runtime_config_file_round_trip_and_admin_update(
         database=str(tmp_path / "runtime.db"),
         browser_profile=str(tmp_path / "profiles"),
         upload_dir=str(tmp_path / "uploads"),
-        pool_subaccount_concurrency=5,
+        pool_max_pending=500,
     )
     save_runtime_config(original, path)
     loaded, source = load_runtime_config(path)
@@ -2841,14 +2933,14 @@ def test_runtime_config_file_round_trip_and_admin_update(
 
     read = api.get("/admin/config", headers=headers)
     assert read.status_code == 200
-    assert read.json()["config"]["pool_subaccount_concurrency"] == 5
+    assert read.json()["config"]["pool_max_pending"] == 500
     assert read.json()["config"]["novnc_public_port"] == 6080
     assert "temp_mail_base_url" not in read.json()["config"]
     assert "auto_accept_terms" not in read.json()["config"]
     assert "sd2api_api_key" not in read.text
     updated = original.model_copy(
         update={
-            "pool_subaccount_concurrency": 7,
+            "pool_max_pending": 700,
             "temp_mail_poll_seconds": 4.0,
         }
     )
@@ -2858,13 +2950,13 @@ def test_runtime_config_file_round_trip_and_admin_update(
     assert response.status_code == 200
     assert response.json()["restart_required"] is False
     assert set(response.json()["changed"]) == {
-        "pool_subaccount_concurrency",
+        "pool_max_pending",
         "temp_mail_poll_seconds",
     }
     persisted, _ = load_runtime_config(path)
-    assert persisted.pool_subaccount_concurrency == 7
+    assert persisted.pool_max_pending == 700
     assert persisted.temp_mail_poll_seconds == 4.0
-    assert main.settings.sd2api_pool_subaccount_concurrency == 7
+    assert main.settings.sd2api_pool_max_pending == 700
     main.settings.replace_runtime(previous_runtime, source=previous_source)
 
 
@@ -2941,7 +3033,7 @@ def test_runtime_config_migrates_old_dotenv_when_file_is_missing(
     config, source = load_runtime_config(tmp_path / "missing.json")
     assert source == "legacy_env"
     assert config.mode == "browser"
-    assert config.pool_subaccount_concurrency == 8
+    assert "pool_subaccount_concurrency" not in config.model_dump()
 
 
 def test_temp_mail_base_url_is_loaded_from_environment(
