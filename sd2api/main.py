@@ -801,6 +801,7 @@ async def admin_config_status() -> dict[str, Any]:
         "login_timeout": settings.sd2api_login_timeout,
         "relogin_interval": settings.sd2api_relogin_interval,
         "session_keepalive_interval": settings.sd2api_session_keepalive_interval,
+        "novnc_public_port": settings.sd2api_novnc_public_port,
         "protocol_transport": "curl_cffi/chrome",
         "protocol_upload_concurrency": settings.sd2api_protocol_upload_concurrency,
         "subaccount_concurrency": settings.sd2api_pool_subaccount_concurrency,

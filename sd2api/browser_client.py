@@ -456,7 +456,10 @@ class BrowserTikTokClient:
         """
         context = self._context
         page = self._require_page()
-        if context is None or not await self._is_logged_in(page):
+        if context is None or not (
+            await self._is_logged_in(page)
+            or await self._has_auth_session_cookie(context)
+        ):
             raise TikTokUpstreamError(
                 "TikTok Ads must be logged in before exporting the protocol session",
                 status_code=401,
@@ -913,7 +916,7 @@ class BrowserTikTokClient:
                     )
                     await self.start()
                     page = self._require_page()
-                    if await self._is_logged_in(page):
+                    if await self._has_browser_login_candidate(page):
                         self._last_login_at = int(time.time())
                         self._set_login_state("logged_in")
                         return await self.status()
@@ -922,7 +925,7 @@ class BrowserTikTokClient:
                     # a moment after domcontentloaded. Avoid mistaking that
                     # transition for a logged-out page.
                     await page.wait_for_timeout(2_000)
-                    if await self._is_logged_in(page):
+                    if await self._has_browser_login_candidate(page):
                         self._last_login_at = int(time.time())
                         self._set_login_state("logged_in")
                         return await self.status()
@@ -972,7 +975,7 @@ class BrowserTikTokClient:
                                 timeout=30,
                             )
                         except RuntimeError:
-                            if await self._is_logged_in(page):
+                            if await self._has_browser_login_candidate(page):
                                 self._last_login_at = int(time.time())
                                 self._set_login_state("logged_in")
                                 return await self.status()
@@ -1006,7 +1009,7 @@ class BrowserTikTokClient:
                         await asyncio.sleep(1.0)
                         if page.is_closed() or self._context is None:
                             raise RuntimeError("Chromium was closed during login")
-                        if await self._is_logged_in(page):
+                        if await self._has_browser_login_candidate(page):
                             self._last_login_at = int(time.time())
                             self._set_login_state("logged_in")
                             return await self.status()
@@ -1931,6 +1934,7 @@ class BrowserTikTokClient:
         authenticated_routes = (
             "/creative/creativestudio/image-to-video",
             "/creative/creativestudio/create",
+            "/creative/creativestudio/chat",
         )
         if not any(route in studio_url for route in authenticated_routes):
             return False
@@ -1949,6 +1953,26 @@ class BrowserTikTokClient:
             if await generation_controls.nth(index).is_visible():
                 return True
         return False
+
+    async def _has_auth_session_cookie(
+        self, context: BrowserContext | None = None
+    ) -> bool:
+        browser_context = context or self._context
+        if browser_context is None:
+            return False
+        cookies = await browser_context.cookies([self.settings.tiktok_base_url])
+        return any(
+            str(cookie.get("name") or "") == "sessionid_ads"
+            and bool(str(cookie.get("value") or "").strip())
+            for cookie in cookies
+        )
+
+    async def _has_browser_login_candidate(self, page: Page) -> bool:
+        if await self._is_logged_in(page):
+            return True
+        if any(token in page.url.lower() for token in ("login", "signin")):
+            return False
+        return await self._has_auth_session_cookie()
 
     @staticmethod
     async def _visible_credits(page: Page) -> int | None:

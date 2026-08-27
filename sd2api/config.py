@@ -25,6 +25,7 @@ class RuntimeConfig(BaseModel):
     browser_headless: bool = False
     browser_max_wait: int = Field(default=1800, ge=60, le=7200)
     browser_autostart: bool = False
+    novnc_public_port: int = Field(default=6080, ge=1, le=65535)
     pool_max_pending: int = Field(default=500, ge=1, le=100000)
     pool_subaccount_concurrency: int = Field(default=5, ge=1, le=20)
     pool_quota_cooldown: int = Field(default=86400, ge=300, le=604800)
@@ -72,6 +73,7 @@ LEGACY_ENV_FIELDS = {
     "SD2API_BROWSER_HEADLESS": "browser_headless",
     "SD2API_BROWSER_MAX_WAIT": "browser_max_wait",
     "SD2API_BROWSER_AUTOSTART": "browser_autostart",
+    "SD2API_NOVNC_PUBLIC_PORT": "novnc_public_port",
     "SD2API_POOL_MAX_PENDING": "pool_max_pending",
     "SD2API_POOL_SUBACCOUNT_CONCURRENCY": "pool_subaccount_concurrency",
     "SD2API_POOL_QUOTA_COOLDOWN": "pool_quota_cooldown",

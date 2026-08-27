@@ -100,6 +100,7 @@ const settingsSchema = [
     ["browser_channel", "浏览器 Channel", "text", { placeholder: "Docker/Chromium 留空" }],
     ["browser_headless", "无头浏览器", "boolean"],
     ["browser_autostart", "启动时恢复号池", "boolean"],
+    ["novnc_public_port", "noVNC 公网端口", "number", { min: 1, max: 65535 }],
     ["browser_max_wait", "浏览器最长等待（秒）", "number", { min: 60, max: 7200 }],
     ["auto_login", "自动登录", "boolean"],
     ["login_timeout", "登录超时（秒）", "number", { min: 60, max: 3600 }],
@@ -330,8 +331,18 @@ function navigate(route, updateHash = true) {
   refreshCurrent(false);
 }
 
+function setNovncUrl(port = 6080) {
+  const novncUrl = new URL(location.href);
+  novncUrl.port = String(port);
+  novncUrl.pathname = "/vnc.html";
+  novncUrl.search = "?autoconnect=1&resize=scale";
+  novncUrl.hash = "";
+  $("novnc").href = novncUrl.toString();
+}
+
 function renderConfig(config) {
   if (config.version) $("appVersion").textContent = "v" + config.version;
+  setNovncUrl(config.novnc_public_port || 6080);
   const notes = [];
   if (config.mode !== "browser_pool") notes.push("当前模式不是 browser_pool，号池功能不可用。");
   if (!config.temp_mail_configured) notes.push("尚未配置 cf_temp_mail，邮箱验证码需要手动处理。");
@@ -1169,7 +1180,7 @@ function startPolling() {
 function init() {
   bindEvents();
   initTtohAds();
-  $("novnc").href = `${location.protocol}//${location.hostname}:6080/vnc.html?autoconnect=1&resize=scale`;
+  setNovncUrl();
   setGenerationMode("text");
   updateDuration();
   navigate(currentRoute(), false);

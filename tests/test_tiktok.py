@@ -124,6 +124,37 @@ async def test_new_create_workspace_route_is_logged_in() -> None:
     assert await BrowserTikTokClient._is_logged_in(page) is True  # type: ignore[arg-type]
 
 
+@pytest.mark.asyncio
+async def test_chat_workspace_route_is_logged_in() -> None:
+    page = _LoginStatePage(
+        "https://ads.tiktok.com/creative/creativestudio/chat",
+        generation_visible=True,
+    )
+    assert await BrowserTikTokClient._is_logged_in(page) is True  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_session_cookie_is_a_login_candidate_outside_login_page(
+    tmp_path: Path,
+) -> None:
+    class Context:
+        async def cookies(self, urls):
+            assert urls == ["https://ads.tiktok.com"]
+            return [{"name": "sessionid_ads", "value": "captured-session"}]
+
+    client = BrowserTikTokClient(
+        Settings(sd2api_browser_profile=str(tmp_path / "profile")),
+        account_id="cookie-login",
+    )
+    client._context = Context()  # type: ignore[assignment]
+
+    chat = _LoginStatePage("https://ads.tiktok.com/creative/creativestudio/chat")
+    login = _LoginStatePage("https://ads.tiktok.com/i18n/login")
+
+    assert await client._has_browser_login_candidate(chat) is True  # type: ignore[arg-type]
+    assert await client._has_browser_login_candidate(login) is False  # type: ignore[arg-type]
+
+
 def test_store_round_trip(tmp_path: Path) -> None:
     store = TaskStore(str(tmp_path / "tasks.db"))
     created = store.create(
@@ -456,6 +487,59 @@ async def test_login_detects_manual_success_while_mail_polling(tmp_path: Path) -
     assert result["logged_in"] is True
     assert client._login_state == "logged_in"
     assert mail.cancelled is True
+
+
+@pytest.mark.asyncio
+async def test_pool_validates_protocol_session_after_browser_login(
+    tmp_path: Path,
+) -> None:
+    store = TaskStore(str(tmp_path / "validated-login.db"))
+    pool = BrowserPoolClient(
+        Settings(
+            sd2api_browser_profile=str(tmp_path / "profiles"),
+            sd2api_admin_key="test-admin-key-at-least-16-characters",
+        ),
+        store,
+    )
+    account = await pool.add_account(
+        account_id=None,
+        name=None,
+        username="login@example.com",
+        password="secret-password",
+        start=False,
+    )
+
+    class Worker:
+        stopped = False
+
+        async def login(self, **kwargs):
+            return {"login_state": "logged_in"}
+
+        async def stop(self):
+            self.stopped = True
+
+    worker = Worker()
+    pool._worker = lambda _account_id: worker  # type: ignore[method-assign]
+    validation_flags: list[bool] = []
+
+    async def capture(account_id, browser, *, validate=False, **kwargs):
+        assert account_id == account["id"]
+        assert browser is worker
+        validation_flags.append(validate)
+        return protocol_session()
+
+    async def refresh(account_id, *, check_access=True):
+        assert account_id == account["id"]
+        assert check_access is True
+        return {}
+
+    pool._capture_protocol_session = capture  # type: ignore[method-assign]
+    pool.refresh_subaccounts = refresh  # type: ignore[method-assign]
+
+    await pool._run_login(account["id"])
+
+    assert validation_flags == [True]
+    assert worker.stopped is True
 
 
 @pytest.mark.asyncio
@@ -2758,6 +2842,7 @@ def test_runtime_config_file_round_trip_and_admin_update(
     read = api.get("/admin/config", headers=headers)
     assert read.status_code == 200
     assert read.json()["config"]["pool_subaccount_concurrency"] == 5
+    assert read.json()["config"]["novnc_public_port"] == 6080
     assert "temp_mail_base_url" not in read.json()["config"]
     assert "auto_accept_terms" not in read.json()["config"]
     assert "sd2api_api_key" not in read.text

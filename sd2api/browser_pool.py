@@ -681,7 +681,7 @@ class BrowserPoolClient:
         elif status["logged_in"]:
             try:
                 worker = self._worker(account_id)
-                await self._capture_protocol_session(account_id, worker)
+                await self._capture_protocol_session(account_id, worker, validate=True)
                 await worker.stop()
                 self._workers.pop(account_id, None)
                 await self.refresh_subaccounts(account_id, check_access=True)
@@ -781,7 +781,7 @@ class BrowserPoolClient:
                 last_error=None,
             )
             try:
-                await self._capture_protocol_session(account_id, worker)
+                await self._capture_protocol_session(account_id, worker, validate=True)
                 await worker.stop()
                 self._workers.pop(account_id, None)
                 await self.refresh_subaccounts(account_id, check_access=True)

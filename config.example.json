@@ -9,6 +9,7 @@
   "browser_headless": false,
   "browser_max_wait": 1800,
   "browser_autostart": true,
+  "novnc_public_port": 6080,
   "pool_max_pending": 500,
   "pool_subaccount_concurrency": 5,
   "pool_quota_cooldown": 86400,
