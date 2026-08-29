@@ -32,6 +32,10 @@ STUDIO_URL = (
 IMAGE_STUDIO_URL = "https://ads.tiktok.com/creative/creativestudio/image-to-video"
 ACCOUNT_LIST_PATH = "/CreativeOne/Client/ClientGetAccountList"
 ACCOUNT_INFO_PATH = "/CreativeOne/Client/ClientGetAccountInfo"
+KEEPALIVE_ACCOUNT_INFO_PATHS = {
+    "/passport/web/account/info",
+    ACCOUNT_INFO_PATH.lower(),
+}
 CREDIT_ACCOUNT_PATH = "/CreativeOne/SymphonyPlatform/QueryCreditAccount"
 USER_LEVEL_PATH = "/CreativeOne/SymphonyPlatform/QueryUserLevelDetail"
 MINIAPP_PERMISSION_PATH = (
@@ -397,7 +401,8 @@ class BrowserTikTokClient:
         }
 
         def is_account_info(response: Any) -> bool:
-            return urlparse(response.url).path == "/passport/web/account/info/"
+            path = urlparse(response.url).path.rstrip("/").lower()
+            return path in KEEPALIVE_ACCOUNT_INFO_PATHS
 
         try:
             async with page.expect_response(is_account_info, timeout=90_000) as response_info:
