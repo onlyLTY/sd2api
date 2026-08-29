@@ -596,12 +596,20 @@ async def test_start_reopens_a_closed_browser_page(tmp_path: Path) -> None:
     await client.stop()
 
 
+@pytest.mark.parametrize(
+    "account_info_url",
+    [
+        "https://ads.tiktok.com/passport/web/account/info/",
+        "https://ads.tiktok.com/CreativeOne/Client/ClientGetAccountInfo"
+        "?aid=585599&app_name=creative_aio_client&device_platform=web",
+    ],
+)
 @pytest.mark.asyncio
 async def test_browser_session_keepalive_uses_exact_image_studio_url(
-    tmp_path: Path,
+    tmp_path: Path, account_info_url: str
 ) -> None:
     class Response:
-        url = "https://ads.tiktok.com/passport/web/account/info/"
+        url = account_info_url
         status = 200
 
     class ResponseInfo:
@@ -611,6 +619,9 @@ async def test_browser_session_keepalive_uses_exact_image_studio_url(
     class ExpectResponse:
         def __init__(self, predicate) -> None:
             assert predicate(Response()) is True
+            unrelated = Response()
+            unrelated.url = "https://ads.tiktok.com/CreativeOne/Client/ClientGetAccountList"
+            assert predicate(unrelated) is False
 
         async def __aenter__(self):
             info = ResponseInfo()
