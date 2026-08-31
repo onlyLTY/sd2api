@@ -441,6 +441,21 @@ class BrowserPoolClient:
         return any(marker in text for marker in markers)
 
     @staticmethod
+    def _is_retryable_submission_error(exc: TikTokUpstreamError) -> bool:
+        if exc.code != "50000":
+            return False
+        text = str(exc).lower()
+        return any(
+            marker in text
+            for marker in (
+                "remote or network error",
+                "request timeout",
+                "connect_timeout",
+                "thrift_egress",
+            )
+        )
+
+    @staticmethod
     def _rate_limit_cooldown(exc: TikTokUpstreamError, settings: Settings) -> int:
         text = f"{exc.code} {exc}".lower()
         if not (
@@ -1437,6 +1452,7 @@ class BrowserPoolClient:
                 last_authentication_error: TikTokUpstreamError | None = None
                 quota_failures = 0
                 transient_limit_failures = 0
+                submission_retries = 0
                 preserve_media = False
                 while candidates:
                     selected_account, selected_subaccount = min(
@@ -1496,6 +1512,29 @@ class BrowserPoolClient:
                                 kwargs["advertiser_id"] = advertiser_id
                             task_id = await target.create_text_video(**kwargs)
                     except TikTokUpstreamError as exc:
+                        if (
+                            self._is_retryable_submission_error(exc)
+                            and submission_retries < 2
+                        ):
+                            submission_retries += 1
+                            candidates.append((selected_account, selected_subaccount))
+                            self.store.add_event(
+                                level="warning",
+                                category="video",
+                                message=(
+                                    "Retrying task submission after transient upstream error"
+                                ),
+                                account_id=account_id,
+                                details={
+                                    "advertiser_id": advertiser_id,
+                                    "retry": submission_retries,
+                                    "max_retries": 2,
+                                    "upstream_code": exc.code,
+                                    "upstream_message": str(exc),
+                                },
+                            )
+                            await asyncio.sleep(0.5 * submission_retries)
+                            continue
                         if is_tiktok_authentication_error(exc):
                             last_authentication_error = exc
                             await self._mark_account_session_expired(account_id, exc)
