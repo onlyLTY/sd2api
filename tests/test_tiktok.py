@@ -2478,6 +2478,78 @@ async def test_pool_fails_over_when_subaccount_hits_daily_quota(
 
 
 @pytest.mark.asyncio
+async def test_pool_retries_transient_submission_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = TaskStore(str(tmp_path / "submission-retry.db"))
+    store.create_account(account_id="a", name="a")
+    store.upsert_subaccounts(
+        "a",
+        [
+            {
+                "advertiser_id": "sub-a",
+                "name": "sub-a",
+                "account_type": "partner",
+                "seedance_access": True,
+                "credits": 100,
+            }
+        ],
+    )
+    store.set_subaccount_enabled("a", "sub-a", True)
+    pool = BrowserPoolClient(Settings(), store)
+
+    async def fake_list_accounts() -> list[dict[str, Any]]:
+        return [
+            {
+                "id": "a",
+                "enabled": True,
+                "running": True,
+                "logged_in": True,
+                "session_available": True,
+                "subaccounts": pool._decorate_subaccounts(
+                    "a", store.list_subaccounts("a")
+                ),
+            }
+        ]
+
+    class TransientClient:
+        load = 0
+        attempts = 0
+
+        async def create_text_video(self, **kwargs: Any) -> str:
+            self.attempts += 1
+            if self.attempts < 3:
+                raise TikTokUpstreamError(
+                    "biz error: remote or network error[remote]: "
+                    "THRIFT_EGRESS request timeout connect_timeout=50ms",
+                    status_code=502,
+                    code="50000",
+                )
+            return "retried-task"
+
+    async def no_sleep(_delay: float) -> None:
+        return None
+
+    client = TransientClient()
+    pool.list_accounts = fake_list_accounts  # type: ignore[method-assign]
+    pool._protocol_client = (  # type: ignore[method-assign]
+        lambda _account_id, advertiser_id=None: client
+    )
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+
+    assert await pool.create_text_video(
+        prompt="retry timeout", model="seedance-2.0", duration=5
+    ) == "retried-task"
+    assert client.attempts == 3
+    retry_events = [
+        event
+        for event in store.list_events()
+        if event.message == "Retrying task submission after transient upstream error"
+    ]
+    assert len(retry_events) == 2
+
+
+@pytest.mark.asyncio
 async def test_pool_fails_over_to_another_login_when_session_expires(
     tmp_path: Path,
 ) -> None:
