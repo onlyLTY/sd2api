@@ -411,18 +411,20 @@ class BrowserPoolClient:
         return int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
 
     def _is_daily_quota_error(self, exc: TikTokUpstreamError) -> bool:
+        known_codes = {"10040104"}
         configured_codes = {
             item.strip()
             for item in self.settings.sd2api_pool_daily_quota_codes.split(",")
             if item.strip()
         }
-        if exc.code in configured_codes:
+        if exc.code in known_codes or exc.code in configured_codes:
             return True
         text = f"{exc.code} {exc}".lower()
         markers = (
             "daily limit",
             "daily quota",
             "daily generation",
+            "generation day limit",
             "generation limit reached",
             "quota exceeded",
             "maximum number of generations",
