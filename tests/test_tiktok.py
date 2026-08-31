@@ -2445,9 +2445,9 @@ async def test_pool_fails_over_when_subaccount_hits_daily_quota(
 
         async def create_text_video(self, **kwargs: Any) -> str:
             raise TikTokUpstreamError(
-                "Daily generation limit reached",
+                "User Generation Day Limit: limit_level=STRATEGY",
                 status_code=429,
-                code="daily_limit",
+                code="10040104",
             )
 
     class HealthyClient:
@@ -2471,7 +2471,9 @@ async def test_pool_fails_over_when_subaccount_hits_daily_quota(
         item for item in store.list_subaccounts("a") if item["advertiser_id"] == "sub-a"
     )
     assert blocked["quota_blocked_until"] > int(time.time())
-    assert blocked["quota_reason"] == "Daily generation limit reached"
+    assert blocked["quota_reason"] == (
+        "User Generation Day Limit: limit_level=STRATEGY"
+    )
     assert pool.account_for_task(task_id) == "b"
 
 
