@@ -27,7 +27,6 @@ class RuntimeConfig(BaseModel):
     browser_autostart: bool = False
     novnc_public_port: int = Field(default=6080, ge=1, le=65535)
     pool_max_pending: int = Field(default=500, ge=1, le=100000)
-    pool_quota_cooldown: int = Field(default=86400, ge=300, le=604800)
     pool_daily_quota_codes: str = ""
     pool_rate_limit_cooldown: int = Field(default=90, ge=1, le=3600)
     pool_generation_limit_cooldown: int = Field(default=300, ge=1, le=3600)
@@ -76,7 +75,6 @@ LEGACY_ENV_FIELDS = {
     "SD2API_BROWSER_AUTOSTART": "browser_autostart",
     "SD2API_NOVNC_PUBLIC_PORT": "novnc_public_port",
     "SD2API_POOL_MAX_PENDING": "pool_max_pending",
-    "SD2API_POOL_QUOTA_COOLDOWN": "pool_quota_cooldown",
     "SD2API_POOL_DAILY_QUOTA_CODES": "pool_daily_quota_codes",
     "SD2API_POOL_RATE_LIMIT_COOLDOWN": "pool_rate_limit_cooldown",
     "SD2API_POOL_GENERATION_LIMIT_COOLDOWN": "pool_generation_limit_cooldown",

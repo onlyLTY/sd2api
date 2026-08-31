@@ -804,7 +804,6 @@ async def admin_config_status() -> dict[str, Any]:
         "novnc_public_port": settings.sd2api_novnc_public_port,
         "protocol_transport": "curl_cffi/chrome",
         "protocol_upload_concurrency": settings.sd2api_protocol_upload_concurrency,
-        "quota_cooldown": settings.sd2api_pool_quota_cooldown,
         "rate_limit_cooldown": settings.sd2api_pool_rate_limit_cooldown,
         "generation_limit_cooldown": settings.sd2api_pool_generation_limit_cooldown,
         "daily_quota_codes": settings.sd2api_pool_daily_quota_codes,
