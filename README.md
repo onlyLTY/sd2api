@@ -358,7 +358,6 @@ flowchart LR
 |---|---|---|
 | `mode` | `browser_pool` | 运行模式，推荐保持 `browser_pool`（纯协议调度 + 按需浏览器登录） |
 | `pool_max_pending` | `500` | 全池允许同时处于排队或生成中的最大任务数；单个子账号不设本地并发上限 |
-| `pool_quota_cooldown` | `86400` | 子账号触发每日上限（Quota Limit）后的熔断冷却时间（秒） |
 | `pool_rate_limit_cooldown` | `90` | TikTok 返回 RPM/请求频率限制后，该子账号的短时冷却时间（秒） |
 | `pool_generation_limit_cooldown` | `300` | TikTok 返回 5 分钟生成限制后，该子账号的冷却时间（秒） |
 | `session_keepalive_interval` | `21600` | 会话自动保活周期（默认 6 小时） |
@@ -366,7 +365,7 @@ flowchart LR
 | `request_timeout` | `60.0` | 上游 HTTP 请求超时时间（秒） |
 | `upload_max_bytes` | `209715200` | 素材上传最大文件限制（200MB） |
 
-号池不会预设单个子账号能同时运行多少任务。调度器持续按当前负载选择账号，直到 TikTok 返回限制：RPM/请求频率限制会触发短时冷却，5 分钟生成限制会触发对应冷却，上游并发槽满只会让本次请求改试其他子账号。`pool_max_pending` 始终是所有账号合计的本地活动任务上限。
+号池不会预设单个子账号能同时运行多少任务。调度器持续按当前负载选择账号，直到 TikTok 返回限制：每日额度限制会熔断至下一个 UTC 00:00，RPM/请求频率限制会触发短时冷却，5 分钟生成限制会触发对应冷却，上游并发槽满只会让本次请求改试其他子账号。`pool_max_pending` 始终是所有账号合计的本地活动任务上限。
 
 ---
 

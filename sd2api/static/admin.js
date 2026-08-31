@@ -111,7 +111,6 @@ const settingsSchema = [
   ]},
   { title: "号池调度", description: "控制全池活动任务、启动并发和每日额度熔断。", fields: [
     ["pool_max_pending", "全池最大活动任务", "number", { min: 1, max: 100000 }],
-    ["pool_quota_cooldown", "额度熔断时间（秒）", "number", { min: 300, max: 604800 }],
     ["pool_daily_quota_codes", "每日额度错误码", "text", { placeholder: "多个错误码用逗号分隔" }],
     ["pool_rate_limit_cooldown", "RPM 限流冷却（秒）", "number", { min: 1, max: 3600 }],
     ["pool_generation_limit_cooldown", "5 分钟限流冷却（秒）", "number", { min: 1, max: 3600 }],

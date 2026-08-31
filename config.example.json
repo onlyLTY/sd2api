@@ -11,7 +11,6 @@
   "browser_autostart": true,
   "novnc_public_port": 6080,
   "pool_max_pending": 500,
-  "pool_quota_cooldown": 86400,
   "pool_daily_quota_codes": "",
   "pool_rate_limit_cooldown": 90,
   "pool_generation_limit_cooldown": 300,

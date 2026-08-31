@@ -2423,7 +2423,7 @@ async def test_pool_fails_over_when_subaccount_hits_daily_quota(
             ],
         )
         store.set_subaccount_enabled(account_id, advertiser_id, True)
-    pool = BrowserPoolClient(Settings(sd2api_pool_quota_cooldown=600), store)
+    pool = BrowserPoolClient(Settings(), store)
 
     async def fake_list_accounts() -> list[dict[str, Any]]:
         return [
@@ -2470,11 +2470,20 @@ async def test_pool_fails_over_when_subaccount_hits_daily_quota(
     blocked = next(
         item for item in store.list_subaccounts("a") if item["advertiser_id"] == "sub-a"
     )
-    assert blocked["quota_blocked_until"] > int(time.time())
+    remaining = blocked["quota_blocked_until"] - int(time.time())
+    assert 0 < remaining <= 86400
+    assert blocked["quota_blocked_until"] % 86400 == 0
     assert blocked["quota_reason"] == (
         "User Generation Day Limit: limit_level=STRATEGY"
     )
     assert pool.account_for_task(task_id) == "b"
+
+
+def test_daily_pool_boundaries_use_utc_midnight() -> None:
+    assert BrowserPoolClient._utc_today_start(1_756_684_799) == 1_756_598_400
+    assert BrowserPoolClient._utc_today_start(1_756_684_800) == 1_756_684_800
+    assert BrowserPoolClient._next_utc_day_start(1_756_684_799) == 1_756_684_800
+    assert BrowserPoolClient._next_utc_day_start(1_756_684_800) == 1_756_771_200
 
 
 @pytest.mark.asyncio
@@ -2936,6 +2945,9 @@ def test_runtime_config_file_round_trip_and_admin_update(
     loaded, source = load_runtime_config(path)
     assert source == "file"
     assert loaded == original
+    assert "pool_quota_cooldown" not in RuntimeConfig.model_validate(
+        {"pool_quota_cooldown": 86400}
+    ).model_dump()
 
     monkeypatch.setattr(main, "CONFIG_PATH", path)
     previous_runtime, previous_source = main.settings.runtime, main.settings.config_source

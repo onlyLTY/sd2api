@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
 import hashlib
 import json
 from pathlib import Path
@@ -406,9 +405,14 @@ class BrowserPoolClient:
         return total
 
     @staticmethod
-    def _today_start() -> int:
-        now = datetime.now().astimezone()
-        return int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    def _utc_today_start(now: float | None = None) -> int:
+        timestamp = time.time() if now is None else now
+        return (int(timestamp) // 86400) * 86400
+
+    @staticmethod
+    def _next_utc_day_start(now: float | None = None) -> int:
+        timestamp = time.time() if now is None else now
+        return ((int(timestamp) // 86400) + 1) * 86400
 
     def _is_daily_quota_error(self, exc: TikTokUpstreamError) -> bool:
         known_codes = {"10040104"}
@@ -547,7 +551,7 @@ class BrowserPoolClient:
                 quota_blocked=quota_blocked,
                 rate_limited=rate_limited_until > now,
                 tasks_today=self.store.task_count_since(
-                    account_id, advertiser_id, self._today_start()
+                    account_id, advertiser_id, self._utc_today_start()
                 ),
             )
             result.append(decorated)
@@ -1505,10 +1509,7 @@ class BrowserPoolClient:
                             continue
                         if self._is_daily_quota_error(exc):
                             quota_failures += 1
-                            blocked_until = (
-                                int(time.time())
-                                + self.settings.sd2api_pool_quota_cooldown
-                            )
+                            blocked_until = self._next_utc_day_start()
                             self.store.update_subaccount(
                                 account_id,
                                 advertiser_id,
