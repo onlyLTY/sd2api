@@ -2865,29 +2865,6 @@ async def test_protocol_pool_refreshes_subaccount_credits_after_terminal_task(
     assert isinstance(updates["last_checked_at"], int)
 
 
-def test_ttoh_rss_only_returns_current_featured_offers() -> None:
-    from sd2api.main import parse_ttoh_featured_offers
-
-    rss = """<?xml version="1.0"?><rss><channel>
-      <item><title>Current</title><link>https://go.ttoh.app/CURRENT</link><description>Save 50% | Region: SEA | Start: 2026-07-30 | End: 2026-08-10</description><category>Featured</category></item>
-      <item><title>Future</title><link>https://go.ttoh.app/FUTURE</link><description>Later | Region: NA | Start: 2026-08-20 | End: 2026-09-15</description><category>Featured</category></item>
-      <item><title>Expired</title><link>https://go.ttoh.app/OLD</link><description>Old | Region: EU | Start: 2026-07-01 | End: 2026-07-31</description><category>Featured</category></item>
-      <item><title>Evergreen</title><link>https://go.ttoh.app/EVERGREEN</link><description>Always | Region: Global | Start: 2025-01-01</description><category>credit</category></item>
-    </channel></rss>"""
-    now = int(datetime(2026, 8, 6, 12, tzinfo=timezone.utc).timestamp())
-
-    assert parse_ttoh_featured_offers(rss, now) == [
-        {
-            "title": "Current",
-            "description": "Save 50%",
-            "link": "https://go.ttoh.app/CURRENT",
-            "region": "SEA",
-            "start": "2026-07-30",
-            "end": "2026-08-10",
-        }
-    ]
-
-
 def test_admin_account_routes_without_starting_browser(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2959,9 +2936,9 @@ def test_admin_account_routes_without_starting_browser(
     assert "refreshVideos" in script.text
     assert '$("vToday").textContent = summary.today || 0' in script.text
     assert "/admin/version" in script.text
-    assert "sd2api_ttoh_dismissed_date" in script.text
-    assert "dismissTtohAdsToday" in script.text
-    assert "data-ttoh-close" in script.text
+    assert "ttoh" not in dashboard.text.lower()
+    assert "ttoh" not in styles.text.lower()
+    assert "ttoh" not in script.text.lower()
     assert 'class="switch-track"' in script.text
     assert "加入调度" in script.text
     assert "待调度" not in script.text
