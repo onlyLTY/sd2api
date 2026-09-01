@@ -433,17 +433,27 @@ class TaskStore:
             raise RuntimeError("Could not read the event after insertion")
         return self._decode_event(row)
 
-    def task_counts(self) -> dict[str, int]:
+    def task_counts(self, *, created_since: int | None = None) -> dict[str, int]:
         counts = {"total": 0, "queued": 0, "running": 0, "succeeded": 0, "failed": 0}
         with self._lock, self._connect() as connection:
             rows = connection.execute(
                 "SELECT status, COUNT(*) AS count FROM tasks GROUP BY status"
             ).fetchall()
+            recent_row = (
+                connection.execute(
+                    "SELECT COUNT(*) AS count FROM tasks WHERE created_at >= ?",
+                    (created_since,),
+                ).fetchone()
+                if created_since is not None
+                else None
+            )
         for row in rows:
             status = str(row["status"])
             value = int(row["count"])
             counts[status] = value
             counts["total"] += value
+        if recent_row is not None:
+            counts["today"] = int(recent_row["count"])
         return counts
 
     def duration_analytics_rows(
