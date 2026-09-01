@@ -776,6 +776,7 @@ async function refreshAnalytics() {
 
 function renderVideoSummary(summary) {
   $("vTotal").textContent = summary.total || 0;
+  $("vToday").textContent = summary.today || 0;
   $("vActive").textContent = Number(summary.queued || 0) + Number(summary.running || 0);
   $("vSucceeded").textContent = summary.succeeded || 0;
   $("vFailed").textContent = summary.failed || 0;
@@ -815,6 +816,7 @@ async function refreshVideos() {
     status: $("videoStatus").value,
     search: $("videoSearch").value.trim(),
     refresh_pending: $("videoAutoRefresh").checked,
+    timezone_offset: -new Date().getTimezoneOffset(),
   });
   const data = await api(`/admin/tasks?${params}`);
   state.tasks = data.data || [];

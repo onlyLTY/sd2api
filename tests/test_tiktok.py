@@ -181,6 +181,8 @@ def test_store_round_trip(tmp_path: Path) -> None:
         "succeeded": 1,
         "failed": 0,
     }
+    assert store.task_counts(created_since=created.created_at)["today"] == 1
+    assert store.task_counts(created_since=created.created_at + 1)["today"] == 0
 
     event = store.add_event(
         level="success",
@@ -2947,6 +2949,7 @@ def test_admin_account_routes_without_starting_browser(
     assert 'id="appVersion"' in dashboard.text
     assert 'href="https://github.com/usdfan/sd2api"' in dashboard.text
     assert "sd2api 控制台" in dashboard.text
+    assert 'id="vToday"' in dashboard.text
     assert all(label in dashboard.text for label in ("生视频", "号池管理", "日志", "视频管理", "系统配置"))
     assert 'name="email_address"' not in dashboard.text
     assert styles.status_code == 200
@@ -2954,6 +2957,7 @@ def test_admin_account_routes_without_starting_browser(
     assert ".sidebar-foot { margin-top: auto;" in styles.text
     assert script.status_code == 200
     assert "refreshVideos" in script.text
+    assert '$("vToday").textContent = summary.today || 0' in script.text
     assert "/admin/version" in script.text
     assert "sd2api_ttoh_dismissed_date" in script.text
     assert "dismissTtohAdsToday" in script.text
@@ -3239,7 +3243,9 @@ def test_admin_tasks_and_logs_support_pagination(
         "Authorization": f"Bearer {main.settings.sd2api_admin_key or main.settings.sd2api_api_key}"
     }
 
-    tasks = api.get("/admin/tasks?limit=2&page=2", headers=headers)
+    tasks = api.get(
+        "/admin/tasks?limit=2&page=2&timezone_offset=480", headers=headers
+    )
     logs = api.get("/admin/logs?limit=2&page=2", headers=headers)
 
     assert tasks.status_code == 200
@@ -3247,6 +3253,7 @@ def test_admin_tasks_and_logs_support_pagination(
     assert tasks.json()["pagination"] == {
         "page": 2, "page_size": 2, "total": 3
     }
+    assert tasks.json()["summary"]["today"] == 3
     assert logs.status_code == 200
     assert len(logs.json()["data"]) == 1
     assert logs.json()["pagination"] == {

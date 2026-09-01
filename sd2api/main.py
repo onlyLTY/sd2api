@@ -1036,6 +1036,7 @@ async def list_admin_tasks(
     status: Literal["all", "queued", "running", "succeeded", "failed"] = "all",
     search: str | None = Query(default=None, max_length=256),
     refresh_pending: bool = False,
+    timezone_offset: int = Query(default=480, ge=-720, le=840),
 ) -> dict[str, Any]:
     selected_status = None if status == "all" else status
     records = store.list(
@@ -1064,9 +1065,12 @@ async def list_admin_tasks(
             status=selected_status,
             search=search,
         )
+    now = int(time.time())
+    timezone_shift = timezone_offset * 60
+    today_since = now - ((now + timezone_shift) % 86400)
     return {
         "data": [admin_task(record) for record in records],
-        "summary": store.task_counts(),
+        "summary": store.task_counts(created_since=today_since),
         "pagination": {
             "page": page,
             "page_size": limit,
