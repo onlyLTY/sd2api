@@ -2421,9 +2421,16 @@ async def test_protocol_pool_uses_upstream_limits_to_fail_over_subaccounts(
         assert limited["rate_limit_reason"] is None
 
 
+@pytest.mark.parametrize(
+    ("quota_message", "quota_code"),
+    [
+        ("User Generation Day Limit: limit_level=STRATEGY", "10040104"),
+        ("InsufficientCredits", "10044200"),
+    ],
+)
 @pytest.mark.asyncio
 async def test_pool_fails_over_when_subaccount_hits_daily_quota(
-    tmp_path: Path,
+    tmp_path: Path, quota_message: str, quota_code: str
 ) -> None:
     store = TaskStore(str(tmp_path / "quota-failover.db"))
     for account_id, advertiser_id in (("a", "sub-a"), ("b", "sub-b")):
@@ -2463,9 +2470,9 @@ async def test_pool_fails_over_when_subaccount_hits_daily_quota(
 
         async def create_text_video(self, **kwargs: Any) -> str:
             raise TikTokUpstreamError(
-                "User Generation Day Limit: limit_level=STRATEGY",
-                status_code=429,
-                code="10040104",
+                quota_message,
+                status_code=502,
+                code=quota_code,
             )
 
     class HealthyClient:
@@ -2491,9 +2498,8 @@ async def test_pool_fails_over_when_subaccount_hits_daily_quota(
     remaining = blocked["quota_blocked_until"] - int(time.time())
     assert 0 < remaining <= 86400
     assert blocked["quota_blocked_until"] % 86400 == 0
-    assert blocked["quota_reason"] == (
-        "User Generation Day Limit: limit_level=STRATEGY"
-    )
+    assert blocked["quota_reason"] == quota_message
+    assert blocked["credits"] == 100
     assert pool.account_for_task(task_id) == "b"
 
 
