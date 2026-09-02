@@ -620,11 +620,20 @@ class ProtocolTikTokClient:
 
     @staticmethod
     def _parse_credits(payload: dict[str, Any]) -> int | None:
-        value = _deep_find(payload, {"Credits", "credits", "creditBalance", "balance"})
-        try:
-            return int(value) if value is not None else None
-        except (TypeError, ValueError):
-            return None
+        values = (
+            _deep_find(payload, {"Credits", "credits", "creditBalance", "balance"}),
+            _deep_find(payload, {"Bonus", "bonus", "bonusCredits", "bonus_credits"}),
+        )
+        parsed: list[int] = []
+        for value in values:
+            if isinstance(value, bool):
+                continue
+            try:
+                if value is not None:
+                    parsed.append(int(value))
+            except (TypeError, ValueError):
+                continue
+        return sum(parsed) if parsed else None
 
     @staticmethod
     def _seedance2_access(
