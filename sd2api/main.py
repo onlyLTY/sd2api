@@ -95,6 +95,7 @@ app = FastAPI(
     version=__version__,
     description=(
         "TikTok Symphony Seedance adapter with Seedance and OpenAI-compatible video APIs. "
+        "支持 Seedance 2.0、2.5，以及仅用于 Reference to video 的 2.0 Mini 和 Fast。"
         "当前 TikTok 网页协议只有 4–15 秒时长会真实生效；size、ratio、resolution "
         "等兼容字段不会改变上游输出。"
     ),
@@ -109,7 +110,8 @@ SEEDANCE_CREATE_DESCRIPTION = """
 
 | 参数 | 当前行为 |
 |---|---|
-| `duration` | **真实生效**；支持 4–15 秒的任意整数，当前页面显示预计 Credits 与秒数相同。 |
+| `model` | T2V / I2V 支持 `seedance-2.0`、`seedance-2.5`；R2V 还支持 `seedance-2.0-mini`、`seedance-2.0-fast`。 |
+| `duration` | **真实生效**；支持 4–15 秒的任意整数。Credits 按 TikTok 的当前模型定价计算。 |
 | `ratio` / `resolution` | 仅兼容记录和回显，**不会发送给 TikTok**，不能改变实际画幅或分辨率。 |
 | `seed` / `camera_fixed` / `watermark` / `generate_audio` | 仅兼容接收，**不会发送给 TikTok**。 |
 
@@ -123,6 +125,7 @@ OPENAI_CREATE_DESCRIPTION = """
 - `seconds` 是唯一可控的视频规格参数：支持 **4–15 秒**的任意整数。
 - `size` 只为 OpenAI SDK 兼容而保存和回显，**不会发送给 TikTok**；当前实测输出固定为竖屏 `720 × 1280`。
 - `sora-2` 是本服务映射到 Dreamina Seedance 2.0 的兼容别名，并非 OpenAI Sora。
+- T2V / I2V 支持 `seedance-2.0`、`seedance-2.5`；R2V 还支持 `seedance-2.0-mini`、`seedance-2.0-fast`。
 - JSON 的 `input_reference` 或 multipart 的同名文件用于单首帧 I2V。
 - JSON 的 `references` 或 multipart 的 `reference_media` 用于 R2V；最多 9 张图片、3 个视频、3 段音频，且必须至少包含一张图片或一个视频。
 """
@@ -205,7 +208,14 @@ OPENAI_JSON_CREATE_SCHEMA: dict[str, Any] = {
         "model": {
             "type": "string",
             "default": "sora-2",
-            "description": "OpenAI 兼容别名；sora-2 映射到 TikTok Dreamina Seedance 2.0。",
+            "enum": [
+                "sora-2",
+                "seedance-2.0",
+                "seedance-2.5",
+                "seedance-2.0-mini",
+                "seedance-2.0-fast",
+            ],
+            "description": "模型名。Mini 和 Fast 仅支持带 references 的 R2V；sora-2 映射到 Seedance 2.0。",
         },
         "seconds": {
             "type": "integer",
@@ -245,7 +255,18 @@ OPENAI_MULTIPART_CREATE_SCHEMA: dict[str, Any] = {
     "required": ["prompt"],
     "properties": {
         "prompt": {"type": "string", "description": "视频提示词。"},
-        "model": {"type": "string", "default": "sora-2"},
+        "model": {
+            "type": "string",
+            "default": "sora-2",
+            "enum": [
+                "sora-2",
+                "seedance-2.0",
+                "seedance-2.5",
+                "seedance-2.0-mini",
+                "seedance-2.0-fast",
+            ],
+            "description": "Mini 和 Fast 仅支持上传 reference_media 的 R2V。",
+        },
         "seconds": {
             "type": "integer",
             "minimum": 4,
@@ -1118,10 +1139,10 @@ async def create_seedance_video(
                     "duration": 5,
                 },
             },
-            "reference_to_video": {
-                "summary": "多模态参考生视频（R2V）",
+            "reference_to_video_mini": {
+                "summary": "Seedance 2.0 Mini 参考生视频（R2V）",
                 "value": {
-                    "model": "seedance-2.0",
+                    "model": "seedance-2.0-mini",
                     "content": [
                         {"type": "text", "text": "参考图片主体和音频节奏生成视频"},
                         {
@@ -1133,6 +1154,21 @@ async def create_seedance_video(
                             "type": "audio_url",
                             "audio_url": {"url": "https://example.com/reference.mp3"},
                             "role": "reference_audio",
+                        },
+                    ],
+                    "duration": 5,
+                },
+            },
+            "reference_to_video_fast": {
+                "summary": "Seedance 2.0 Fast 参考生视频（R2V）",
+                "value": {
+                    "model": "seedance-2.0-fast",
+                    "content": [
+                        {"type": "text", "text": "参考图片主体生成一段节奏紧凑的视频"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/reference.png"},
+                            "role": "reference_image",
                         },
                     ],
                     "duration": 5,
@@ -1395,10 +1431,10 @@ def validate_reference_media(media: list[StagedMedia]) -> None:
                                 },
                             },
                         },
-                        "reference_to_video": {
-                            "summary": "多模态参考（R2V）",
+                        "reference_to_video_mini": {
+                            "summary": "Seedance 2.0 Mini 多模态参考（R2V）",
                             "value": {
-                                "model": "sora-2",
+                                "model": "seedance-2.0-mini",
                                 "prompt": "参考图片主体和音频节奏生成视频",
                                 "seconds": 5,
                                 "references": [
@@ -1412,6 +1448,21 @@ def validate_reference_media(media: list[StagedMedia]) -> None:
                                         "audio_url": "https://example.com/reference.mp3",
                                         "role": "reference_audio",
                                     },
+                                ],
+                            },
+                        },
+                        "reference_to_video_fast": {
+                            "summary": "Seedance 2.0 Fast 图片参考（R2V）",
+                            "value": {
+                                "model": "seedance-2.0-fast",
+                                "prompt": "参考图片主体生成一段节奏紧凑的视频",
+                                "seconds": 5,
+                                "references": [
+                                    {
+                                        "type": "image_url",
+                                        "image_url": "https://example.com/reference.png",
+                                        "role": "reference_image",
+                                    }
                                 ],
                             },
                         },

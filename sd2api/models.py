@@ -42,6 +42,14 @@ class SeedanceCreateRequest(BaseModel):
     model: str = Field(
         default="seedance-2.0",
         description="Seedance model alias. Seedance 2.0 Mini and Fast are available for reference-to-video only.",
+        json_schema_extra={
+            "examples": [
+                "seedance-2.0",
+                "seedance-2.5",
+                "seedance-2.0-mini",
+                "seedance-2.0-fast",
+            ]
+        },
     )
     content: list[SeedanceContent] = Field(
         description="Text plus optional first-frame or multimodal reference media."
@@ -184,6 +192,15 @@ class OpenAICreateVideoRequest(BaseModel):
     model: str = Field(
         default="sora-2",
         description="TikTok Dreamina Seedance model alias. Mini and Fast are available for reference-to-video only; sora-2 maps to Seedance 2.0 and is not OpenAI Sora.",
+        json_schema_extra={
+            "examples": [
+                "sora-2",
+                "seedance-2.0",
+                "seedance-2.5",
+                "seedance-2.0-mini",
+                "seedance-2.0-fast",
+            ]
+        },
     )
     seconds: int | str = Field(
         default=4,
