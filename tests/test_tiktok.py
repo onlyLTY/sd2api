@@ -1421,6 +1421,97 @@ async def test_protocol_status_two_is_running_until_zero_with_vid() -> None:
     assert result.error_code is None
 
 
+@pytest.mark.asyncio
+async def test_protocol_task_check_retries_http_5xx_three_times(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls <= 3:
+            return httpx.Response(502, json={})
+        return httpx.Response(200, json={"code": 0, "data": {"draft_infos": []}})
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    client = ProtocolTikTokClient(
+        Settings(),
+        protocol_session(),
+        account_id="account-a",
+        advertiser_id="123456789012",
+        transport=httpx.MockTransport(handler),
+    )
+    result = await client.check_task("task-retry")
+    await client.close()
+
+    assert result.status == "queued"
+    assert calls == 4
+    assert sleeps == [0.5, 1.0, 1.5]
+
+
+@pytest.mark.asyncio
+async def test_protocol_task_check_returns_last_5xx_after_three_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(504, json={})
+
+    async def fake_sleep(delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    client = ProtocolTikTokClient(
+        Settings(),
+        protocol_session(),
+        account_id="account-a",
+        advertiser_id="123456789012",
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(TikTokUpstreamError) as error:
+        await client.check_task("task-retry-exhausted")
+    await client.close()
+
+    assert calls == 4
+    assert error.value.status_code == 504
+    assert error.value.code == "tiktok_http_504"
+
+
+@pytest.mark.asyncio
+async def test_protocol_task_check_does_not_retry_business_error() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json={"code": 10001202, "message": "Task rejected"},
+        )
+
+    client = ProtocolTikTokClient(
+        Settings(),
+        protocol_session(),
+        account_id="account-a",
+        advertiser_id="123456789012",
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(TikTokUpstreamError) as error:
+        await client.check_task("task-business-error")
+    await client.close()
+
+    assert calls == 1
+    assert error.value.code == "10001202"
+
+
 def test_protocol_video_url_ignores_empty_preview_and_prefers_original() -> None:
     payload = {
         "previewLink": "",
