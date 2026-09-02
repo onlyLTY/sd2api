@@ -313,8 +313,8 @@ flowchart LR
 
 | 功能 | Seedance 字段 | OpenAI 字段 | 说明 |
 |---|---|---|---|
-| **模型** | `model` | `model` | 支持 `seedance-2.0`（实测支持）与兼容别名 `sora-2` |
-| **时长** | `duration` | `seconds` | **生效**。支持 `4`～`15` 的任意整数（秒），TikTok 消耗点数等于生成秒数 |
+| **模型** | `model` | `model` | 支持 `seedance-2.0`、`seedance-2.5`；参考生视频还支持 `seedance-2.0-mini`、`seedance-2.0-fast`。`sora-2` 是 2.0 的兼容别名 |
+| **时长** | `duration` | `seconds` | **生效**。支持 `4`～`15` 的任意整数（秒），消耗点数按 TikTok 当前模型定价计算 |
 | **首帧图** | `role=first_frame` | `input_reference` | **生效**。单张首帧图片用于图生视频 |
 | **多素材参考** | `content` 数组 | `reference_media` / `references` | **生效**。支持最多 9 张图片、3 个视频、3 段音频混合输入 |
 | **分辨率/画幅** | `resolution` / `ratio` | `size` | 兼容性字段。TikTok 网页端固定输出 720p 竖屏视频（`720x1280`） |

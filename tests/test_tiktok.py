@@ -1798,6 +1798,94 @@ async def test_protocol_mode_specific_model_ids(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "expected_internal"),
+    [
+        ("seedance-2.0-mini", "2000009"),
+        ("seedance-2.0-fast", "2000012"),
+    ],
+)
+async def test_protocol_supports_seedance_2_variants_for_reference_video(
+    tmp_path: Path,
+    model: str,
+    expected_internal: str,
+) -> None:
+    image = tmp_path / "reference.png"
+    image.write_bytes(png_bytes())
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(200, json={"code": 0, "data": {"taskId": "task"}})
+
+    client = ProtocolTikTokClient(
+        Settings(),
+        protocol_session(),
+        account_id="account-a",
+        advertiser_id="123456789012",
+        transport=httpx.MockTransport(handler),
+    )
+
+    async def fake_upload(media: StagedMedia):
+        return type(
+            "Media",
+            (),
+            {
+                "kind": media.kind,
+                "image_url": "https://img/reference",
+                "vid": None,
+                "poster_url": None,
+            },
+        )()
+
+    client.upload_media = fake_upload  # type: ignore[method-assign]
+    await client.create_reference_video(
+        prompt="reference",
+        model=model,
+        duration=5,
+        media=[StagedMedia(kind="image", path=str(image))],
+    )
+    await client.close()
+
+    assert captured["model"] == expected_internal
+    assert json.loads(captured["settings"])["aiModel"] == expected_internal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["text", "image"])
+async def test_protocol_rejects_seedance_2_mini_outside_reference_video(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    client = ProtocolTikTokClient(
+        Settings(),
+        protocol_session(),
+        account_id="account-a",
+        advertiser_id="123456789012",
+        transport=httpx.MockTransport(lambda _: httpx.Response(500)),
+    )
+
+    with pytest.raises(TikTokUpstreamError) as error:
+        if mode == "text":
+            await client.create_text_video(
+                prompt="text", model="seedance-2.0-mini", duration=5
+            )
+        else:
+            image = tmp_path / "first-frame.png"
+            image.write_bytes(png_bytes())
+            await client.create_image_video(
+                prompt="image",
+                model="seedance-2.0-mini",
+                duration=5,
+                image_path=str(image),
+            )
+    await client.close()
+
+    assert error.value.status_code == 400
+    assert error.value.code == "invalid_model"
+
+
+@pytest.mark.asyncio
 async def test_protocol_client_preserves_model_permission_denied_as_403() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

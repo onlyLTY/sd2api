@@ -23,7 +23,9 @@ from curl_cffi.requests.exceptions import RequestException as CurlRequestExcepti
 from .config import Settings
 from .models import UpstreamTask
 from .tiktok import (
+    I2V_MODELS,
     MODEL_PERMISSION_CODES,
+    R2V_MODELS,
     T2V_MODELS,
     TikTokUpstreamError,
     _deep_find,
@@ -61,18 +63,6 @@ VIDEO_SPACE_NAME = "ad_site"
 REFERENCE_IMAGE = 1
 REFERENCE_VIDEO = 2
 REFERENCE_AUDIO = 101
-
-# Creative Studio uses a different internal model family for every workflow,
-# even though all three are exposed to callers as the same Seedance model.
-I2V_MODELS = {
-    alias: "4000008" if internal == "5000007" else "4000005"
-    for alias, internal in T2V_MODELS.items()
-}
-R2V_MODELS = {
-    alias: "2000008" if internal == "5000007" else "2000004"
-    for alias, internal in T2V_MODELS.items()
-}
-
 
 @dataclass(frozen=True, slots=True)
 class ProtocolSession:
