@@ -1931,8 +1931,11 @@ def test_openapi_documents_video_parameters_and_both_openai_body_formats() -> No
     assert set(seedance_operation["requestBody"]["content"]["application/json"]["examples"]) == {
         "text_to_video",
         "image_to_video",
-        "reference_to_video",
+        "reference_to_video_mini",
+        "reference_to_video_fast",
     }
+    assert "seedance-2.0-mini" in seedance_operation["description"]
+    assert "seedance-2.0-fast" in seedance_operation["description"]
 
     openai_operation = schema["paths"]["/v1/videos"]["post"]
     assert openai_operation["summary"] == "创建视频（OpenAI 兼容）"
@@ -1942,13 +1945,21 @@ def test_openapi_documents_video_parameters_and_both_openai_body_formats() -> No
     content = openai_operation["requestBody"]["content"]
     assert set(content) == {"application/json", "multipart/form-data"}
     json_properties = content["application/json"]["schema"]["properties"]
+    assert set(json_properties["model"]["enum"]) == {
+        "sora-2",
+        "seedance-2.0",
+        "seedance-2.5",
+        "seedance-2.0-mini",
+        "seedance-2.0-fast",
+    }
     assert json_properties["seconds"]["minimum"] == 4
     assert json_properties["seconds"]["maximum"] == 15
     assert "不会发送给 TikTok" in json_properties["size"]["description"]
     assert set(content["application/json"]["examples"]) == {
         "text_to_video",
         "image_to_video",
-        "reference_to_video",
+        "reference_to_video_mini",
+        "reference_to_video_fast",
     }
     multipart_properties = content["multipart/form-data"]["schema"]["properties"]
     assert multipart_properties["input_reference"]["format"] == "binary"
