@@ -744,6 +744,14 @@ function setGenerationMode(mode) {
   $$(".mode-button").forEach((button) => button.classList.toggle("active", button.dataset.mode === mode));
   $("imageUploadBlock").classList.toggle("hidden", mode !== "image");
   $("referenceUploadBlock").classList.toggle("hidden", mode !== "reference");
+  const modelSelect = $("generationModel");
+  [...modelSelect.options].forEach((option) => {
+    const unavailable = option.dataset.referenceOnly === "true" && mode !== "reference";
+    option.hidden = unavailable;
+    option.disabled = unavailable;
+  });
+  if (modelSelect.selectedOptions[0]?.disabled) modelSelect.value = "seedance-2.0";
+  updateDuration();
 }
 
 function renderFiles(input, target) {
@@ -754,9 +762,14 @@ function renderFiles(input, target) {
 
 function updateDuration() {
   const seconds = Number($("generationDuration").value);
+  const selectedModel = $("generationModel").selectedOptions[0];
+  const rate = Number(selectedModel?.dataset.creditRate || 1);
+  const credits = seconds * rate;
   $("durationValue").textContent = `${seconds} 秒`;
-  $("creditEstimate").textContent = `${seconds} Credits`;
-  $("generateSubmit").querySelector("small").textContent = `预计 ${seconds} Credits`;
+  $("generationModelBadge").textContent = (selectedModel?.textContent || "Seedance 2.0")
+    .replace("Dreamina ", "").replace(/（.*$/, "");
+  $("creditEstimate").textContent = `${credits} Credits`;
+  $("generateSubmit").querySelector("small").textContent = `预计 ${credits} Credits`;
 }
 
 function validateReferences(files) {
@@ -977,6 +990,7 @@ function bindEvents() {
   $("mobileBackdrop").addEventListener("click", closeMobileMenu);
   $$(".mode-button").forEach((button) => button.addEventListener("click", () => setGenerationMode(button.dataset.mode)));
   $("generationDuration").addEventListener("input", updateDuration);
+  $("generationModel").addEventListener("change", updateDuration);
   $("generationPrompt").addEventListener("input", () => { $("promptCount").textContent = $("generationPrompt").value.length; });
   $("firstFrameInput").addEventListener("change", () => renderFiles($("firstFrameInput"), "firstFramePreview"));
   $("referenceInput").addEventListener("change", () => renderFiles($("referenceInput"), "referencePreview"));

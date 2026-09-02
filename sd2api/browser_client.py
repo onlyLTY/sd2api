@@ -20,7 +20,7 @@ from playwright.async_api import (
 
 from .config import Settings
 from .models import UpstreamTask
-from .tiktok import T2V_MODELS, TikTokUpstreamError
+from .tiktok import I2V_MODELS, R2V_MODELS, T2V_MODELS, TikTokUpstreamError
 from .temp_mail import TempMailClient, TempMailError
 from .uploads import StagedMedia
 
@@ -275,9 +275,14 @@ class BrowserTikTokClient:
         media: list[StagedMedia],
         advertiser_id: str | None,
     ) -> str:
-        if model.lower() not in T2V_MODELS:
+        models = {
+            "text": T2V_MODELS,
+            "image": I2V_MODELS,
+            "reference": R2V_MODELS,
+        }[mode]
+        if model.lower() not in models:
             raise TikTokUpstreamError(
-                f"Unsupported model {model!r}. Browser mode currently supports Seedance aliases only",
+                f"Unsupported model {model!r} for {mode}-to-video",
                 status_code=400,
                 code="invalid_model",
             )
@@ -1451,7 +1456,15 @@ class BrowserTikTokClient:
         )
 
     async def _select_model(self, page: Page, model: str) -> None:
-        target = "Dreamina Seedance 2.5" if "2.5" in model else "Dreamina Seedance 2.0"
+        normalized = model.lower()
+        if "mini" in normalized:
+            target = "Dreamina Seedance 2.0 Mini"
+        elif "fast" in normalized:
+            target = "Dreamina Seedance 2.0 Fast"
+        elif "2.5" in normalized or "2-5" in normalized:
+            target = "Dreamina Seedance 2.5"
+        else:
+            target = "Dreamina Seedance 2.0"
         selectors = page.get_by_role(
             "button", name=re.compile(r"Dreamina Seedance|Video 1\.5", re.I)
         )

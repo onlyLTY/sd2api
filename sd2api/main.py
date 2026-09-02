@@ -438,6 +438,20 @@ def upstream_model_name(model: str) -> str:
         "dreamina-seedance-2-5",
     }:
         return "seedance-2.5"
+    if normalized in {
+        "seedance-2.0-mini",
+        "seedance-2-0-mini",
+        "dreamina-seedance-2.0-mini",
+        "dreamina-seedance-2-0-mini",
+    }:
+        return "seedance-2.0-mini"
+    if normalized in {
+        "seedance-2.0-fast",
+        "seedance-2-0-fast",
+        "dreamina-seedance-2.0-fast",
+        "dreamina-seedance-2-0-fast",
+    }:
+        return "seedance-2.0-fast"
     return model
 
 

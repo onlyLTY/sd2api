@@ -41,7 +41,7 @@ class SeedanceCreateRequest(BaseModel):
 
     model: str = Field(
         default="seedance-2.0",
-        description="Seedance model alias. seedance-2.0 is verified; 2.5 requires upstream account access.",
+        description="Seedance model alias. Seedance 2.0 Mini and Fast are available for reference-to-video only.",
     )
     content: list[SeedanceContent] = Field(
         description="Text plus optional first-frame or multimodal reference media."
@@ -183,7 +183,7 @@ class OpenAICreateVideoRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=32000)
     model: str = Field(
         default="sora-2",
-        description="OpenAI-compatible alias for TikTok Dreamina Seedance 2.0; it is not OpenAI Sora.",
+        description="TikTok Dreamina Seedance model alias. Mini and Fast are available for reference-to-video only; sora-2 maps to Seedance 2.0 and is not OpenAI Sora.",
     )
     seconds: int | str = Field(
         default=4,

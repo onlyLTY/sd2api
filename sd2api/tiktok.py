@@ -22,6 +22,26 @@ T2V_MODELS: dict[str, str] = {
     "dreamina-seedance-2.5": "5000007",
 }
 
+I2V_MODELS: dict[str, str] = {
+    alias: "4000008" if internal == "5000007" else "4000005"
+    for alias, internal in T2V_MODELS.items()
+}
+
+R2V_MODELS: dict[str, str] = {
+    **{
+        alias: "2000008" if internal == "5000007" else "2000004"
+        for alias, internal in T2V_MODELS.items()
+    },
+    "seedance-2.0-mini": "2000009",
+    "seedance-2-0-mini": "2000009",
+    "dreamina-seedance-2.0-mini": "2000009",
+    "dreamina-seedance-2-0-mini": "2000009",
+    "seedance-2.0-fast": "2000012",
+    "seedance-2-0-fast": "2000012",
+    "dreamina-seedance-2.0-fast": "2000012",
+    "dreamina-seedance-2-0-fast": "2000012",
+}
+
 MODEL_PERMISSION_CODES = {"10001100"}
 AUTHENTICATION_ERROR_CODES = {
     "tiktok_authentication_error",

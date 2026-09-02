@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="dark">
   <title>sd2api 控制台</title>
   <link rel="stylesheet" href="/admin/assets/admin.css?v=12">
-  <script defer src="/admin/assets/admin.js?v=12"></script>
+  <script defer src="/admin/assets/admin.js?v=13"></script>
 </head>
 <body>
   <div id="auth" class="auth-screen">
@@ -94,7 +94,7 @@
           <form id="generateForm" class="panel generation-panel">
             <div class="panel-heading">
               <div><p class="eyebrow">NEW GENERATION</p><h2>创建视频</h2></div>
-              <span class="capability-chip">Seedance 2.0</span>
+              <span id="generationModelBadge" class="capability-chip">Seedance 2.0</span>
             </div>
 
             <div class="mode-switch" role="tablist" aria-label="生成模式">
@@ -108,8 +108,10 @@
               <label class="field">
                 <span>模型</span>
                 <select id="generationModel" name="model">
-                  <option value="seedance-2.0">Dreamina Seedance 2.0</option>
-                  <option value="seedance-2.5">Dreamina Seedance 2.5（需账号权限）</option>
+                  <option value="seedance-2.0" data-credit-rate="5">Dreamina Seedance 2.0</option>
+                  <option value="seedance-2.5" data-credit-rate="10">Dreamina Seedance 2.5（需账号权限）</option>
+                  <option value="seedance-2.0-mini" data-credit-rate="2" data-reference-only="true">Dreamina Seedance 2.0 Mini（仅参考生视频）</option>
+                  <option value="seedance-2.0-fast" data-credit-rate="3" data-reference-only="true">Dreamina Seedance 2.0 Fast（仅参考生视频）</option>
                 </select>
               </label>
               <label class="field">
