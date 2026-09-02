@@ -850,13 +850,16 @@ class BrowserTikTokClient:
 
     @staticmethod
     def _parse_credits(payload: dict[str, Any]) -> int | None:
-        value = payload.get("credits")
-        if isinstance(value, bool):
-            return None
-        try:
-            return int(value) if value is not None else None
-        except (TypeError, ValueError):
-            return None
+        parsed: list[int] = []
+        for value in (payload.get("credits"), payload.get("bonus")):
+            if isinstance(value, bool):
+                continue
+            try:
+                if value is not None:
+                    parsed.append(int(value))
+            except (TypeError, ValueError):
+                continue
+        return sum(parsed) if parsed else None
 
     @staticmethod
     def _seedance2_access(

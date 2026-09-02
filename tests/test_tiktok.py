@@ -44,6 +44,22 @@ def wav_bytes() -> bytes:
     return output.getvalue()
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"credits": "210", "bonus": "16000"}, 16210),
+        ({"credits": 575}, 575),
+        ({"credits": "invalid", "bonus": 4000}, 4000),
+        ({"credits": True, "bonus": None}, None),
+    ],
+)
+def test_credit_parsers_include_bonus(
+    payload: dict[str, Any], expected: int | None
+) -> None:
+    assert BrowserTikTokClient._parse_credits(payload) == expected
+    assert ProtocolTikTokClient._parse_credits(payload) == expected
+
+
 def mp4_bytes() -> bytes:
     return b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2"
 
