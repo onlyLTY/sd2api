@@ -46,6 +46,8 @@ T2V_CREATE_PATH = "/creative_bff_i18n/api/cue/t2v/create_generate_task"
 I2V_CREATE_PATH = "/creative_bff_i18n/api/cue/i2v/create_generate_task"
 R2V_CREATE_PATH = "/creative_bff_i18n/api/cue/i2v/gen_r2v_video"
 CHECK_TASK_PATH = "/creative_bff_i18n/api/cue/generate-task/check"
+CHECK_TASK_MAX_RETRIES = 3
+CHECK_TASK_RETRY_DELAY_SECONDS = 0.5
 BIND_VIDEOS_PATH = "/creative_bff_i18n/api/cue/lego/bind_videos"
 VIDEO_INFO_PATH = "/creative_bff_i18n/api/cue/lego/get_video_info"
 ACCOUNT_CONTEXT_COOKIE = "s_aio_client_id"
@@ -805,9 +807,7 @@ class ProtocolTikTokClient:
         return result
 
     async def check_task(self, task_id: str) -> UpstreamTask:
-        payload = await self._request(
-            "POST", CHECK_TASK_PATH, json_body={"taskId": task_id}
-        )
+        payload = await self._check_task_payload(task_id)
         drafts = _deep_find(payload, {"draft_infos", "draftInfos"})
         if not isinstance(drafts, list) or not drafts:
             return UpstreamTask(id=task_id, status="queued", progress=0, raw=payload)
@@ -879,6 +879,24 @@ class ProtocolTikTokClient:
             error_message=str(error_message) if error_message else None,
             raw=payload,
         )
+
+    async def _check_task_payload(self, task_id: str) -> dict[str, Any]:
+        for attempt in range(CHECK_TASK_MAX_RETRIES + 1):
+            try:
+                return await self._request(
+                    "POST", CHECK_TASK_PATH, json_body={"taskId": task_id}
+                )
+            except TikTokUpstreamError as exc:
+                retryable = (
+                    500 <= exc.status_code < 600
+                    and exc.code.startswith("tiktok_http_")
+                )
+                if not retryable or attempt >= CHECK_TASK_MAX_RETRIES:
+                    raise
+                await asyncio.sleep(
+                    CHECK_TASK_RETRY_DELAY_SECONDS * (attempt + 1)
+                )
+        raise RuntimeError("Task status retry loop exited unexpectedly")
 
     async def _video_info(self, vid: str) -> dict[str, Any]:
         try:
