@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import time
 import base64
 import json
@@ -3430,6 +3431,30 @@ def test_runtime_config_file_round_trip_and_admin_update(
     assert persisted.temp_mail_poll_seconds == 4.0
     assert main.settings.sd2api_pool_max_pending == 700
     main.settings.replace_runtime(previous_runtime, source=previous_source)
+
+
+def test_runtime_config_save_falls_back_for_bind_mounted_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sd2api.config import RuntimeConfig, load_runtime_config, save_runtime_config
+
+    path = tmp_path / "config.json"
+    path.write_text("{}\n", encoding="utf-8")
+    original_replace = Path.replace
+
+    def bind_mount_replace(source: Path, target: Path) -> Path:
+        if source == path.with_suffix(".json.tmp"):
+            raise OSError(errno.EBUSY, "Device or resource busy")
+        return original_replace(source, target)
+
+    monkeypatch.setattr(Path, "replace", bind_mount_replace)
+    expected = RuntimeConfig(feishu_instance_name="Mounted instance")
+    save_runtime_config(expected, path)
+
+    loaded, source = load_runtime_config(path)
+    assert source == "file"
+    assert loaded == expected
+    assert not path.with_suffix(".json.tmp").exists()
 
 
 def test_admin_feishu_config_hides_and_preserves_secret_and_can_send_test(
