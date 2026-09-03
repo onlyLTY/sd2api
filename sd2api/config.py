@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 from http.cookies import SimpleCookie
 import json
 import os
@@ -147,11 +148,17 @@ def load_runtime_config(path: Path = CONFIG_PATH) -> tuple[RuntimeConfig, str]:
 def save_runtime_config(config: RuntimeConfig, path: Path = CONFIG_PATH) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(config.model_dump(mode="json"), ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
+    content = json.dumps(config.model_dump(mode="json"), ensure_ascii=False, indent=2) + "\n"
+    temporary.write_text(content, encoding="utf-8")
+    try:
+        temporary.replace(path)
+    except OSError as exc:
+        if exc.errno != errno.EBUSY:
+            raise
+        # Docker cannot replace a file that is itself a bind-mount target.
+        # Writing through the mounted inode keeps online configuration usable.
+        path.write_text(content, encoding="utf-8")
+        temporary.unlink(missing_ok=True)
 
 
 class Settings(BaseSettings):

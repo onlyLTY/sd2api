@@ -152,7 +152,9 @@ async function api(path, options = {}) {
     throw new Error("未授权");
   }
   if (!response.ok) {
-    const detail = typeof data?.detail === "string" ? data.detail : JSON.stringify(data?.detail || data || {});
+    const detail = typeof data?.detail === "string"
+      ? data.detail
+      : (data ? JSON.stringify(data.detail || data) : "");
     throw new Error(data?.error?.message || detail || `HTTP ${response.status}`);
   }
   return data;
