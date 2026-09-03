@@ -17,9 +17,10 @@ from fastapi.responses import FileResponse
 from pydantic import ValidationError
 from starlette.datastructures import UploadFile
 
-from .config import CONFIG_PATH, RuntimeConfig, save_runtime_config, settings
 from .browser_client import BrowserTikTokClient
 from .browser_pool import BrowserPoolClient
+from .config import CONFIG_PATH, RuntimeConfig, save_runtime_config, settings
+from .feishu import FeishuError, FeishuNotifier
 from .models import (
     AccountCreateRequest,
     AccountLoginRequest,
@@ -50,6 +51,13 @@ elif settings.sd2api_mode.lower() == "browser":
     client = BrowserTikTokClient(settings)
 else:
     client = TikTokClient(settings)
+feishu_notifier = FeishuNotifier(settings)
+
+
+def public_runtime_config(config: RuntimeConfig) -> dict[str, Any]:
+    payload = config.model_dump(mode="json")
+    payload["feishu_app_secret"] = ""
+    return payload
 
 
 def audit_event(
@@ -82,9 +90,18 @@ async def lifespan(_: FastAPI):
             await client.start()
         except Exception:
             logger.exception("Could not auto-start the persistent browser")
+    notification_task: asyncio.Task[None] | None = None
+    if isinstance(client, BrowserPoolClient):
+        notification_task = asyncio.create_task(
+            feishu_notifier.run(client.list_accounts),
+            name="sd2api-feishu-notifications",
+        )
     try:
         yield
     finally:
+        if notification_task:
+            notification_task.cancel()
+            await asyncio.gather(notification_task, return_exceptions=True)
         if isinstance(client, (BrowserTikTokClient, BrowserPoolClient)):
             await client.stop()
         audit_event("info", "system", "sd2api 服务已停止")
@@ -754,6 +771,12 @@ async def admin_config_status() -> dict[str, Any]:
         "login_timeout": settings.sd2api_login_timeout,
         "relogin_interval": settings.sd2api_relogin_interval,
         "session_keepalive_interval": settings.sd2api_session_keepalive_interval,
+        "feishu_enabled": settings.sd2api_feishu_enabled,
+        "feishu_configured": bool(
+            settings.sd2api_feishu_app_id
+            and settings.sd2api_feishu_app_secret
+            and settings.sd2api_feishu_receive_id
+        ),
         "novnc_public_port": settings.sd2api_novnc_public_port,
         "protocol_transport": "curl_cffi/chrome",
         "protocol_upload_concurrency": settings.sd2api_protocol_upload_concurrency,
@@ -768,7 +791,8 @@ async def admin_config_status() -> dict[str, Any]:
 @app.get("/admin/config", dependencies=[Depends(require_admin_key)])
 async def admin_runtime_config() -> dict[str, Any]:
     return {
-        "config": settings.runtime.model_dump(mode="json"),
+        "config": public_runtime_config(settings.runtime),
+        "feishu_secret_configured": bool(settings.sd2api_feishu_app_secret),
         "path": str(CONFIG_PATH.resolve()),
         "source": settings.config_source,
         "restart_required": False,
@@ -837,6 +861,8 @@ async def delete_admin_api_key(key_id: str) -> dict[str, Any]:
 @app.put("/admin/config", dependencies=[Depends(require_admin_key)])
 async def update_admin_runtime_config(body: RuntimeConfig) -> dict[str, Any]:
     previous = settings.runtime
+    if not body.feishu_app_secret.strip() and previous.feishu_app_secret:
+        body = body.model_copy(update={"feishu_app_secret": previous.feishu_app_secret})
     save_runtime_config(body, CONFIG_PATH)
     settings.replace_runtime(body)
     changed = sorted(
@@ -870,12 +896,34 @@ async def update_admin_runtime_config(body: RuntimeConfig) -> dict[str, Any]:
         },
     )
     return {
-        "config": body.model_dump(mode="json"),
+        "config": public_runtime_config(body),
+        "feishu_secret_configured": bool(body.feishu_app_secret),
         "path": str(CONFIG_PATH.resolve()),
         "source": "file",
         "changed": changed,
         "restart_required": restart_required,
     }
+
+
+@app.post("/admin/notifications/feishu/test", dependencies=[Depends(require_admin_key)])
+async def test_feishu_notification() -> dict[str, Any]:
+    try:
+        message_id = await feishu_notifier.send_test()
+    except FeishuError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    audit_event("info", "system", "飞书测试消息已发送")
+    return {"sent": True, "message_id": message_id}
+
+
+@app.get("/admin/notifications/feishu/targets", dependencies=[Depends(require_admin_key)])
+async def list_feishu_targets(
+    receive_id_type: Literal["chat_id", "open_id"] = Query(...),
+) -> dict[str, Any]:
+    try:
+        targets = await feishu_notifier.client.list_targets(receive_id_type)
+    except FeishuError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"data": targets, "receive_id_type": receive_id_type}
 
 
 @app.get("/admin/pool/status", dependencies=[Depends(require_admin_key)])
