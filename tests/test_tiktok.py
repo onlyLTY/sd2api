@@ -70,13 +70,33 @@ async def test_feishu_client_lists_contacts_and_sends_message(
                 200,
                 json={"code": 0, "tenant_access_token": "tenant-token", "expire": 7200},
             )
-        if request.url.path.endswith("find_by_department"):
-            assert request.url.params["department_id"] == "0"
+        if request.url.path.endswith("/contact/v3/scopes"):
             return httpx.Response(
                 200,
                 json={
                     "code": 0,
-                    "data": {"items": [{"open_id": "ou_user", "name": "Alice"}]},
+                    "data": {
+                        "user_ids": ["ou_direct"],
+                        "department_ids": ["od_allowed"],
+                    },
+                },
+            )
+        if request.url.path.endswith("find_by_department"):
+            assert request.url.params["department_id"] == "od_allowed"
+            assert request.url.params["department_id_type"] == "open_department_id"
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {"items": [{"open_id": "ou_dept", "name": "Alice"}]},
+                },
+            )
+        if request.url.path.endswith("/contact/v3/users/ou_direct"):
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {"user": {"open_id": "ou_direct", "name": "Bob"}},
                 },
             )
         assert request.headers["Authorization"] == "Bearer tenant-token"
@@ -89,7 +109,10 @@ async def test_feishu_client_lists_contacts_and_sends_message(
         )
 
     feishu = FeishuClient(configured, transport=httpx.MockTransport(handler))
-    assert await feishu.list_targets("open_id") == [{"id": "ou_user", "name": "Alice"}]
+    assert await feishu.list_targets("open_id") == [
+        {"id": "ou_dept", "name": "Alice"},
+        {"id": "ou_direct", "name": "Bob"},
+    ]
     assert await feishu.send_text("Test message") == "om_message"
     assert sum(request.url.path.endswith("tenant_access_token/internal") for request in requests) == 1
 
@@ -121,6 +144,21 @@ async def test_feishu_client_lists_chats_and_reports_business_errors(
     assert await feishu.list_targets("chat_id") == [{"id": "oc_chat", "name": "Ops"}]
     with pytest.raises(FeishuError, match="Bot is not in the chat"):
         await feishu.send_text("Test")
+
+
+def test_feishu_client_preserves_business_error_from_http_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    configured = Settings()
+    feishu = FeishuClient(configured)
+    response = httpx.Response(
+        403,
+        json={"code": 40004, "msg": "no dept authority error"},
+    )
+
+    with pytest.raises(FeishuError, match=r"no dept authority error \(code=40004\)"):
+        feishu._response_payload(response, "读取飞书通讯录失败")
 
 
 @pytest.mark.asyncio
