@@ -1121,7 +1121,7 @@ function startPolling() {
     if (!state.key || !$("auth").classList.contains("hidden")) return;
     if (state.route === "logs" && !$("logAutoRefresh").checked) return;
     if (state.route === "videos" && !$("videoAutoRefresh").checked) return;
-    if (state.route === "analytics") return;
+    if (state.route === "analytics" || state.route === "settings") return;
     refreshCurrent(false);
   }, 5000);
 }
