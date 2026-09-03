@@ -16,7 +16,8 @@ from curl_cffi.requests import AsyncSession as CurlAsyncSession
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from sd2api.config import Settings
+from sd2api.config import RuntimeConfig, Settings, load_runtime_config
+from sd2api.feishu import FeishuClient, FeishuError, FeishuNotifier
 from sd2api.browser_client import (
     BrowserTikTokClient,
     IMAGE_STUDIO_URL,
@@ -46,6 +47,119 @@ def wav_bytes() -> bytes:
         audio.setframerate(16_000)
         audio.writeframes(b"\x00\x00" * 32_000)
     return output.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_feishu_client_lists_contacts_and_sends_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    configured = Settings(
+        sd2api_feishu_app_id="cli_test",
+        sd2api_feishu_app_secret="secret",
+        sd2api_feishu_receive_id_type="open_id",
+        sd2api_feishu_receive_id="ou_user",
+    )
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("tenant_access_token/internal"):
+            return httpx.Response(
+                200,
+                json={"code": 0, "tenant_access_token": "tenant-token", "expire": 7200},
+            )
+        if request.url.path.endswith("find_by_department"):
+            assert request.url.params["department_id"] == "0"
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {"items": [{"open_id": "ou_user", "name": "Alice"}]},
+                },
+            )
+        assert request.headers["Authorization"] == "Bearer tenant-token"
+        body = json.loads(request.content)
+        assert request.url.params["receive_id_type"] == "open_id"
+        assert body["receive_id"] == "ou_user"
+        assert json.loads(body["content"])["text"] == "Test message"
+        return httpx.Response(
+            200, json={"code": 0, "data": {"message_id": "om_message"}}
+        )
+
+    feishu = FeishuClient(configured, transport=httpx.MockTransport(handler))
+    assert await feishu.list_targets("open_id") == [{"id": "ou_user", "name": "Alice"}]
+    assert await feishu.send_text("Test message") == "om_message"
+    assert sum(request.url.path.endswith("tenant_access_token/internal") for request in requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_feishu_client_lists_chats_and_reports_business_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    configured = Settings(
+        sd2api_feishu_app_id="cli_test",
+        sd2api_feishu_app_secret="secret",
+        sd2api_feishu_receive_id="oc_chat",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("tenant_access_token/internal"):
+            return httpx.Response(
+                200, json={"code": 0, "tenant_access_token": "token", "expire": 7200}
+            )
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"items": [{"chat_id": "oc_chat", "name": "Ops"}]}},
+            )
+        return httpx.Response(200, json={"code": 230001, "msg": "Bot is not in the chat"})
+
+    feishu = FeishuClient(configured, transport=httpx.MockTransport(handler))
+    assert await feishu.list_targets("chat_id") == [{"id": "oc_chat", "name": "Ops"}]
+    with pytest.raises(FeishuError, match="Bot is not in the chat"):
+        await feishu.send_text("Test")
+
+
+@pytest.mark.asyncio
+async def test_feishu_notifier_deduplicates_manual_action_until_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    configured = Settings(
+        sd2api_feishu_enabled=True,
+        sd2api_feishu_notify_manual_action=True,
+        sd2api_feishu_instance_name="Instance B",
+        sd2api_feishu_novnc_url="http://example.test:16081/vnc.html",
+    )
+
+    class FakeFeishu:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        async def send_text(self, message: str) -> str:
+            self.messages.append(message)
+            return "om_test"
+
+    fake = FakeFeishu()
+    notifier = FeishuNotifier(configured, feishu_client=fake)  # type: ignore[arg-type]
+    manual = [{
+        "id": "account-1",
+        "enabled": True,
+        "username": "user@example.com",
+        "login_state": "captcha_required",
+        "login_error": "Complete CAPTCHA",
+    }]
+    await notifier.check_accounts(manual)
+    await notifier.check_accounts(manual)
+    assert len(fake.messages) == 1
+    assert "Instance B" in fake.messages[0]
+    assert "16081" in fake.messages[0]
+
+    await notifier.check_accounts([{**manual[0], "login_state": "logged_in", "login_error": None}])
+    await notifier.check_accounts(manual)
+    assert len(fake.messages) == 2
 
 
 @pytest.mark.parametrize(
@@ -3315,6 +3429,50 @@ def test_runtime_config_file_round_trip_and_admin_update(
     assert persisted.pool_max_pending == 700
     assert persisted.temp_mail_poll_seconds == 4.0
     assert main.settings.sd2api_pool_max_pending == 700
+    main.settings.replace_runtime(previous_runtime, source=previous_source)
+
+
+def test_admin_feishu_config_hides_and_preserves_secret_and_can_send_test(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sd2api.main as main
+
+    path = tmp_path / "config.json"
+    original = RuntimeConfig(
+        feishu_app_id="cli_test",
+        feishu_app_secret="very-secret-value",
+        feishu_receive_id_type="chat_id",
+        feishu_receive_id="oc_chat",
+    )
+    previous_runtime, previous_source = main.settings.runtime, main.settings.config_source
+    monkeypatch.setattr(main, "CONFIG_PATH", path)
+    monkeypatch.setattr(main.settings, "sd2api_admin_key", "admin-key")
+    main.settings.replace_runtime(original)
+
+    async def send_test() -> str:
+        return "om_test_message"
+
+    monkeypatch.setattr(main.feishu_notifier, "send_test", send_test)
+    api = TestClient(main.app)
+    headers = {"Authorization": "Bearer admin-key"}
+    read = api.get("/admin/config", headers=headers)
+    assert read.status_code == 200
+    assert read.json()["config"]["feishu_app_secret"] == ""
+    assert read.json()["feishu_secret_configured"] is True
+    assert "very-secret-value" not in read.text
+
+    update = original.model_copy(
+        update={"feishu_app_secret": "", "feishu_instance_name": "Instance A"}
+    )
+    saved = api.put("/admin/config", headers=headers, json=update.model_dump(mode="json"))
+    assert saved.status_code == 200
+    persisted, _ = load_runtime_config(path)
+    assert persisted.feishu_app_secret == "very-secret-value"
+    assert saved.json()["config"]["feishu_app_secret"] == ""
+
+    tested = api.post("/admin/notifications/feishu/test", headers=headers)
+    assert tested.status_code == 200
+    assert tested.json() == {"sent": True, "message_id": "om_test_message"}
     main.settings.replace_runtime(previous_runtime, source=previous_source)
 
 

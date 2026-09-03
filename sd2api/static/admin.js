@@ -81,6 +81,16 @@ const settingsSchema = [
     ["pool_generation_limit_cooldown", "5 分钟限流冷却（秒）", "number", { min: 1, max: 3600 }],
     ["pool_start_concurrency", "号池启动并发", "number", { min: 1, max: 50 }],
   ]},
+  { title: "飞书通知", description: "账号需要验证码、手动接码、重新登录或浏览器恢复时通知个人或群聊。", fields: [
+    ["feishu_enabled", "启用飞书通知", "boolean"],
+    ["feishu_notify_manual_action", "人工操作时通知", "boolean"],
+    ["feishu_app_id", "App ID", "text", { placeholder: "cli_xxxxxxxxxxxxxxxx" }],
+    ["feishu_app_secret", "App Secret", "password", { autocomplete: "new-password" }],
+    ["feishu_receive_id_type", "接收对象类型", "select", [["chat_id", "群聊"], ["open_id", "个人"]]],
+    ["feishu_receive_id", "接收对象", "target"],
+    ["feishu_instance_name", "实例名称", "text", { placeholder: "例如：实例 A" }],
+    ["feishu_novnc_url", "noVNC 地址", "text", { placeholder: "例如：http://服务器:16080/vnc.html" }],
+  ]},
   { title: "协议上传", description: "素材上传并发、直传阈值和分片大小，字节数可直接复制。", fields: [
     ["protocol_upload_concurrency", "上传并发", "number", { min: 1, max: 16 }],
     ["protocol_direct_upload_bytes", "直传阈值（字节）", "number", { min: 262144, max: 67108864 }],
@@ -243,6 +253,9 @@ function settingsFieldMarkup(field, config) {
   if (type === "select") {
     return `<label class="field setting-field"><span>${esc(label)}<small>${esc(name)}</small></span><select name="${esc(name)}">${options.map(([optionValue, optionLabel]) => `<option value="${esc(optionValue)}" ${value === optionValue ? "selected" : ""}>${esc(optionLabel)}</option>`).join("")}</select></label>`;
   }
+  if (type === "target") {
+    return `<label class="field setting-field"><span>${esc(label)}<small>${esc(name)}</small></span><select name="${esc(name)}" data-current-value="${esc(value)}"><option value="${esc(value)}">${value ? "正在读取飞书通讯录…" : "请先保存 App ID 和 App Secret"}</option></select></label>`;
+  }
   const attributes = typeof options === "object" ? Object.entries(options).map(([key, item]) => `${key}="${esc(item)}"`).join(" ") : "";
   return `<label class="field setting-field"><span>${esc(label)}<small>${esc(name)}</small></span><input name="${esc(name)}" type="${type}" value="${esc(value)}" ${attributes}></label>`;
 }
@@ -253,7 +266,33 @@ function renderSettings(data) {
   $("configFilePath").textContent = data.path || "config.json";
   $("configSourceBadge").textContent = ({ file: "配置文件", legacy_env: "旧环境变量兼容", defaults: "内置默认值", explicit: "临时配置" })[data.source] || data.source || "配置文件";
   $("settingsGroups").innerHTML = settingsSchema.map((group) => `<section class="settings-group"><div class="settings-group-heading"><h3>${esc(group.title)}</h3><p>${esc(group.description)}</p></div><div class="settings-grid">${group.fields.map((field) => settingsFieldMarkup(field, config)).join("")}</div></section>`).join("");
+  const secret = $("settingsForm").elements.feishu_app_secret;
+  if (secret && data.feishu_secret_configured) secret.placeholder = "已配置，留空保留原密钥";
+  const targetType = $("settingsForm").elements.feishu_receive_id_type;
+  if (targetType) targetType.addEventListener("change", () => loadFeishuTargets(true));
+  if (data.feishu_secret_configured) loadFeishuTargets(false);
   $("settingsRestartHint").textContent = data.restart_required ? "上次修改包含需重启项目" : "部分路径和运行模式修改保存后需要重启服务";
+}
+
+async function loadFeishuTargets(clearSelection) {
+  const form = $("settingsForm");
+  const type = form.elements.feishu_receive_id_type.value;
+  const select = form.elements.feishu_receive_id;
+  const current = clearSelection ? "" : String(select.dataset.currentValue || select.value || "");
+  select.disabled = true;
+  select.innerHTML = '<option value="">正在读取飞书通讯录…</option>';
+  try {
+    const result = await api(`/admin/notifications/feishu/targets?receive_id_type=${encodeURIComponent(type)}`);
+    const items = result.data || [];
+    select.innerHTML = `<option value="">请选择${type === "chat_id" ? "群聊" : "联系人"}</option>${items.map((item) => `<option value="${esc(item.id)}" ${item.id === current ? "selected" : ""}>${esc(item.name)}</option>`).join("")}`;
+    select.dataset.currentValue = current;
+    if (!items.length) toast("未读取到接收对象", "请确认飞书应用的通讯录或群聊权限", "error");
+  } catch (error) {
+    select.innerHTML = `<option value="${esc(current)}">${current ? "当前已保存对象（通讯录读取失败）" : "通讯录读取失败"}</option>`;
+    toast("读取飞书通讯录失败", error.message, "error");
+  } finally {
+    select.disabled = false;
+  }
 }
 
 function renderApiKeys(items) {
@@ -316,8 +355,7 @@ async function deleteApiKey(id) {
   }
 }
 
-async function saveSettings(event) {
-  event.preventDefault();
+function settingsPayload() {
   const form = new FormData($("settingsForm"));
   const config = {};
   settingsSchema.flatMap((group) => group.fields).forEach(([name, , type]) => {
@@ -325,6 +363,12 @@ async function saveSettings(event) {
     else if (type === "number") config[name] = Number(form.get(name));
     else config[name] = String(form.get(name) ?? "").trim();
   });
+  return config;
+}
+
+async function saveSettings(event) {
+  event.preventDefault();
+  const config = settingsPayload();
   $("settingsError").textContent = "";
   $("settingsSave").disabled = true;
   try {
@@ -336,6 +380,20 @@ async function saveSettings(event) {
     toast("保存失败", error.message, "error");
   } finally {
     $("settingsSave").disabled = false;
+  }
+}
+
+async function testFeishuNotification() {
+  const button = $("feishuTest");
+  button.disabled = true;
+  try {
+    await api("/admin/config", { method: "PUT", body: JSON.stringify(settingsPayload()) });
+    const result = await api("/admin/notifications/feishu/test", { method: "POST" });
+    toast("测试消息已发送", result.message_id || "请检查飞书接收端");
+  } catch (error) {
+    toast("测试发送失败", error.message, "error");
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -1001,6 +1059,7 @@ function bindEvents() {
   $("addAccountButton").addEventListener("click", openAddAccount);
   $("accountForm").addEventListener("submit", saveAccount);
   $("settingsForm").addEventListener("submit", saveSettings);
+  $("feishuTest").addEventListener("click", testFeishuNotification);
   $("apiKeyForm").addEventListener("submit", addApiKey);
   $("apiKeyGenerate").addEventListener("click", () => {
     $("apiKeyForm").elements.key.value = "";
