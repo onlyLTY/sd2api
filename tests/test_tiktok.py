@@ -17,7 +17,11 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from sd2api.config import Settings
-from sd2api.browser_client import BrowserTikTokClient, IMAGE_STUDIO_URL
+from sd2api.browser_client import (
+    BrowserTikTokClient,
+    IMAGE_STUDIO_URL,
+    _clear_stale_chromium_profile_locks,
+)
 from sd2api.browser_pool import BrowserPoolClient
 from sd2api.models import OpenAICreateVideoRequest, SeedanceCreateRequest, UpstreamTask
 from sd2api.protocol import ProtocolSession, ProtocolTikTokClient, _sign_gateway_request
@@ -612,6 +616,70 @@ async def test_start_reopens_a_closed_browser_page(tmp_path: Path) -> None:
     assert isinstance(client._page, OpenPage)
     assert client._page.default_timeout == 30_000
     await client.stop()
+
+
+def test_browser_removes_singleton_locks_from_an_old_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    (profile / "SingletonLock").symlink_to("old-container-3916")
+    (profile / "SingletonCookie").symlink_to("cookie-token")
+    (profile / "SingletonSocket").symlink_to("/tmp/old/SingletonSocket")
+    monkeypatch.setattr("sd2api.browser_client.socket.gethostname", lambda: "new-container")
+    monkeypatch.setattr(
+        "sd2api.browser_client.os.kill",
+        lambda *_args: pytest.fail("a foreign-container PID must not be probed locally"),
+    )
+
+    assert _clear_stale_chromium_profile_locks(profile) is True
+    assert not any(
+        (profile / name).is_symlink()
+        for name in ("SingletonLock", "SingletonCookie", "SingletonSocket")
+    )
+
+
+def test_browser_preserves_singleton_locks_for_a_live_local_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    (profile / "SingletonLock").symlink_to("current-container-4321")
+    (profile / "SingletonCookie").symlink_to("cookie-token")
+    monkeypatch.setattr(
+        "sd2api.browser_client.socket.gethostname", lambda: "current-container"
+    )
+    checked: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        "sd2api.browser_client.os.kill",
+        lambda pid, signal: checked.append((pid, signal)),
+    )
+
+    assert _clear_stale_chromium_profile_locks(profile) is False
+    assert checked == [(4321, 0)]
+    assert (profile / "SingletonLock").is_symlink()
+    assert (profile / "SingletonCookie").is_symlink()
+
+
+def test_browser_removes_singleton_locks_for_a_dead_local_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    (profile / "SingletonLock").symlink_to("current-container-4321")
+    (profile / "SingletonSocket").symlink_to("/tmp/old/SingletonSocket")
+    monkeypatch.setattr(
+        "sd2api.browser_client.socket.gethostname", lambda: "current-container"
+    )
+
+    def missing_process(_pid: int, _signal: int) -> None:
+        raise ProcessLookupError
+
+    monkeypatch.setattr("sd2api.browser_client.os.kill", missing_process)
+
+    assert _clear_stale_chromium_profile_locks(profile) is True
+    assert not (profile / "SingletonLock").is_symlink()
+    assert not (profile / "SingletonSocket").is_symlink()
 
 
 @pytest.mark.parametrize(

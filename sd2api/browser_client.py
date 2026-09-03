@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
+import socket
 import time
 import uuid
 from dataclasses import dataclass
@@ -44,6 +46,38 @@ MINIAPP_PERMISSION_PATH = (
 ACCOUNT_CONTEXT_COOKIE = "s_aio_client_id"
 SEEDANCE2_ALLOWLIST_TOOL = "cue_mini_i2v_seedance_2"
 SEEDANCE2_USER_TIERS = {"T00", "T0", "T1"}
+CHROMIUM_SINGLETON_FILES = ("SingletonLock", "SingletonCookie", "SingletonSocket")
+
+
+def _clear_stale_chromium_profile_locks(profile: Path) -> bool:
+    lock = profile / "SingletonLock"
+    if not lock.is_symlink():
+        return False
+    try:
+        owner, pid_text = os.readlink(lock).rsplit("-", 1)
+        pid = int(pid_text)
+    except (OSError, ValueError):
+        return False
+    if pid <= 1:
+        return False
+
+    if owner == socket.gethostname():
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            return False
+        else:
+            return False
+
+    removed = False
+    for name in CHROMIUM_SINGLETON_FILES:
+        singleton = profile / name
+        if singleton.is_symlink():
+            singleton.unlink(missing_ok=True)
+            removed = True
+    return removed
 
 
 @dataclass(slots=True)
@@ -111,7 +145,9 @@ class BrowserTikTokClient:
             if self._context is None:
                 if self._playwright is None:
                     self._playwright = await async_playwright().start()
-                profile = str(Path(self.profile_path).resolve())
+                profile_path = Path(self.profile_path).resolve()
+                _clear_stale_chromium_profile_locks(profile_path)
+                profile = str(profile_path)
                 context = await self._playwright.chromium.launch_persistent_context(
                     user_data_dir=profile,
                     channel=self.settings.sd2api_browser_channel or None,
