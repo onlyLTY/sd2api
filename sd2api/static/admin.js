@@ -28,6 +28,7 @@ const state = {
   focusTask: null,
   refreshing: false,
   refreshQueued: false,
+  skipVideoPendingRefresh: false,
   timer: null,
 };
 
@@ -755,12 +756,14 @@ function renderTasks(items) {
 }
 
 async function refreshVideos() {
+  const refreshPending = $("videoAutoRefresh").checked && !state.skipVideoPendingRefresh;
+  state.skipVideoPendingRefresh = false;
   const params = query({
     limit: state.videoPageSize,
     page: state.videoPage,
     status: $("videoStatus").value,
     search: $("videoSearch").value.trim(),
-    refresh_pending: $("videoAutoRefresh").checked,
+    refresh_pending: refreshPending,
     timezone_offset: -new Date().getTimezoneOffset(),
   });
   const data = await api(`/admin/tasks?${params}`);
@@ -1098,9 +1101,17 @@ function bindEvents() {
     $$('[data-analytics-range]').forEach((item) => item.classList.toggle("active", item === button));
     refreshCurrent(false);
   }));
-  const refreshVideoFilters = debounce(() => { state.videoPage = 1; refreshCurrent(false); });
+  const refreshVideoFilters = debounce(() => {
+    state.videoPage = 1;
+    state.skipVideoPendingRefresh = true;
+    refreshCurrent(false);
+  });
   $("videoSearch").addEventListener("input", refreshVideoFilters);
-  $("videoStatus").addEventListener("change", () => { state.videoPage = 1; refreshCurrent(false); });
+  $("videoStatus").addEventListener("change", () => {
+    state.videoPage = 1;
+    state.skipVideoPendingRefresh = true;
+    refreshCurrent(false);
+  });
   $("videoAutoRefresh").addEventListener("change", () => refreshCurrent(false));
   document.addEventListener("click", (event) => {
     const button = event.target.closest("[data-pagination-page]");

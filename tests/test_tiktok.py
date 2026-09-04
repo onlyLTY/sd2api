@@ -3375,6 +3375,8 @@ def test_admin_account_routes_without_starting_browser(
     assert '$("vWeek").textContent = summary.week || 0' in script.text
     assert "state.refreshQueued = true" in script.text
     assert "if (state.refreshQueued)" in script.text
+    assert 'refresh_pending: refreshPending' in script.text
+    assert "state.skipVideoPendingRefresh = true" in script.text
     assert "/admin/version" in script.text
     assert "ttoh" not in dashboard.text.lower()
     assert "ttoh" not in styles.text.lower()
