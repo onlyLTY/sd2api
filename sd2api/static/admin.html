@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>sd2api 控制台</title>
-  <link rel="stylesheet" href="/admin/assets/admin.css?v=12">
-  <script defer src="/admin/assets/admin.js?v=16"></script>
+  <link rel="stylesheet" href="/admin/assets/admin.css?v=13">
+  <script defer src="/admin/assets/admin.js?v=17"></script>
 </head>
 <body>
   <div id="auth" class="auth-screen">
@@ -252,6 +252,7 @@
         <div class="metric-grid video-metrics">
           <article class="metric-card"><span>全部任务</span><strong id="vTotal">0</strong><small>本地任务记录</small></article>
           <article class="metric-card accent"><span>今日任务</span><strong id="vToday">0</strong><small>按当前浏览器时区</small></article>
+          <article class="metric-card"><span>本周生成数量</span><strong id="vWeek">0</strong><small>周一至今 · 当前浏览器时区</small></article>
           <article class="metric-card"><span>排队 / 生成</span><strong id="vActive">0</strong><small>自动刷新上游</small></article>
           <article class="metric-card"><span>已完成</span><strong id="vSucceeded">0</strong><small>可下载原始视频</small></article>
           <article class="metric-card"><span>失败</span><strong id="vFailed">0</strong><small>查看上游错误</small></article>
@@ -259,7 +260,7 @@
         <section class="panel filter-panel">
           <div class="filter-row video-filter-row">
             <label class="field search-field"><span>搜索视频</span><input id="videoSearch" type="search" placeholder="任务 ID、提示词、模型、API Key 或账号"></label>
-            <label class="field"><span>状态</span><select id="videoStatus"><option value="all">全部状态</option><option value="queued">排队中</option><option value="running">生成中</option><option value="succeeded">已完成</option><option value="failed">失败</option></select></label>
+            <label class="field"><span>状态</span><select id="videoStatus"><option value="all">全部状态</option><option value="nonterminal">非终态</option><option value="queued">排队中</option><option value="running">生成中</option><option value="succeeded">已完成</option><option value="failed">失败</option></select></label>
             <label class="toggle-field"><input id="videoAutoRefresh" type="checkbox" checked><span>自动刷新生成中任务</span></label>
           </div>
         </section>

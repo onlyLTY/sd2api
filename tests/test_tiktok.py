@@ -7,7 +7,7 @@ import base64
 import json
 from io import BytesIO
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 import wave
 
@@ -3360,6 +3360,8 @@ def test_admin_account_routes_without_starting_browser(
     assert 'href="https://github.com/usdfan/sd2api"' in dashboard.text
     assert "sd2api 控制台" in dashboard.text
     assert 'id="vToday"' in dashboard.text
+    assert 'id="vWeek"' in dashboard.text
+    assert '<option value="nonterminal">非终态</option>' in dashboard.text
     assert all(label in dashboard.text for label in ("生视频", "号池管理", "日志", "视频管理", "系统配置"))
     assert 'name="email_address"' not in dashboard.text
     assert styles.status_code == 200
@@ -3368,6 +3370,7 @@ def test_admin_account_routes_without_starting_browser(
     assert script.status_code == 200
     assert "refreshVideos" in script.text
     assert '$("vToday").textContent = summary.today || 0' in script.text
+    assert '$("vWeek").textContent = summary.week || 0' in script.text
     assert "/admin/version" in script.text
     assert "ttoh" not in dashboard.text.lower()
     assert "ttoh" not in styles.text.lower()
@@ -3737,6 +3740,68 @@ def test_admin_tasks_and_logs_support_pagination(
     assert logs.json()["pagination"] == {
         "page": 2, "page_size": 2, "total": 3
     }
+
+
+def test_admin_tasks_support_weekly_summary_and_nonterminal_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sd2api.main as main
+
+    # 2026-09-04 12:00:00 UTC; the week starts Monday in the requested timezone.
+    now = 1_788_523_200
+    task_store = TaskStore(str(tmp_path / "weekly-tasks.db"))
+    for task_id, status in [
+        ("last-week", "succeeded"),
+        ("queued-this-week", "queued"),
+        ("running-this-week", "running"),
+        ("done-this-week", "succeeded"),
+    ]:
+        task_store.create(
+            task_id=task_id,
+            api="openai",
+            model="sora-2",
+            prompt=task_id,
+            seconds=5,
+        )
+        task_store.update(task_id, status=status)
+
+    local_week_start = int(
+        (
+            datetime.fromtimestamp(now, tz=timezone.utc)
+            - timedelta(days=datetime.fromtimestamp(now, tz=timezone.utc).weekday())
+        )
+        .replace(hour=0, minute=0, second=0, microsecond=0)
+        .timestamp()
+    )
+    with task_store._connect() as connection:
+        connection.execute(
+            "UPDATE tasks SET created_at = ? WHERE id = ?",
+            (local_week_start - 1, "last-week"),
+        )
+        connection.execute(
+            "UPDATE tasks SET created_at = ? WHERE id != ?",
+            (local_week_start + 1, "last-week"),
+        )
+
+    monkeypatch.setattr(main, "store", task_store)
+    monkeypatch.setattr(main.time, "time", lambda: now)
+    api = TestClient(main.app)
+    headers = {
+        "Authorization": f"Bearer {main.settings.sd2api_admin_key or main.settings.sd2api_api_key}"
+    }
+
+    response = api.get(
+        "/admin/tasks?status=nonterminal&timezone_offset=0", headers=headers
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert {task["id"] for task in payload["data"]} == {
+        "queued-this-week",
+        "running-this-week",
+    }
+    assert payload["pagination"]["total"] == 2
+    assert payload["summary"]["week"] == 3
 
 
 def test_admin_duration_analytics(
