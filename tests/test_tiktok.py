@@ -3361,7 +3361,9 @@ def test_admin_account_routes_without_starting_browser(
     assert "sd2api 控制台" in dashboard.text
     assert 'id="vToday"' in dashboard.text
     assert 'id="vWeek"' in dashboard.text
+    assert 'id="vWeekSucceeded"' in dashboard.text
     assert "本周任务数量" in dashboard.text
+    assert "本周成功数量" in dashboard.text
     assert "本周生成数量" not in dashboard.text
     assert '<option value="nonterminal">非终态</option>' in dashboard.text
     assert all(label in dashboard.text for label in ("生视频", "号池管理", "日志", "视频管理", "系统配置"))
@@ -3373,6 +3375,7 @@ def test_admin_account_routes_without_starting_browser(
     assert "refreshVideos" in script.text
     assert '$("vToday").textContent = summary.today || 0' in script.text
     assert '$("vWeek").textContent = summary.week || 0' in script.text
+    assert '$("vWeekSucceeded").textContent = summary.week_succeeded || 0' in script.text
     assert "state.refreshQueued = true" in script.text
     assert "if (state.refreshQueued)" in script.text
     assert 'refresh_pending: refreshPending' in script.text
@@ -3808,6 +3811,7 @@ def test_admin_tasks_support_weekly_summary_and_nonterminal_filter(
     }
     assert payload["pagination"]["total"] == 2
     assert payload["summary"]["week"] == 3
+    assert payload["summary"]["week_succeeded"] == 1
 
 
 def test_admin_duration_analytics(
