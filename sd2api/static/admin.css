@@ -180,7 +180,7 @@ strong { font-weight: 700; }
 
 .metric-grid { display: grid; gap: 12px; margin-bottom: 18px; }
 .generate-metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-.video-metrics { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+.video-metrics { grid-template-columns: repeat(7, minmax(0, 1fr)); }
 .account-metrics { grid-template-columns: repeat(6, minmax(0, 1fr)); }
 .metric-card { position: relative; overflow: hidden; min-height: 118px; border-radius: 14px; padding: 17px 18px; }
 .metric-card span { display: block; color: #a9b3c1; font-size: 12px; }

@@ -470,6 +470,15 @@ class TaskStore:
                 if week_since is not None
                 else None
             )
+            week_succeeded_row = (
+                connection.execute(
+                    "SELECT COUNT(*) AS count FROM tasks "
+                    "WHERE created_at >= ? AND status = 'succeeded'",
+                    (week_since,),
+                ).fetchone()
+                if week_since is not None
+                else None
+            )
         for row in rows:
             status = str(row["status"])
             value = int(row["count"])
@@ -479,6 +488,8 @@ class TaskStore:
             counts["today"] = int(recent_row["count"])
         if week_row is not None:
             counts["week"] = int(week_row["count"])
+        if week_succeeded_row is not None:
+            counts["week_succeeded"] = int(week_succeeded_row["count"])
         return counts
 
     def duration_analytics_rows(
