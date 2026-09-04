@@ -5,6 +5,7 @@ import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 import logging
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import time
 from typing import Any, Literal
@@ -1034,12 +1035,20 @@ async def list_admin_tasks(
     limit: int = Query(default=50, ge=1, le=1000),
     page: int = Query(default=1, ge=1),
     account_id: str | None = None,
-    status: Literal["all", "queued", "running", "succeeded", "failed"] = "all",
+    status: Literal[
+        "all", "nonterminal", "queued", "running", "succeeded", "failed"
+    ] = "all",
     search: str | None = Query(default=None, max_length=256),
     refresh_pending: bool = False,
     timezone_offset: int = Query(default=480, ge=-720, le=840),
 ) -> dict[str, Any]:
-    selected_status = None if status == "all" else status
+    selected_status: str | tuple[str, ...] | None
+    if status == "all":
+        selected_status = None
+    elif status == "nonterminal":
+        selected_status = ("queued", "running")
+    else:
+        selected_status = status
     records = store.list(
         limit=limit,
         offset=(page - 1) * limit,
@@ -1069,9 +1078,19 @@ async def list_admin_tasks(
     now = int(time.time())
     timezone_shift = timezone_offset * 60
     today_since = now - ((now + timezone_shift) % 86400)
+    local_now = datetime.fromtimestamp(
+        now, tz=timezone(timedelta(minutes=timezone_offset))
+    )
+    week_since = int(
+        (local_now - timedelta(days=local_now.weekday()))
+        .replace(hour=0, minute=0, second=0, microsecond=0)
+        .timestamp()
+    )
     return {
         "data": [admin_task(record) for record in records],
-        "summary": store.task_counts(created_since=today_since),
+        "summary": store.task_counts(
+            created_since=today_since, week_since=week_since
+        ),
         "pagination": {
             "page": page,
             "page_size": limit,

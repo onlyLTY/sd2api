@@ -720,6 +720,7 @@ async function refreshAnalytics() {
 function renderVideoSummary(summary) {
   $("vTotal").textContent = summary.total || 0;
   $("vToday").textContent = summary.today || 0;
+  $("vWeek").textContent = summary.week || 0;
   $("vActive").textContent = Number(summary.queued || 0) + Number(summary.running || 0);
   $("vSucceeded").textContent = summary.succeeded || 0;
   $("vFailed").textContent = summary.failed || 0;

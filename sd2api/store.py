@@ -329,7 +329,7 @@ class TaskStore:
         after: str | None = None,
         order: str = "desc",
         account_id: str | None = None,
-        status: str | None = None,
+        status: str | tuple[str, ...] | None = None,
         search: str | None = None,
     ) -> list[TaskRecord]:
         direction = "ASC" if order == "asc" else "DESC"
@@ -344,7 +344,12 @@ class TaskStore:
         if account_id:
             conditions.append("account_id = ?")
             params.append(account_id)
-        if status:
+        if isinstance(status, tuple):
+            if status:
+                placeholders = ", ".join("?" for _ in status)
+                conditions.append(f"status IN ({placeholders})")
+                params.extend(status)
+        elif status:
             conditions.append("status = ?")
             params.append(status)
         if search:
@@ -367,7 +372,7 @@ class TaskStore:
         self,
         *,
         account_id: str | None = None,
-        status: str | None = None,
+        status: str | tuple[str, ...] | None = None,
         search: str | None = None,
     ) -> int:
         conditions: list[str] = []
@@ -375,7 +380,12 @@ class TaskStore:
         if account_id:
             conditions.append("account_id = ?")
             params.append(account_id)
-        if status:
+        if isinstance(status, tuple):
+            if status:
+                placeholders = ", ".join("?" for _ in status)
+                conditions.append(f"status IN ({placeholders})")
+                params.extend(status)
+        elif status:
             conditions.append("status = ?")
             params.append(status)
         if search:
@@ -433,7 +443,12 @@ class TaskStore:
             raise RuntimeError("Could not read the event after insertion")
         return self._decode_event(row)
 
-    def task_counts(self, *, created_since: int | None = None) -> dict[str, int]:
+    def task_counts(
+        self,
+        *,
+        created_since: int | None = None,
+        week_since: int | None = None,
+    ) -> dict[str, int]:
         counts = {"total": 0, "queued": 0, "running": 0, "succeeded": 0, "failed": 0}
         with self._lock, self._connect() as connection:
             rows = connection.execute(
@@ -447,6 +462,14 @@ class TaskStore:
                 if created_since is not None
                 else None
             )
+            week_row = (
+                connection.execute(
+                    "SELECT COUNT(*) AS count FROM tasks WHERE created_at >= ?",
+                    (week_since,),
+                ).fetchone()
+                if week_since is not None
+                else None
+            )
         for row in rows:
             status = str(row["status"])
             value = int(row["count"])
@@ -454,6 +477,8 @@ class TaskStore:
             counts["total"] += value
         if recent_row is not None:
             counts["today"] = int(recent_row["count"])
+        if week_row is not None:
+            counts["week"] = int(week_row["count"])
         return counts
 
     def duration_analytics_rows(
