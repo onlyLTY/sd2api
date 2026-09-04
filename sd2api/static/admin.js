@@ -27,6 +27,7 @@ const state = {
   editId: null,
   focusTask: null,
   refreshing: false,
+  refreshQueued: false,
   timer: null,
 };
 
@@ -777,7 +778,11 @@ async function refreshVideos() {
 }
 
 async function refreshCurrent(userInitiated = false) {
-  if (!state.key || state.refreshing || !$("auth").classList.contains("hidden")) return;
+  if (!state.key || !$("auth").classList.contains("hidden")) return;
+  if (state.refreshing) {
+    state.refreshQueued = true;
+    return;
+  }
   state.refreshing = true;
   $("refreshButton").disabled = true;
   try {
@@ -797,6 +802,10 @@ async function refreshCurrent(userInitiated = false) {
   } finally {
     state.refreshing = false;
     $("refreshButton").disabled = false;
+    if (state.refreshQueued) {
+      state.refreshQueued = false;
+      refreshCurrent(false);
+    }
   }
 }
 

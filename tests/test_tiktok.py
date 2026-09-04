@@ -3361,6 +3361,8 @@ def test_admin_account_routes_without_starting_browser(
     assert "sd2api 控制台" in dashboard.text
     assert 'id="vToday"' in dashboard.text
     assert 'id="vWeek"' in dashboard.text
+    assert "本周任务数量" in dashboard.text
+    assert "本周生成数量" not in dashboard.text
     assert '<option value="nonterminal">非终态</option>' in dashboard.text
     assert all(label in dashboard.text for label in ("生视频", "号池管理", "日志", "视频管理", "系统配置"))
     assert 'name="email_address"' not in dashboard.text
@@ -3371,6 +3373,8 @@ def test_admin_account_routes_without_starting_browser(
     assert "refreshVideos" in script.text
     assert '$("vToday").textContent = summary.today || 0' in script.text
     assert '$("vWeek").textContent = summary.week || 0' in script.text
+    assert "state.refreshQueued = true" in script.text
+    assert "if (state.refreshQueued)" in script.text
     assert "/admin/version" in script.text
     assert "ttoh" not in dashboard.text.lower()
     assert "ttoh" not in styles.text.lower()
