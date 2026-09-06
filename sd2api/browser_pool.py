@@ -285,7 +285,8 @@ class BrowserPoolClient:
                 bool(item.get("quota_blocked")) for item in subaccounts
             ),
             "rate_limited_subaccounts": sum(
-                bool(item.get("rate_limited")) for item in subaccounts
+                bool(item.get("rate_limited") or item.get("model_rate_limited"))
+                for item in subaccounts
             ),
             "logging_in": sum(
                 account.get("login_state")
@@ -366,12 +367,57 @@ class BrowserPoolClient:
         }
 
     @staticmethod
-    def _subaccount_eligible(item: dict[str, Any]) -> bool:
-        return bool(item.get("enabled")) and item.get("seedance_access") is True and (
-            item.get("credits") is None or int(item["credits"]) > 0
-        ) and max(
-            int(item.get("quota_blocked_until") or 0),
-            int(item.get("rate_limited_until") or 0),
+    def _model_key(model: str) -> str:
+        normalized = model.strip().lower().replace("_", "-")
+        aliases = {
+            "sora-2": "seedance-2.0",
+            "sora2": "seedance-2.0",
+            "seedance-2-0": "seedance-2.0",
+            "dreamina-seedance-2.0": "seedance-2.0",
+            "dreamina-seedance-2-0": "seedance-2.0",
+            "seedance-2-5": "seedance-2.5",
+            "dreamina-seedance-2.5": "seedance-2.5",
+            "dreamina-seedance-2-5": "seedance-2.5",
+            "seedance-2-0-mini": "seedance-2.0-mini",
+            "dreamina-seedance-2.0-mini": "seedance-2.0-mini",
+            "dreamina-seedance-2-0-mini": "seedance-2.0-mini",
+            "seedance-2-0-fast": "seedance-2.0-fast",
+            "dreamina-seedance-2.0-fast": "seedance-2.0-fast",
+            "dreamina-seedance-2-0-fast": "seedance-2.0-fast",
+        }
+        return aliases.get(normalized, normalized)
+
+    @classmethod
+    def _model_limit(
+        cls, item: dict[str, Any], model: str
+    ) -> dict[str, Any] | None:
+        model_key = cls._model_key(model)
+        return next(
+            (
+                limit
+                for limit in item.get("model_limits", [])
+                if limit.get("model") == model_key
+            ),
+            None,
+        )
+
+    @classmethod
+    def _subaccount_eligible(
+        cls, item: dict[str, Any], model: str | None = None
+    ) -> bool:
+        if not (
+            bool(item.get("enabled"))
+            and item.get("seedance_access") is True
+            and (item.get("credits") is None or int(item["credits"]) > 0)
+            and int(item.get("rate_limited_until") or 0) <= int(time.time())
+        ):
+            return False
+        if model is None:
+            return True
+        limit = cls._model_limit(item, model) or {}
+        return max(
+            int(limit.get("quota_blocked_until") or 0),
+            int(limit.get("rate_limited_until") or 0),
         ) <= int(time.time())
 
     def _subaccount_load(self, account_id: str, advertiser_id: str) -> int:
@@ -481,6 +527,15 @@ class BrowserPoolClient:
         return settings.sd2api_pool_rate_limit_cooldown
 
     @staticmethod
+    def _is_model_rate_limit(exc: TikTokUpstreamError) -> bool:
+        text = f"{exc.code} {exc}".lower()
+        return (
+            "10001113" in text
+            or "5min limit" in text
+            or "user generation 5min limit" in text
+        )
+
+    @staticmethod
     def _is_concurrency_full_error(exc: TikTokUpstreamError) -> bool:
         text = f"{exc.code} {exc}".lower()
         slot_markers = (
@@ -553,17 +608,61 @@ class BrowserPoolClient:
         self, account_id: str, items: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
         now = int(time.time())
+        limits_by_advertiser: dict[str, list[dict[str, Any]]] = {}
+        for limit in self.store.list_subaccount_model_limits(account_id):
+            if max(
+                int(limit.get("quota_blocked_until") or 0),
+                int(limit.get("rate_limited_until") or 0),
+            ) <= now:
+                continue
+            limits_by_advertiser.setdefault(
+                str(limit["advertiser_id"]), []
+            ).append(limit)
         result: list[dict[str, Any]] = []
         for item in items:
             decorated = dict(item)
             advertiser_id = str(item["advertiser_id"])
             active_tasks = self._subaccount_load(account_id, advertiser_id)
-            blocked_until = int(item.get("quota_blocked_until") or 0)
-            quota_blocked = blocked_until > now
+            model_limits = limits_by_advertiser.get(advertiser_id, [])
+            quota_limits = [
+                limit
+                for limit in model_limits
+                if int(limit.get("quota_blocked_until") or 0) > now
+            ]
+            model_rate_limits = [
+                limit
+                for limit in model_limits
+                if int(limit.get("rate_limited_until") or 0) > now
+            ]
             rate_limited_until = int(item.get("rate_limited_until") or 0)
             decorated.update(
                 active_tasks=active_tasks,
-                quota_blocked=quota_blocked,
+                model_limits=model_limits,
+                quota_blocked=bool(quota_limits),
+                quota_blocked_until=max(
+                    (
+                        int(limit["quota_blocked_until"])
+                        for limit in quota_limits
+                    ),
+                    default=0,
+                ),
+                quota_models=[limit["model"] for limit in quota_limits],
+                quota_reason="; ".join(
+                    str(limit["quota_reason"])
+                    for limit in quota_limits
+                    if limit.get("quota_reason")
+                )
+                or None,
+                quota_updated_at=max(
+                    (
+                        int(limit["quota_updated_at"])
+                        for limit in quota_limits
+                        if limit.get("quota_updated_at") is not None
+                    ),
+                    default=0,
+                )
+                or None,
+                model_rate_limited=bool(model_rate_limits),
                 rate_limited=rate_limited_until > now,
                 tasks_today=self.store.task_count_since(
                     account_id, advertiser_id, self._utc_today_start()
@@ -1212,12 +1311,6 @@ class BrowserPoolClient:
                 status_code=403,
                 code="seedance_access_required",
             )
-        if enabled and int(target.get("quota_blocked_until") or 0) > int(time.time()):
-            raise TikTokUpstreamError(
-                f"Subaccount {advertiser_id!r} reached its daily generation limit",
-                status_code=429,
-                code="subaccount_daily_quota_exhausted",
-            )
         if enabled and int(target.get("rate_limited_until") or 0) > int(time.time()):
             raise TikTokUpstreamError(
                 f"Subaccount {advertiser_id!r} is temporarily rate limited",
@@ -1353,7 +1446,7 @@ class BrowserPoolClient:
                     and status["logged_in"]
                     and status.get("keepalive_active")
                     and any(
-                        self._subaccount_eligible(subaccount)
+                        self._subaccount_eligible(subaccount, model)
                         for subaccount in status["subaccounts"]
                     )
                 ):
@@ -1368,7 +1461,7 @@ class BrowserPoolClient:
                 eligible.extend(
                     (status, subaccount)
                     for subaccount in status["subaccounts"]
-                    if self._subaccount_eligible(subaccount)
+                    if self._subaccount_eligible(subaccount, model)
                 )
             if not eligible:
                 if keepalive_eligible:
@@ -1389,25 +1482,48 @@ class BrowserPoolClient:
                         or int(subaccount["credits"]) > 0
                     )
                 ]
+                now = int(time.time())
+
+                def requested_model_limit(
+                    subaccount: dict[str, Any]
+                ) -> dict[str, Any]:
+                    return self._model_limit(subaccount, model) or {}
+
                 if selected_subaccounts and all(
-                    int(subaccount.get("quota_blocked_until") or 0)
-                    > int(time.time())
+                    int(
+                        requested_model_limit(subaccount).get(
+                            "quota_blocked_until"
+                        )
+                        or 0
+                    )
+                    > now
                     for subaccount in selected_subaccounts
                 ):
                     raise TikTokUpstreamError(
-                        "All selected subaccounts have exhausted their daily generation quota",
+                        f"All selected subaccounts have exhausted their daily quota for {self._model_key(model)}",
                         status_code=429,
                         code="subaccount_daily_quota_exhausted",
                     )
                 if selected_subaccounts and all(
                     max(
-                        int(subaccount.get("quota_blocked_until") or 0),
                         int(subaccount.get("rate_limited_until") or 0),
-                    ) > int(time.time())
+                        int(
+                            requested_model_limit(subaccount).get(
+                                "quota_blocked_until"
+                            )
+                            or 0
+                        ),
+                        int(
+                            requested_model_limit(subaccount).get(
+                                "rate_limited_until"
+                            )
+                            or 0
+                        ),
+                    ) > now
                     for subaccount in selected_subaccounts
                 ):
                     raise TikTokUpstreamError(
-                        "All selected subaccounts are temporarily rate limited",
+                        f"All selected subaccounts are temporarily limited for {self._model_key(model)}",
                         status_code=429,
                         code="subaccount_rate_limited",
                     )
@@ -1549,29 +1665,50 @@ class BrowserPoolClient:
                         if self._is_daily_quota_error(exc):
                             quota_failures += 1
                             blocked_until = self._next_utc_day_start()
-                            self.store.update_subaccount(
+                            self.store.update_subaccount_model_limit(
                                 account_id,
                                 advertiser_id,
+                                self._model_key(model),
                                 quota_blocked_until=blocked_until,
                                 quota_reason=str(exc),
                                 quota_updated_at=int(time.time()),
+                            )
+                            self.store.update_subaccount(
+                                account_id,
+                                advertiser_id,
                                 last_error=str(exc),
                             )
-                            event_message = "Subaccount daily generation quota exhausted"
+                            event_message = "Subaccount model daily quota exhausted"
                         else:
                             cooldown = self._rate_limit_cooldown(exc, self.settings)
                             if cooldown:
                                 transient_limit_failures += 1
                                 blocked_until = int(time.time()) + cooldown
-                                self.store.update_subaccount(
-                                    account_id,
-                                    advertiser_id,
-                                    rate_limited_until=blocked_until,
-                                    rate_limit_reason=str(exc),
-                                    rate_limit_updated_at=int(time.time()),
-                                    last_error=str(exc),
-                                )
-                                event_message = "Subaccount temporarily rate limited"
+                                if self._is_model_rate_limit(exc):
+                                    self.store.update_subaccount_model_limit(
+                                        account_id,
+                                        advertiser_id,
+                                        self._model_key(model),
+                                        rate_limited_until=blocked_until,
+                                        rate_limit_reason=str(exc),
+                                        rate_limit_updated_at=int(time.time()),
+                                    )
+                                    self.store.update_subaccount(
+                                        account_id,
+                                        advertiser_id,
+                                        last_error=str(exc),
+                                    )
+                                    event_message = "Subaccount model temporarily rate limited"
+                                else:
+                                    self.store.update_subaccount(
+                                        account_id,
+                                        advertiser_id,
+                                        rate_limited_until=blocked_until,
+                                        rate_limit_reason=str(exc),
+                                        rate_limit_updated_at=int(time.time()),
+                                        last_error=str(exc),
+                                    )
+                                    event_message = "Subaccount temporarily rate limited"
                             elif self._is_concurrency_full_error(exc):
                                 transient_limit_failures += 1
                                 blocked_until = None
@@ -1585,6 +1722,7 @@ class BrowserPoolClient:
                             account_id=account_id,
                             details={
                                 "advertiser_id": advertiser_id,
+                                "model": self._model_key(model),
                                 "blocked_until": blocked_until,
                                 "upstream_code": exc.code,
                                 "upstream_message": str(exc),
@@ -1597,14 +1735,12 @@ class BrowserPoolClient:
                     ] = self._selection_counter
                     self._task_accounts[task_id] = account_id
                     self._task_advertisers[task_id] = advertiser_id
-                    if selected_subaccount.get("quota_reason"):
+                    cleared_model_limit = self.store.clear_subaccount_model_limit(
+                        account_id, advertiser_id, self._model_key(model)
+                    )
+                    if cleared_model_limit:
                         self.store.update_subaccount(
-                            account_id,
-                            advertiser_id,
-                            quota_blocked_until=None,
-                            quota_reason=None,
-                            quota_updated_at=None,
-                            last_error=None,
+                            account_id, advertiser_id, last_error=None
                         )
                     if selected_subaccount.get("rate_limit_reason"):
                         self.store.update_subaccount(
@@ -1639,7 +1775,7 @@ class BrowserPoolClient:
                         code="subaccount_rate_limited",
                     )
                 raise TikTokUpstreamError(
-                    "All selected subaccounts have exhausted their daily generation quota",
+                    f"All selected subaccounts have exhausted their daily quota for {self._model_key(model)}",
                     status_code=429,
                     code="subaccount_daily_quota_exhausted",
                 )

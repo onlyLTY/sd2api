@@ -436,6 +436,16 @@ def test_store_tracks_subaccounts_and_preserves_user_selection(tmp_path: Path) -
     )
     assert selected["enabled"] is True
     assert selected["seedance_access"] is True
+    model_limit = store.update_subaccount_model_limit(
+        "login-a",
+        "7668593711596617729",
+        "seedance-2.0",
+        quota_blocked_until=int(time.time()) + 600,
+        quota_reason="Daily generation limit reached",
+        quota_updated_at=int(time.time()),
+    )
+    assert model_limit["model"] == "seedance-2.0"
+    assert len(store.list_subaccount_model_limits("login-a")) == 1
 
     store.upsert_subaccounts(
         "login-a",
@@ -455,6 +465,38 @@ def test_store_tracks_subaccounts_and_preserves_user_selection(tmp_path: Path) -
     )
     assert partner["enabled"] is True
     assert partner["credits"] == 1995
+    assert store.clear_subaccount_model_limit(
+        "login-a", "7668593711596617729", "seedance-2.0"
+    ) is True
+    assert store.list_subaccount_model_limits("login-a") == []
+    assert store.clear_subaccount_model_limit(
+        "login-a", "7668593711596617729", "seedance-2.0"
+    ) is False
+
+
+def test_store_clears_legacy_account_wide_quota_on_upgrade(tmp_path: Path) -> None:
+    database = tmp_path / "legacy-account-quota.db"
+    store = TaskStore(str(database))
+    store.create_account(account_id="login-a", name="Login A")
+    store.upsert_subaccounts(
+        "login-a",
+        [{"advertiser_id": "sub-a", "name": "Sub A"}],
+    )
+    store.update_subaccount(
+        "login-a",
+        "sub-a",
+        quota_blocked_until=int(time.time()) + 600,
+        quota_reason="Daily generation limit reached",
+        quota_updated_at=int(time.time()),
+        last_error="Daily generation limit reached",
+    )
+
+    upgraded = TaskStore(str(database)).list_subaccounts("login-a")[0]
+
+    assert upgraded["quota_blocked_until"] is None
+    assert upgraded["quota_reason"] is None
+    assert upgraded["quota_updated_at"] is None
+    assert upgraded["last_error"] is None
 
 
 def test_browser_profile_is_reused_by_login_email(tmp_path: Path) -> None:
@@ -2802,8 +2844,13 @@ async def test_protocol_pool_uses_upstream_limits_to_fail_over_subaccounts(
 
     class LimitedClient:
         load = 0
+        requested_models: list[str] = []
 
         async def create_text_video(self, **kwargs: Any) -> str:
+            self.requested_models.append(kwargs["model"])
+            if upstream_error.code == "10001113" and kwargs["model"] != "seedance-2.0":
+                self.load += 1
+                return "other-model-task"
             raise upstream_error
 
     class HealthyClient:
@@ -2823,13 +2870,34 @@ async def test_protocol_pool_uses_upstream_limits_to_fail_over_subaccounts(
         prompt="response-driven failover", model="seedance-2.0", duration=5
     ) == "healthy-task"
     limited = store.list_subaccounts("a")[0]
-    remaining = int(limited.get("rate_limited_until") or 0) - int(time.time())
+    if upstream_error.code == "10001113":
+        model_limit = store.list_subaccount_model_limits("a", "sub-a")[0]
+        remaining = int(model_limit.get("rate_limited_until") or 0) - int(time.time())
+        assert model_limit["model"] == "seedance-2.0"
+        assert limited["rate_limited_until"] is None
+    else:
+        remaining = int(limited.get("rate_limited_until") or 0) - int(time.time())
     if minimum_cooldown:
         assert remaining >= minimum_cooldown
-        assert limited["rate_limit_reason"] == str(upstream_error)
+        if upstream_error.code == "10001113":
+            assert model_limit["rate_limit_reason"] == str(upstream_error)
+        else:
+            assert limited["rate_limit_reason"] == str(upstream_error)
     else:
         assert limited["rate_limited_until"] is None
         assert limited["rate_limit_reason"] is None
+
+    if upstream_error.code in {"10043101", "10001113"}:
+        other_model_task = await pool.create_text_video(
+            prompt="other model", model="seedance-2.5", duration=5
+        )
+        if upstream_error.code == "10001113":
+            assert other_model_task == "other-model-task"
+            assert pool.account_for_task(other_model_task) == "a"
+        else:
+            assert other_model_task == "healthy-task"
+            assert clients["sub-a"].requested_models == ["seedance-2.0"]
+            assert pool.account_for_task(other_model_task) == "b"
 
 
 @pytest.mark.parametrize(
@@ -2878,13 +2946,18 @@ async def test_pool_fails_over_when_subaccount_hits_daily_quota(
 
     class QuotaClient:
         load = 0
+        requested_models: list[str] = []
 
         async def create_text_video(self, **kwargs: Any) -> str:
-            raise TikTokUpstreamError(
-                quota_message,
-                status_code=502,
-                code=quota_code,
-            )
+            self.requested_models.append(kwargs["model"])
+            if kwargs["model"] == "seedance-2.0":
+                raise TikTokUpstreamError(
+                    quota_message,
+                    status_code=502,
+                    code=quota_code,
+                )
+            self.load += 1
+            return "other-model-task"
 
     class HealthyClient:
         load = 0
@@ -2903,15 +2976,27 @@ async def test_pool_fails_over_when_subaccount_hits_daily_quota(
         prompt="fail over", model="seedance-2.0", duration=5
     )
     assert task_id == "healthy-task"
-    blocked = next(
-        item for item in store.list_subaccounts("a") if item["advertiser_id"] == "sub-a"
-    )
+    blocked = store.list_subaccount_model_limits("a", "sub-a")[0]
     remaining = blocked["quota_blocked_until"] - int(time.time())
     assert 0 < remaining <= 86400
     assert blocked["quota_blocked_until"] % 86400 == 0
     assert blocked["quota_reason"] == quota_message
-    assert blocked["credits"] == 100
+    assert blocked["model"] == "seedance-2.0"
+    assert store.list_subaccounts("a")[0]["credits"] == 100
     assert pool.account_for_task(task_id) == "b"
+
+    other_model_task = await pool.create_text_video(
+        prompt="other model remains available", model="seedance-2.5", duration=5
+    )
+    assert other_model_task == "other-model-task"
+    assert pool.account_for_task(other_model_task) == "a"
+
+    same_model_task = await pool.create_text_video(
+        prompt="blocked model changes account", model="seedance-2.0", duration=5
+    )
+    assert same_model_task == "healthy-task"
+    assert clients["sub-a"].requested_models == ["seedance-2.0", "seedance-2.5"]
+    assert pool.account_for_task(same_model_task) == "b"
 
 
 def test_daily_pool_boundaries_use_utc_midnight() -> None:
@@ -2919,6 +3004,12 @@ def test_daily_pool_boundaries_use_utc_midnight() -> None:
     assert BrowserPoolClient._utc_today_start(1_756_684_800) == 1_756_684_800
     assert BrowserPoolClient._next_utc_day_start(1_756_684_799) == 1_756_684_800
     assert BrowserPoolClient._next_utc_day_start(1_756_684_800) == 1_756_771_200
+
+
+def test_pool_normalizes_model_aliases_for_cooldowns() -> None:
+    assert BrowserPoolClient._model_key("sora-2") == "seedance-2.0"
+    assert BrowserPoolClient._model_key("Dreamina_Seedance_2-5") == "seedance-2.5"
+    assert BrowserPoolClient._model_key("seedance-2-0-mini") == "seedance-2.0-mini"
 
 
 @pytest.mark.asyncio
@@ -3183,9 +3274,10 @@ async def test_pool_returns_429_when_every_selected_subaccount_is_quota_blocked(
         ],
     )
     store.set_subaccount_enabled("a", "sub-a", True)
-    store.update_subaccount(
+    store.update_subaccount_model_limit(
         "a",
         "sub-a",
+        "seedance-2.0",
         quota_blocked_until=int(time.time()) + 600,
         quota_reason="Daily generation limit reached",
         quota_updated_at=int(time.time()),
@@ -3380,6 +3472,9 @@ def test_admin_account_routes_without_starting_browser(
     assert "if (state.refreshQueued)" in script.text
     assert 'refresh_pending: refreshPending' in script.text
     assert "state.skipVideoPendingRefresh = true" in script.text
+    assert "部分模型冷却" in script.text
+    assert "模型限额：" in script.text
+    assert "admin.js?v=20" in dashboard.text
     assert "/admin/version" in script.text
     assert "ttoh" not in dashboard.text.lower()
     assert "ttoh" not in styles.text.lower()

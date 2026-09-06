@@ -204,6 +204,37 @@ class TaskStore:
                     )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS subaccount_model_limits (
+                    account_id TEXT NOT NULL,
+                    advertiser_id TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    quota_blocked_until INTEGER,
+                    quota_reason TEXT,
+                    quota_updated_at INTEGER,
+                    rate_limited_until INTEGER,
+                    rate_limit_reason TEXT,
+                    rate_limit_updated_at INTEGER,
+                    PRIMARY KEY (account_id, advertiser_id, model)
+                )
+                """
+            )
+            connection.execute(
+                """
+                UPDATE subaccounts
+                SET last_error = CASE
+                        WHEN last_error = quota_reason THEN NULL
+                        ELSE last_error
+                    END,
+                    quota_blocked_until = NULL,
+                    quota_reason = NULL,
+                    quota_updated_at = NULL
+                WHERE quota_blocked_until IS NOT NULL
+                   OR quota_reason IS NOT NULL
+                   OR quota_updated_at IS NOT NULL
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     created_at INTEGER NOT NULL,
@@ -788,6 +819,10 @@ class TaskStore:
 
     def delete_account(self, account_id: str) -> bool:
         with self._lock, self._connect() as connection:
+            connection.execute(
+                "DELETE FROM subaccount_model_limits WHERE account_id = ?",
+                (account_id,),
+            )
             connection.execute("DELETE FROM subaccounts WHERE account_id = ?", (account_id,))
             result = connection.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
         return result.rowcount > 0
@@ -919,3 +954,96 @@ class TaskStore:
             for item in self.list_subaccounts(account_id)
             if item["advertiser_id"] == advertiser_id
         )
+
+    def list_subaccount_model_limits(
+        self,
+        account_id: str | None = None,
+        advertiser_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        conditions: list[str] = []
+        params: list[str] = []
+        if account_id is not None:
+            conditions.append("account_id = ?")
+            params.append(account_id)
+        if advertiser_id is not None:
+            conditions.append("advertiser_id = ?")
+            params.append(advertiser_id)
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM subaccount_model_limits
+                {where}
+                ORDER BY account_id, advertiser_id, model
+                """,
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_subaccount_model_limit(
+        self,
+        account_id: str,
+        advertiser_id: str,
+        model: str,
+        **changes: Any,
+    ) -> dict[str, Any]:
+        allowed = {
+            "quota_blocked_until",
+            "quota_reason",
+            "quota_updated_at",
+            "rate_limited_until",
+            "rate_limit_reason",
+            "rate_limit_updated_at",
+        }
+        invalid = set(changes) - allowed
+        if invalid:
+            raise ValueError(f"Unsupported model limit fields: {sorted(invalid)}")
+        if not changes:
+            raise ValueError("At least one model limit field is required")
+        values = {
+            "account_id": account_id,
+            "advertiser_id": advertiser_id,
+            "model": model,
+            **changes,
+        }
+        columns = ", ".join(changes)
+        placeholders = ", ".join(f":{name}" for name in changes)
+        assignments = ", ".join(
+            f"{name} = excluded.{name}" for name in changes
+        )
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                f"""
+                INSERT INTO subaccount_model_limits (
+                    account_id, advertiser_id, model, {columns}
+                ) VALUES (
+                    :account_id, :advertiser_id, :model, {placeholders}
+                )
+                ON CONFLICT(account_id, advertiser_id, model) DO UPDATE SET
+                    {assignments}
+                """,
+                values,
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM subaccount_model_limits
+                WHERE account_id = ? AND advertiser_id = ? AND model = ?
+                """,
+                (account_id, advertiser_id, model),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("Could not read model limit after update")
+        return dict(row)
+
+    def clear_subaccount_model_limit(
+        self, account_id: str, advertiser_id: str, model: str
+    ) -> bool:
+        with self._lock, self._connect() as connection:
+            result = connection.execute(
+                """
+                DELETE FROM subaccount_model_limits
+                WHERE account_id = ? AND advertiser_id = ? AND model = ?
+                """,
+                (account_id, advertiser_id, model),
+            )
+        return result.rowcount > 0
