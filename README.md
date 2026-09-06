@@ -352,8 +352,9 @@ flowchart LR
 |---|---|---|
 | `mode` | `browser_pool` | 运行模式，推荐保持 `browser_pool`（纯协议调度 + 按需浏览器登录） |
 | `pool_max_pending` | `500` | 全池允许同时处于排队或生成中的最大任务数；单个子账号不设本地并发上限 |
+| `pool_daily_quota_codes` | 空 | 补充识别为每日额度的上游错误码；命中后仅冷却对应模型至下一个 UTC 00:00 |
 | `pool_rate_limit_cooldown` | `90` | TikTok 返回 RPM/请求频率限制后，该子账号的短时冷却时间（秒） |
-| `pool_generation_limit_cooldown` | `300` | TikTok 返回 5 分钟生成限制后，该子账号的冷却时间（秒） |
+| `pool_generation_limit_cooldown` | `300` | TikTok 返回 5 分钟生成限制后，该子账号对应模型的冷却时间（秒） |
 | `session_keepalive_interval` | `21600` | 会话自动保活周期（默认 6 小时） |
 | `novnc_public_port` | `6080` | 管理端“打开 noVNC”按钮使用的公网端口；端口映射不同时需同步修改 |
 | `feishu_enabled` | `false` | 是否在账号需要人工操作时发送飞书通知 |
