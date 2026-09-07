@@ -729,7 +729,7 @@ class BrowserPoolClient:
         auto_login: bool | None = None,
     ) -> dict[str, Any]:
         if enabled is False:
-            await self.stop_account(account_id)
+            await self.stop_account(account_id, force=True)
         changes: dict[str, Any] = {}
         if name is not None:
             changes["name"] = name
@@ -763,7 +763,7 @@ class BrowserPoolClient:
         return await self.account_status(account_id)
 
     async def delete_account(self, account_id: str) -> None:
-        await self.stop_account(account_id)
+        await self.stop_account(account_id, force=True)
         if not self.store.delete_account(account_id):
             raise TikTokUpstreamError(
                 f"Account {account_id!r} does not exist",
@@ -907,6 +907,12 @@ class BrowserPoolClient:
                     code="account_busy",
                 )
             await worker.stop()
+        if force:
+            self.store.fail_active_tasks_for_account(
+                account_id,
+                error_code="account_stopped",
+                error_message="Account was stopped by an administrator",
+            )
         await self._close_protocol_clients(account_id)
         self._started_accounts.discard(account_id)
 

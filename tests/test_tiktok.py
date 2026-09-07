@@ -2465,6 +2465,43 @@ async def test_pool_stop_and_delete_cancel_login_tasks(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_pool_force_stop_and_delete_fail_active_tasks(tmp_path: Path) -> None:
+    store = TaskStore(str(tmp_path / "force-stop.db"))
+    pool = BrowserPoolClient(Settings(), store)
+
+    for account_id in ("stop-me", "delete-me"):
+        store.create_account(account_id=account_id, name=account_id)
+        store.upsert_subaccounts(
+            account_id,
+            [{"advertiser_id": "advertiser-1", "name": "Advertiser"}],
+        )
+        store.create(
+            task_id=f"task-{account_id}",
+            api="openai",
+            model="seedance-2.0",
+            prompt="test",
+            seconds=5,
+            account_id=account_id,
+            advertiser_id="advertiser-1",
+        )
+        pool._started_accounts.add(account_id)
+
+    await pool.stop_account("stop-me", force=True)
+    stopped_task = store.get("task-stop-me")
+    assert stopped_task is not None
+    assert stopped_task.status == "failed"
+    assert stopped_task.error_code == "account_stopped"
+    assert "stop-me" not in pool._started_accounts
+
+    await pool.delete_account("delete-me")
+    deleted_task = store.get("task-delete-me")
+    assert deleted_task is not None
+    assert deleted_task.status == "failed"
+    assert deleted_task.error_code == "account_stopped"
+    assert store.get_account("delete-me") is None
+
+
+@pytest.mark.asyncio
 async def test_pool_schedules_concurrent_jobs_across_accounts(tmp_path: Path) -> None:
     store = TaskStore(str(tmp_path / "pool.db"))
     store.create_account(account_id="a", name="Account A")

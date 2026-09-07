@@ -695,7 +695,7 @@ async def start_pool_account(account_id: str) -> dict[str, Any]:
 
 @app.post("/admin/accounts/{account_id}/stop", dependencies=[Depends(require_admin_key)])
 async def stop_pool_account(account_id: str) -> dict[str, bool]:
-    await require_pool().stop_account(account_id)
+    await require_pool().stop_account(account_id, force=True)
     audit_event("warning", "account", "账号已停止", account_id=account_id)
     return {"stopped": True}
 

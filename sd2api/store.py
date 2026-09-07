@@ -560,6 +560,26 @@ class TaskStore:
             ).fetchall()
         return [str(row["id"]) for row in rows]
 
+    def fail_active_tasks_for_account(
+        self,
+        account_id: str,
+        *,
+        error_code: str,
+        error_message: str,
+    ) -> int:
+        now = int(time.time())
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE tasks
+                SET status = 'failed', updated_at = ?, completed_at = ?,
+                    error_code = ?, error_message = ?
+                WHERE account_id = ? AND status IN ('queued', 'running')
+                """,
+                (now, now, error_code, error_message, account_id),
+            )
+        return cursor.rowcount
+
     def task_count_since(
         self, account_id: str, advertiser_id: str, since: int
     ) -> int:
