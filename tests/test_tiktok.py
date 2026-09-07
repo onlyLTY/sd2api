@@ -2422,6 +2422,49 @@ async def test_pool_keepalive_failure_does_not_schedule_login(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_pool_stop_and_delete_cancel_login_tasks(tmp_path: Path) -> None:
+    store = TaskStore(str(tmp_path / "cancel-login.db"))
+    pool = BrowserPoolClient(Settings(), store)
+
+    class Worker:
+        load = 0
+
+        def __init__(self) -> None:
+            self.stopped = False
+
+        async def stop(self) -> None:
+            self.stopped = True
+
+    async def start_fake_login(account_id: str) -> tuple[asyncio.Task[None], Worker]:
+        store.create_account(account_id=account_id, name=account_id)
+        store.update_account(account_id, login_state="logging_in")
+        worker = Worker()
+        task = asyncio.create_task(asyncio.sleep(3600))
+        pool._workers[account_id] = worker  # type: ignore[assignment]
+        pool._login_tasks[account_id] = task
+        pool._started_accounts.add(account_id)
+        await asyncio.sleep(0)
+        return task, worker
+
+    stop_task, stop_worker = await start_fake_login("stop-me")
+    await pool.stop_account("stop-me")
+
+    assert stop_task.cancelled()
+    assert stop_worker.stopped is True
+    assert "stop-me" not in pool._login_tasks
+    assert "stop-me" not in pool._started_accounts
+    stopped = store.get_account("stop-me")
+    assert stopped is not None and stopped["login_state"] == "not_started"
+
+    delete_task, delete_worker = await start_fake_login("delete-me")
+    await pool.delete_account("delete-me")
+
+    assert delete_task.cancelled()
+    assert delete_worker.stopped is True
+    assert store.get_account("delete-me") is None
+
+
+@pytest.mark.asyncio
 async def test_pool_schedules_concurrent_jobs_across_accounts(tmp_path: Path) -> None:
     store = TaskStore(str(tmp_path / "pool.db"))
     store.create_account(account_id="a", name="Account A")
