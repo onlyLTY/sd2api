@@ -879,15 +879,15 @@ class BrowserPoolClient:
     async def stop_account(self, account_id: str, *, force: bool = False) -> None:
         login_task = self._login_tasks.get(account_id)
         if login_task and not login_task.done():
-            if not force:
-                raise TikTokUpstreamError(
-                    f"Account {account_id!r} is currently logging in",
-                    status_code=409,
-                    code="account_login_busy",
-                )
             login_task.cancel()
             await asyncio.gather(login_task, return_exceptions=True)
             self._login_tasks.pop(account_id, None)
+            try:
+                self.store.update_account(
+                    account_id, login_state="not_started", last_error=None
+                )
+            except KeyError:
+                pass
         worker = self._workers.pop(account_id, None)
         protocol_load = self._account_load(account_id)
         if protocol_load > 0 and not force:
