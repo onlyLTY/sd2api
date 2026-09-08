@@ -82,6 +82,8 @@ const settingsSchema = [
     ["pool_rate_limit_cooldown", "RPM 限流冷却（秒）", "number", { min: 1, max: 3600 }],
     ["pool_generation_limit_cooldown", "5 分钟限流冷却（秒）", "number", { min: 1, max: 3600 }],
     ["pool_start_concurrency", "号池启动并发", "number", { min: 1, max: 50 }],
+    ["submission_concurrency", "任务提交并发", "number", { min: 1, max: 32 }],
+    ["submission_staging_max_bytes", "异步暂存上限（字节）", "number", { min: 536870912, max: 536870912000 }],
   ]},
   { title: "飞书通知", description: "账号需要验证码、手动接码、重新登录或浏览器恢复时通知个人或群聊。", fields: [
     ["feishu_enabled", "启用飞书通知", "boolean"],

@@ -34,6 +34,21 @@ class UploadManager:
         self.root = Path(settings.sd2api_upload_dir).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
 
+    def staged_bytes(self) -> int:
+        return sum(
+            path.stat().st_size for path in self.root.iterdir() if path.is_file()
+        )
+
+    def ensure_staging_capacity(self, *, kind: MediaKind | None = None) -> None:
+        reserve = self._max_bytes(kind) if kind else 0
+        used = self.staged_bytes()
+        if used + reserve > self.settings.sd2api_submission_staging_max_bytes:
+            raise TikTokUpstreamError(
+                "The asynchronous submission staging area is full",
+                status_code=507,
+                code="submission_staging_full",
+            )
+
     async def save_upload(self, upload: UploadFile) -> str:
         return (await self.save_media_upload(upload, expected_kind="image")).path
 
@@ -69,7 +84,7 @@ class UploadManager:
                 content_type=upload.content_type or "",
             )
             return StagedMedia(kind=kind, path=validated)
-        except Exception:
+        except BaseException:
             path.unlink(missing_ok=True)
             raise
         finally:
@@ -143,7 +158,7 @@ class UploadManager:
                             content_type=content_type,
                         )
                         return StagedMedia(kind=kind, path=validated)
-                    except Exception:
+                    except BaseException:
                         path.unlink(missing_ok=True)
                         raise
         raise TikTokUpstreamError(

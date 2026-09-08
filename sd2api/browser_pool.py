@@ -1805,7 +1805,9 @@ class BrowserPoolClient:
         return self._task_advertisers.get(task_id)
 
     async def check_task(self, task_id: str) -> UpstreamTask:
-        record = self.store.get(task_id)
+        record = self.store.get(task_id) or self.store.get_by_upstream_task_id(
+            task_id
+        )
         account_id = self._task_accounts.get(task_id) or (
             record.account_id if record else None
         )

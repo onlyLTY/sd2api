@@ -141,6 +141,10 @@ status = client.videos.retrieve(video.id)
 print(f"Current Status: {status.status}")
 ```
 
+创建接口返回 HTTP `202 Accepted`。响应中的 `id` 是 sd2api 本地任务 ID；后台随后下载远程素材、上传到 TikTok 并创建上游任务。调用方应使用该 ID 轮询，不需要为创建请求设置几十分钟的读取超时。
+
+调用方重试创建请求时应携带稳定的 `Idempotency-Key` 请求头。同一 API Key 与幂等键会返回第一次受理的本地任务，避免网络重试造成重复生成和重复扣费。
+
 #### cURL 调用示例
 
 ##### 文生视频 (T2V)
@@ -324,7 +328,7 @@ flowchart LR
 
 | TikTok 状态 | Seedance 响应状态 | OpenAI 响应状态 | 说明 |
 |---|---|---|---|
-| 等待排队中 | `queued` | `queued` | 任务已提交，等待上游分配 GPU 算力 |
+| 等待排队中 | `queued` | `queued` | 本地等待提交，或已提交并等待上游分配 GPU 算力 |
 | 生成 / 渲染中 | `running` | `in_progress` | TikTok 正在生成与渲染视频片段 |
 | 生成成功 | `succeeded` | `completed` | 视频生成完毕，已获取原始视频下载 URL |
 | 生成失败 | `failed` | `failed` | 上游生成失败或超出重试限制 |
@@ -352,6 +356,8 @@ flowchart LR
 |---|---|---|
 | `mode` | `browser_pool` | 运行模式，推荐保持 `browser_pool`（纯协议调度 + 按需浏览器登录） |
 | `pool_max_pending` | `500` | 全池允许同时处于排队或生成中的最大任务数；单个子账号不设本地并发上限 |
+| `submission_concurrency` | `4` | 后台同时准备/提交的任务数；修改后需重启实例 |
+| `submission_staging_max_bytes` | `8589934592` | 异步队列素材暂存目录上限（默认 8 GiB）；超过后拒绝新任务以保护磁盘 |
 | `pool_daily_quota_codes` | 空 | 补充识别为每日额度的上游错误码；命中后仅冷却对应模型至下一个 UTC 00:00 |
 | `pool_rate_limit_cooldown` | `90` | TikTok 返回 RPM/请求频率限制后，该子账号的短时冷却时间（秒） |
 | `pool_generation_limit_cooldown` | `300` | TikTok 返回 5 分钟生成限制后，该子账号对应模型的冷却时间（秒） |
@@ -363,6 +369,8 @@ flowchart LR
 | `feishu_instance_name` / `feishu_novnc_url` | `sd2api` / - | 通知中显示的实例名称和人工处理入口 |
 | `request_timeout` | `60.0` | 上游 HTTP 请求超时时间（秒） |
 | `upload_max_bytes` | `209715200` | 素材上传最大文件限制（200MB） |
+
+异步队列参数和状态只占 SQLite 中每任务约 1～5 KB。multipart 素材会在返回 202 前写入持久化 `uploads` 卷；JSON URL 素材由后台下载到同一目录。素材在成功提交到 TikTok 或提交失败后立即删除，因此主要磁盘占用约等于当前排队/提交中的素材总大小，不保存生成后的视频文件。
 
 号池不会预设单个子账号能同时运行多少任务。调度器持续按当前负载选择账号，直到 TikTok 返回限制：每日额度限制会熔断至下一个 UTC 00:00，RPM/请求频率限制会触发短时冷却，5 分钟生成限制会触发对应冷却，上游并发槽满只会让本次请求改试其他子账号。`pool_max_pending` 始终是所有账号合计的本地活动任务上限。
 
