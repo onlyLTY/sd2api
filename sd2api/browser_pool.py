@@ -863,17 +863,19 @@ class BrowserPoolClient:
         ):
             self._schedule_login(account_id)
         elif status["logged_in"]:
+            worker = self._worker(account_id)
             try:
-                worker = self._worker(account_id)
                 await self._capture_protocol_session(account_id, worker, validate=True)
-                await worker.stop()
-                self._workers.pop(account_id, None)
                 await self.refresh_subaccounts(account_id, check_access=True)
             except Exception as exc:
                 self.store.update_account(
                     account_id,
                     last_error=f"Subaccount scan failed: {exc.__class__.__name__}: {exc}",
                 )
+            finally:
+                await worker.stop()
+                if self._workers.get(account_id) is worker:
+                    self._workers.pop(account_id, None)
         return await self.account_status(account_id)
 
     async def stop_account(self, account_id: str, *, force: bool = False) -> None:
@@ -945,6 +947,7 @@ class BrowserPoolClient:
         return task
 
     async def _run_login(self, account_id: str) -> None:
+        worker: BrowserTikTokClient | None = None
         try:
             self._started_accounts.add(account_id)
             credentials = self.store.account_credentials(account_id)
@@ -972,8 +975,6 @@ class BrowserPoolClient:
             )
             try:
                 await self._capture_protocol_session(account_id, worker, validate=True)
-                await worker.stop()
-                self._workers.pop(account_id, None)
                 await self.refresh_subaccounts(account_id, check_access=True)
             except Exception as scan_exc:
                 self.store.update_account(
@@ -994,6 +995,10 @@ class BrowserPoolClient:
             except KeyError:
                 pass
         finally:
+            if worker is not None:
+                await worker.stop()
+                if self._workers.get(account_id) is worker:
+                    self._workers.pop(account_id, None)
             current = self._login_tasks.get(account_id)
             if current is asyncio.current_task():
                 self._login_tasks.pop(account_id, None)
