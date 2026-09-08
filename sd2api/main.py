@@ -165,6 +165,13 @@ OPENAI_CREATE_DESCRIPTION = """
 """
 
 
+TASK_ID_COMPAT_DESCRIPTION = """
+路径参数同时接受 sd2api 创建接口返回的本地 `video_*` ID（推荐）和 TikTok 上游 task ID。
+
+使用 TikTok task ID 访问新异步任务时，服务会解析到对应的本地任务记录，响应体中的 `id` 仍为该记录的本地 ID。历史上直接以 TikTok task ID 作为主 ID 保存的任务继续兼容。
+"""
+
+
 OPENAI_JSON_REFERENCE_ITEM_SCHEMA: dict[str, Any] = {
     "oneOf": [
         {
@@ -1344,7 +1351,12 @@ async def create_seedance_video(
     return seedance_task(record)
 
 
-@app.get("/api/v3/contents/generations/tasks/{task_id}", dependencies=[Depends(require_api_key)])
+@app.get(
+    "/api/v3/contents/generations/tasks/{task_id}",
+    dependencies=[Depends(require_api_key)],
+    summary="查询 Seedance 视频任务",
+    description=TASK_ID_COMPAT_DESCRIPTION,
+)
 async def retrieve_seedance_video(task_id: str) -> dict[str, Any]:
     record = find_task(task_id)
     if record is None:
@@ -1362,7 +1374,12 @@ async def list_seedance_videos(
     return {"items": [seedance_task(record) for record in records], "has_more": len(records) == limit}
 
 
-@app.delete("/api/v3/contents/generations/tasks/{task_id}", dependencies=[Depends(require_api_key)])
+@app.delete(
+    "/api/v3/contents/generations/tasks/{task_id}",
+    dependencies=[Depends(require_api_key)],
+    summary="删除 Seedance 视频任务",
+    description=TASK_ID_COMPAT_DESCRIPTION,
+)
 async def delete_seedance_video(task_id: str) -> dict[str, Any]:
     record = find_task(task_id)
     if record is None or not store.delete(record.id):
@@ -1702,7 +1719,12 @@ async def create_openai_video(request: Request) -> dict[str, Any]:
     return openai_video(record)
 
 
-@app.get("/v1/videos/{video_id}", dependencies=[Depends(require_api_key)])
+@app.get(
+    "/v1/videos/{video_id}",
+    dependencies=[Depends(require_api_key)],
+    summary="查询视频任务",
+    description=TASK_ID_COMPAT_DESCRIPTION,
+)
 async def retrieve_openai_video(video_id: str) -> dict[str, Any]:
     record = find_task(video_id)
     if record is None:
@@ -1724,7 +1746,12 @@ async def list_openai_videos(
     }
 
 
-@app.delete("/v1/videos/{video_id}", dependencies=[Depends(require_api_key)])
+@app.delete(
+    "/v1/videos/{video_id}",
+    dependencies=[Depends(require_api_key)],
+    summary="删除视频任务",
+    description=TASK_ID_COMPAT_DESCRIPTION,
+)
 async def delete_openai_video(video_id: str) -> dict[str, Any]:
     record = find_task(video_id)
     if record is None:
@@ -1745,7 +1772,12 @@ async def delete_openai_video(video_id: str) -> dict[str, Any]:
     return {"id": record.id, "object": "video.deleted", "deleted": True}
 
 
-@app.get("/v1/videos/{video_id}/content", dependencies=[Depends(require_api_key)])
+@app.get(
+    "/v1/videos/{video_id}/content",
+    dependencies=[Depends(require_api_key)],
+    summary="下载视频内容",
+    description=TASK_ID_COMPAT_DESCRIPTION,
+)
 async def download_openai_video(video_id: str) -> Response:
     record = find_task(video_id)
     if record is None:
