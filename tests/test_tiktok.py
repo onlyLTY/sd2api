@@ -760,6 +760,55 @@ async def test_pool_validates_protocol_session_after_browser_login(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["login", "capture"])
+async def test_pool_login_failure_stops_browser_worker(
+    tmp_path: Path, failure_stage: str
+) -> None:
+    store = TaskStore(str(tmp_path / f"failed-{failure_stage}.db"))
+    pool = BrowserPoolClient(
+        Settings(sd2api_admin_key="test-admin-key-at-least-16-characters"),
+        store,
+    )
+    account = await pool.add_account(
+        account_id=None,
+        name=None,
+        username="login@example.com",
+        password="secret-password",
+        start=False,
+    )
+
+    class Worker:
+        stopped = False
+
+        async def login(self, **kwargs):
+            if failure_stage == "login":
+                raise RuntimeError("login failed")
+            return {"login_state": "logged_in"}
+
+        async def stop(self):
+            self.stopped = True
+
+    worker = Worker()
+    pool._workers[account["id"]] = worker  # type: ignore[assignment]
+
+    async def capture(*args, **kwargs):
+        raise RuntimeError("capture failed")
+
+    pool._capture_protocol_session = capture  # type: ignore[method-assign]
+
+    await pool._run_login(account["id"])
+
+    assert worker.stopped is True
+    assert account["id"] not in pool._workers
+    updated = store.get_account(account["id"])
+    assert updated is not None
+    if failure_stage == "login":
+        assert updated["login_state"] == "login_failed"
+    else:
+        assert "capture failed" in updated["last_error"]
+
+
+@pytest.mark.asyncio
 async def test_start_reopens_a_closed_browser_page(tmp_path: Path) -> None:
     class ClosedPage:
         @staticmethod
