@@ -429,6 +429,8 @@ def not_found(task_id: str) -> HTTPException:
 
 
 async def refresh(record: TaskRecord, *, force: bool = False) -> TaskRecord:
+    if record.submission_status == "failed":
+        return record
     if not force and record.status in {"succeeded", "failed"} and record.video_url:
         return record
     if record.submission_status in {"queued", "submitting"}:
