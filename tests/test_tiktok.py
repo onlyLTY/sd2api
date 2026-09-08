@@ -1679,6 +1679,104 @@ async def test_refresh_uses_upstream_id_for_async_submission(
     assert refreshed.status == "running"
 
 
+def test_video_routes_accept_local_and_upstream_task_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sd2api.main as main
+
+    class FakeBrowserClient:
+        async def fetch_video(self, video_url: str) -> tuple[bytes, str]:
+            assert video_url == "https://example.com/generated.mp4"
+            return b"video-data", "video/mp4"
+
+    task_store = TaskStore(str(tmp_path / "upstream-lookup.db"))
+    task_store.create_submission(
+        task_id="video_local",
+        model="seedance-2.0",
+        prompt="A red ball",
+        seconds=5,
+        size="720x1280",
+        api_key_mask=None,
+        idempotency_key_hash=None,
+        payload={"mode": "text", "media": []},
+    )
+    task_store.claim_submission("video_local")
+    task_store.complete_submission(
+        "video_local",
+        upstream_task_id="tiktok_upstream",
+        account_id=None,
+        advertiser_id=None,
+    )
+    task_store.update(
+        "video_local",
+        status="succeeded",
+        progress=100,
+        video_url="https://example.com/generated.mp4",
+    )
+    fake = FakeBrowserClient()
+    monkeypatch.setattr(main, "BrowserTikTokClient", FakeBrowserClient)
+    monkeypatch.setattr(main, "client", fake)
+    monkeypatch.setattr(main, "store", task_store)
+    api = TestClient(main.app)
+    headers = {"Authorization": f"Bearer {main.settings.sd2api_api_key}"}
+
+    for task_id in ("video_local", "tiktok_upstream"):
+        retrieved = api.get(f"/v1/videos/{task_id}", headers=headers)
+        assert retrieved.status_code == 200
+        assert retrieved.json()["id"] == "video_local"
+
+    seedance = api.get(
+        "/api/v3/contents/generations/tasks/tiktok_upstream", headers=headers
+    )
+    assert seedance.status_code == 200
+    assert seedance.json()["id"] == "video_local"
+
+    content = api.get("/v1/videos/tiktok_upstream/content", headers=headers)
+    assert content.status_code == 200
+    assert content.content == b"video-data"
+
+    deleted = api.delete("/v1/videos/tiktok_upstream", headers=headers)
+    assert deleted.status_code == 200
+    assert deleted.json()["id"] == "video_local"
+    assert task_store.get("video_local") is None
+
+
+def test_seedance_delete_accepts_upstream_task_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sd2api.main as main
+
+    task_store = TaskStore(str(tmp_path / "seedance-upstream-delete.db"))
+    task_store.create_submission(
+        task_id="video_local",
+        model="seedance-2.0",
+        prompt="A red ball",
+        seconds=5,
+        size="720x1280",
+        api_key_mask=None,
+        idempotency_key_hash=None,
+        payload={"mode": "text", "media": []},
+    )
+    task_store.claim_submission("video_local")
+    task_store.complete_submission(
+        "video_local",
+        upstream_task_id="tiktok_upstream",
+        account_id=None,
+        advertiser_id=None,
+    )
+    monkeypatch.setattr(main, "store", task_store)
+    api = TestClient(main.app)
+    headers = {"Authorization": f"Bearer {main.settings.sd2api_api_key}"}
+
+    deleted = api.delete(
+        "/api/v3/contents/generations/tasks/tiktok_upstream", headers=headers
+    )
+
+    assert deleted.status_code == 200
+    assert deleted.json() == {"id": "video_local", "deleted": True}
+    assert task_store.get("video_local") is None
+
+
 @pytest.mark.asyncio
 async def test_submission_worker_survives_cancelled_task(tmp_path: Path) -> None:
     started = asyncio.Event()
