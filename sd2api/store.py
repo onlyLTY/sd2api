@@ -34,6 +34,10 @@ class TaskRecord:
     error_code: str | None = None
     error_message: str | None = None
     raw: dict[str, Any] | None = None
+    upstream_task_id: str | None = None
+    submission_status: str | None = None
+    submission_payload: dict[str, Any] | None = None
+    idempotency_key_hash: str | None = None
 
 
 @dataclass(slots=True)
@@ -86,7 +90,11 @@ class TaskStore:
                     poster_url TEXT,
                     error_code TEXT,
                     error_message TEXT,
-                    raw TEXT
+                    raw TEXT,
+                    upstream_task_id TEXT,
+                    submission_status TEXT,
+                    submission_payload TEXT,
+                    idempotency_key_hash TEXT
                 )
                 """
             )
@@ -99,6 +107,22 @@ class TaskStore:
                 connection.execute("ALTER TABLE tasks ADD COLUMN advertiser_id TEXT")
             if "api_key_mask" not in columns:
                 connection.execute("ALTER TABLE tasks ADD COLUMN api_key_mask TEXT")
+            if "upstream_task_id" not in columns:
+                connection.execute("ALTER TABLE tasks ADD COLUMN upstream_task_id TEXT")
+            if "submission_status" not in columns:
+                connection.execute("ALTER TABLE tasks ADD COLUMN submission_status TEXT")
+            if "submission_payload" not in columns:
+                connection.execute("ALTER TABLE tasks ADD COLUMN submission_payload TEXT")
+            if "idempotency_key_hash" not in columns:
+                connection.execute("ALTER TABLE tasks ADD COLUMN idempotency_key_hash TEXT")
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS tasks_upstream_task_id_idx "
+                "ON tasks(upstream_task_id) WHERE upstream_task_id IS NOT NULL"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS tasks_idempotency_key_hash_idx "
+                "ON tasks(idempotency_key_hash) WHERE idempotency_key_hash IS NOT NULL"
+            )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS api_keys (
@@ -256,6 +280,11 @@ class TaskStore:
     def _decode(row: sqlite3.Row) -> TaskRecord:
         values = dict(row)
         values["raw"] = json.loads(values["raw"]) if values.get("raw") else None
+        values["submission_payload"] = (
+            json.loads(values["submission_payload"])
+            if values.get("submission_payload")
+            else None
+        )
         return TaskRecord(**values)
 
     @staticmethod
@@ -305,20 +334,174 @@ class TaskStore:
                 INSERT INTO tasks (
                     id, api, model, prompt, seconds, size, ratio, resolution,
                     status, progress, created_at, updated_at, api_key_mask, account_id, advertiser_id, completed_at,
-                    video_id, video_url, poster_url, error_code, error_message, raw
+                    video_id, video_url, poster_url, error_code, error_message, raw,
+                    upstream_task_id, submission_status, submission_payload
                 ) VALUES (
                     :id, :api, :model, :prompt, :seconds, :size, :ratio, :resolution,
                     :status, :progress, :created_at, :updated_at, :api_key_mask, :account_id, :advertiser_id, :completed_at,
-                    :video_id, :video_url, :poster_url, :error_code, :error_message, :raw
+                    :video_id, :video_url, :poster_url, :error_code, :error_message, :raw,
+                    :upstream_task_id, :submission_status, :submission_payload
                 )
                 """,
                 values,
             )
         return record
 
+    def create_submission(
+        self,
+        *,
+        task_id: str,
+        model: str,
+        prompt: str,
+        seconds: int,
+        size: str,
+        api_key_mask: str | None,
+        idempotency_key_hash: str | None,
+        payload: dict[str, Any],
+    ) -> TaskRecord:
+        now = int(time.time())
+        record = TaskRecord(
+            id=task_id,
+            api="openai",
+            model=model,
+            prompt=prompt,
+            seconds=seconds,
+            size=size,
+            ratio="adaptive",
+            resolution="720p",
+            status="queued",
+            progress=0,
+            created_at=now,
+            updated_at=now,
+            api_key_mask=api_key_mask,
+            idempotency_key_hash=idempotency_key_hash,
+            submission_status="queued",
+            submission_payload=payload,
+        )
+        values = asdict(record)
+        values["raw"] = None
+        values["submission_payload"] = json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":")
+        )
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO tasks (
+                    id, api, model, prompt, seconds, size, ratio, resolution,
+                    status, progress, created_at, updated_at, api_key_mask,
+                    account_id, advertiser_id, completed_at, video_id, video_url,
+                    poster_url, error_code, error_message, raw, upstream_task_id,
+                    submission_status, submission_payload, idempotency_key_hash
+                ) VALUES (
+                    :id, :api, :model, :prompt, :seconds, :size, :ratio, :resolution,
+                    :status, :progress, :created_at, :updated_at, :api_key_mask,
+                    :account_id, :advertiser_id, :completed_at, :video_id, :video_url,
+                    :poster_url, :error_code, :error_message, :raw, :upstream_task_id,
+                    :submission_status, :submission_payload, :idempotency_key_hash
+                )
+                """,
+                values,
+            )
+        return record
+
+    def claim_submission(self, task_id: str) -> TaskRecord | None:
+        now = int(time.time())
+        with self._lock, self._connect() as connection:
+            result = connection.execute(
+                """
+                UPDATE tasks
+                SET submission_status = 'submitting', updated_at = ?
+                WHERE id = ? AND status = 'queued' AND submission_status = 'queued'
+                """,
+                (now, task_id),
+            )
+            if result.rowcount == 0:
+                return None
+            row = connection.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+        return self._decode(row) if row else None
+
+    def queued_submission_ids(self) -> list[str]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id FROM tasks
+                WHERE status = 'queued' AND submission_status = 'queued'
+                ORDER BY created_at, id
+                """
+            ).fetchall()
+        return [str(row["id"]) for row in rows]
+
+    def interrupted_submissions(self) -> list[TaskRecord]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM tasks WHERE submission_status = 'submitting'"
+            ).fetchall()
+        return [self._decode(row) for row in rows]
+
+    def complete_submission(
+        self,
+        task_id: str,
+        *,
+        upstream_task_id: str,
+        account_id: str | None,
+        advertiser_id: str | None,
+    ) -> TaskRecord:
+        now = int(time.time())
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE tasks
+                SET upstream_task_id = ?, submission_status = 'submitted',
+                    submission_payload = NULL, account_id = ?, advertiser_id = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (upstream_task_id, account_id, advertiser_id, now, task_id),
+            )
+        record = self.get(task_id)
+        if record is None:
+            raise KeyError(task_id)
+        return record
+
+    def fail_submission(
+        self, task_id: str, *, error_code: str, error_message: str
+    ) -> TaskRecord:
+        now = int(time.time())
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE tasks
+                SET status = 'failed', submission_status = 'failed',
+                    submission_payload = NULL, error_code = ?, error_message = ?,
+                    completed_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (error_code, error_message, now, now, task_id),
+            )
+        record = self.get(task_id)
+        if record is None:
+            raise KeyError(task_id)
+        return record
+
     def get(self, task_id: str) -> TaskRecord | None:
         with self._lock, self._connect() as connection:
             row = connection.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        return self._decode(row) if row else None
+
+    def get_by_upstream_task_id(self, task_id: str) -> TaskRecord | None:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM tasks WHERE upstream_task_id = ?", (task_id,)
+            ).fetchone()
+        return self._decode(row) if row else None
+
+    def get_by_idempotency_key_hash(self, key_hash: str) -> TaskRecord | None:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM tasks WHERE idempotency_key_hash = ?", (key_hash,)
+            ).fetchone()
         return self._decode(row) if row else None
 
     def update(self, task_id: str, **changes: Any) -> TaskRecord:
@@ -333,6 +516,11 @@ class TaskStore:
             "error_code",
             "error_message",
             "raw",
+            "account_id",
+            "advertiser_id",
+            "upstream_task_id",
+            "submission_status",
+            "submission_payload",
         }
         invalid = set(changes) - allowed
         if invalid:
@@ -343,6 +531,16 @@ class TaskStore:
         encoded = dict(changes)
         if "raw" in encoded:
             encoded["raw"] = json.dumps(encoded["raw"], ensure_ascii=False)
+        if "submission_payload" in encoded:
+            encoded["submission_payload"] = (
+                json.dumps(
+                    encoded["submission_payload"],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                if encoded["submission_payload"] is not None
+                else None
+            )
         assignments = ", ".join(f"{name} = :{name}" for name in encoded)
         encoded["id"] = task_id
         with self._lock, self._connect() as connection:

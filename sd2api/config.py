@@ -32,6 +32,12 @@ class RuntimeConfig(BaseModel):
     pool_rate_limit_cooldown: int = Field(default=90, ge=1, le=3600)
     pool_generation_limit_cooldown: int = Field(default=300, ge=1, le=3600)
     pool_start_concurrency: int = Field(default=3, ge=1, le=50)
+    submission_concurrency: int = Field(default=4, ge=1, le=32)
+    submission_staging_max_bytes: int = Field(
+        default=8 * 1024 * 1024 * 1024,
+        ge=512 * 1024 * 1024,
+        le=500 * 1024 * 1024 * 1024,
+    )
     protocol_upload_concurrency: int = Field(default=3, ge=1, le=16)
     protocol_direct_upload_bytes: int = Field(
         default=5 * 1024 * 1024, ge=256 * 1024, le=64 * 1024 * 1024
@@ -90,6 +96,8 @@ LEGACY_ENV_FIELDS = {
     "SD2API_POOL_RATE_LIMIT_COOLDOWN": "pool_rate_limit_cooldown",
     "SD2API_POOL_GENERATION_LIMIT_COOLDOWN": "pool_generation_limit_cooldown",
     "SD2API_POOL_START_CONCURRENCY": "pool_start_concurrency",
+    "SD2API_SUBMISSION_CONCURRENCY": "submission_concurrency",
+    "SD2API_SUBMISSION_STAGING_MAX_BYTES": "submission_staging_max_bytes",
     "SD2API_PROTOCOL_UPLOAD_CONCURRENCY": "protocol_upload_concurrency",
     "SD2API_PROTOCOL_DIRECT_UPLOAD_BYTES": "protocol_direct_upload_bytes",
     "SD2API_PROTOCOL_SLICE_BYTES": "protocol_slice_bytes",

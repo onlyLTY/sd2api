@@ -29,6 +29,7 @@ from sd2api.models import OpenAICreateVideoRequest, SeedanceCreateRequest, Upstr
 from sd2api.protocol import ProtocolSession, ProtocolTikTokClient, _sign_gateway_request
 from sd2api.security import CredentialError, CredentialVault
 from sd2api.store import TaskStore
+from sd2api.submissions import VideoSubmissionDispatcher
 from sd2api.temp_mail import TempMailClient
 from sd2api.tiktok import TikTokClient, TikTokUpstreamError
 from sd2api.uploads import StagedMedia, UploadManager
@@ -1365,14 +1366,29 @@ def test_openai_route_accepts_json_and_multipart(tmp_path: Path, monkeypatch: py
         },
     )
 
-    assert json_response.status_code == 200
-    assert multipart_response.status_code == 200
+    assert json_response.status_code == 202
+    assert multipart_response.status_code == 202
     assert json_response.json()["status"] == "queued"
     assert multipart_response.json()["size"] == "1280x720"
-    assert fake.calls == [
-        {"prompt": "A red ball", "model": "sora-2", "duration": 5},
-        {"prompt": "A blue ball", "model": "sora-2", "duration": 5},
-    ]
+    assert json_response.json()["id"].startswith("video_")
+    assert fake.calls == []
+    stored = main.store.get(json_response.json()["id"])
+    assert stored is not None
+    assert stored.submission_status == "queued"
+
+    idempotent_headers = {**headers, "Idempotency-Key": "caller-job-123"}
+    first = api.post(
+        "/v1/videos",
+        headers=idempotent_headers,
+        json={"model": "sora-2", "prompt": "Only once", "seconds": 5},
+    )
+    repeated = api.post(
+        "/v1/videos",
+        headers=idempotent_headers,
+        json={"model": "sora-2", "prompt": "Only once", "seconds": 5},
+    )
+    assert first.status_code == repeated.status_code == 202
+    assert first.json()["id"] == repeated.json()["id"]
 
 
 def test_openai_multipart_image_routes_to_image_video(
@@ -1416,11 +1432,24 @@ def test_openai_multipart_image_routes_to_image_video(
         files={"input_reference": ("cube.png", png_bytes(), "image/png")},
     )
 
-    assert response.status_code == 200
-    assert response.json()["id"] == "image-task-1"
+    assert response.status_code == 202
+    task_id = response.json()["id"]
+    queued = main.store.get(task_id)
+    assert queued is not None
+    staged_path = Path(queued.submission_payload["media"][0]["value"])
+    assert staged_path.is_file()
+    dispatcher = VideoSubmissionDispatcher(
+        store=main.store,
+        uploads=main.uploads,
+        client=fake,
+        concurrency=1,
+        audit=lambda *args, **kwargs: None,
+    )
+    asyncio.run(dispatcher._submit(task_id))
     assert len(fake.calls) == 1
-    assert Path(str(fake.calls[0]["image_path"])).is_file()
     assert fake.calls[0]["duration"] == 5
+    assert main.store.get(task_id).upstream_task_id == "image-task-1"
+    assert not staged_path.exists()
 
     data_url = "data:image/png;base64," + base64.b64encode(png_bytes()).decode("ascii")
     seedance_response = api.post(
@@ -1498,13 +1527,51 @@ def test_openai_multipart_image_routes_to_image_video(
             ("reference_media", ("tone.wav", wav_bytes(), "audio/wav")),
         ],
     )
-    assert openai_reference_response.status_code == 200
-    assert openai_reference_response.json()["id"] == "reference-task-2"
+    assert openai_reference_response.status_code == 202
+    reference_local_id = openai_reference_response.json()["id"]
+    asyncio.run(dispatcher._submit(reference_local_id))
+    assert main.store.get(reference_local_id).upstream_task_id == "reference-task-2"
     assert [item.kind for item in fake.reference_calls[1]["media"]] == [
         "image",
         "video",
         "audio",
     ]
+
+
+def test_deleting_queued_openai_video_cleans_staged_media(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sd2api.main as main
+
+    class FakeBrowserClient:
+        async def create_image_video(self, **kwargs: object) -> str:
+            return "unused"
+
+    monkeypatch.setattr(main, "BrowserTikTokClient", FakeBrowserClient)
+    monkeypatch.setattr(main, "client", FakeBrowserClient())
+    monkeypatch.setattr(main, "store", TaskStore(str(tmp_path / "delete-queued.db")))
+    monkeypatch.setattr(
+        main,
+        "uploads",
+        UploadManager(Settings(sd2api_upload_dir=str(tmp_path / "uploads"))),
+    )
+    api = TestClient(main.app)
+    headers = {"Authorization": f"Bearer {main.settings.sd2api_api_key}"}
+    response = api.post(
+        "/v1/videos",
+        headers=headers,
+        data={"model": "sora-2", "prompt": "test", "seconds": "5"},
+        files={"input_reference": ("frame.png", png_bytes(), "image/png")},
+    )
+    task_id = response.json()["id"]
+    record = main.store.get(task_id)
+    staged = Path(record.submission_payload["media"][0]["value"])
+
+    deleted = api.delete(f"/v1/videos/{task_id}", headers=headers)
+
+    assert deleted.status_code == 200
+    assert main.store.get(task_id) is None
+    assert not staged.exists()
 
 
 @pytest.mark.asyncio
@@ -1513,6 +1580,144 @@ async def test_upload_manager_rejects_private_image_url(tmp_path: Path) -> None:
     with pytest.raises(TikTokUpstreamError) as error:
         await manager.save_url("http://127.0.0.1/private.png")
     assert error.value.code == "image_url_blocked"
+
+
+@pytest.mark.asyncio
+async def test_submission_dispatcher_marks_interrupted_task_failed_and_cleans_media(
+    tmp_path: Path,
+) -> None:
+    class FakeClient:
+        async def create_text_video(self, **kwargs: object) -> str:
+            return "unused"
+
+    task_store = TaskStore(str(tmp_path / "submissions.db"))
+    upload_manager = UploadManager(
+        Settings(sd2api_upload_dir=str(tmp_path / "uploads"))
+    )
+    staged = upload_manager.root / "queued.png"
+    staged.write_bytes(png_bytes())
+    task_store.create_submission(
+        task_id="video_interrupted",
+        model="seedance-2.0",
+        prompt="A red ball",
+        seconds=5,
+        size="720x1280",
+        api_key_mask=None,
+        idempotency_key_hash=None,
+        payload={
+            "mode": "image",
+            "media": [{"kind": "image", "source": "path", "value": str(staged)}],
+        },
+    )
+    assert task_store.claim_submission("video_interrupted") is not None
+    dispatcher = VideoSubmissionDispatcher(
+        store=task_store,
+        uploads=upload_manager,
+        client=FakeClient(),
+        concurrency=1,
+        audit=lambda *args, **kwargs: None,
+    )
+
+    await dispatcher.start()
+    await dispatcher.stop()
+
+    recovered = task_store.get("video_interrupted")
+    assert recovered is not None
+    assert recovered.status == "failed"
+    assert recovered.error_code == "submission_interrupted"
+    assert not staged.exists()
+
+
+@pytest.mark.asyncio
+async def test_refresh_uses_upstream_id_for_async_submission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sd2api.main as main
+
+    class FakeClient:
+        checked: list[str] = []
+
+        async def check_task(self, task_id: str) -> UpstreamTask:
+            self.checked.append(task_id)
+            return UpstreamTask(id=task_id, status="running", progress=20)
+
+    task_store = TaskStore(str(tmp_path / "refresh-local.db"))
+    task_store.create_submission(
+        task_id="video_local",
+        model="seedance-2.0",
+        prompt="A red ball",
+        seconds=5,
+        size="720x1280",
+        api_key_mask=None,
+        idempotency_key_hash=None,
+        payload={"mode": "text", "media": []},
+    )
+    task_store.claim_submission("video_local")
+    task_store.complete_submission(
+        "video_local",
+        upstream_task_id="tiktok_upstream",
+        account_id=None,
+        advertiser_id=None,
+    )
+    fake = FakeClient()
+    monkeypatch.setattr(main, "store", task_store)
+    monkeypatch.setattr(main, "client", fake)
+
+    refreshed = await main.refresh(task_store.get("video_local"))
+
+    assert fake.checked == ["tiktok_upstream"]
+    assert refreshed.id == "video_local"
+    assert refreshed.status == "running"
+
+
+@pytest.mark.asyncio
+async def test_submission_worker_survives_cancelled_task(tmp_path: Path) -> None:
+    started = asyncio.Event()
+
+    class FakeClient:
+        calls = 0
+
+        async def create_text_video(self, **kwargs: object) -> str:
+            self.calls += 1
+            if self.calls == 1:
+                started.set()
+                await asyncio.Event().wait()
+            return "upstream-second"
+
+    task_store = TaskStore(str(tmp_path / "cancel-submission.db"))
+    for task_id in ("video_first", "video_second"):
+        task_store.create_submission(
+            task_id=task_id,
+            model="seedance-2.0",
+            prompt=task_id,
+            seconds=5,
+            size="720x1280",
+            api_key_mask=None,
+            idempotency_key_hash=None,
+            payload={"mode": "text", "media": []},
+        )
+    dispatcher = VideoSubmissionDispatcher(
+        store=task_store,
+        uploads=UploadManager(Settings(sd2api_upload_dir=str(tmp_path / "uploads"))),
+        client=FakeClient(),
+        concurrency=1,
+        audit=lambda *args, **kwargs: None,
+    )
+    await dispatcher.start()
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    await dispatcher.cancel("video_first")
+    task_store.delete("video_first")
+    for _ in range(100):
+        second = task_store.get("video_second")
+        if second and second.upstream_task_id:
+            break
+        await asyncio.sleep(0.01)
+    await dispatcher.stop()
+
+    second = task_store.get("video_second")
+    assert second is not None
+    assert second.upstream_task_id == "upstream-second"
 
 
 def protocol_session() -> ProtocolSession:
@@ -3814,8 +4019,8 @@ def test_admin_can_manage_multiple_api_keys_and_tasks_record_masked_key(
         headers={"Authorization": "Bearer worker-api-key-1234567890"},
         json={"model": "seedance-2.0", "prompt": "A calm lake", "seconds": 5},
     )
-    assert generated.status_code == 200
-    stored = task_store.get("managed-key-task")
+    assert generated.status_code == 202
+    stored = task_store.get(generated.json()["id"])
     assert stored is not None
     assert stored.api_key_mask == "wo***90"
 
@@ -4130,11 +4335,12 @@ def test_admin_key_can_submit_openai_compatible_video(
             "seconds": 5,
         },
     )
-    assert response.status_code == 200
-    assert response.json()["id"] == "admin-created-task"
+    assert response.status_code == 202
+    assert response.json()["id"].startswith("video_")
+    assert main.store.get(response.json()["id"]).submission_status == "queued"
 
 
-def test_video_api_returns_upstream_model_permission_error_as_403(
+def test_video_api_records_upstream_model_permission_error_as_failed_task(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import sd2api.main as main
@@ -4161,10 +4367,18 @@ def test_video_api_returns_upstream_model_permission_error_as_403(
             "seconds": 5,
         },
     )
-    assert response.status_code == 403
-    assert response.json()["error"] == {
-        "message": "没有模型使用权限",
-        "type": "upstream_error",
-        "param": None,
-        "code": "10001100",
-    }
+    assert response.status_code == 202
+    task_id = response.json()["id"]
+    dispatcher = VideoSubmissionDispatcher(
+        store=main.store,
+        uploads=main.uploads,
+        client=main.client,
+        concurrency=1,
+        audit=lambda *args, **kwargs: None,
+    )
+    asyncio.run(dispatcher._submit(task_id))
+    failed = main.store.get(task_id)
+    assert failed is not None
+    assert failed.status == "failed"
+    assert failed.error_code == "10001100"
+    assert failed.error_message == "没有模型使用权限"

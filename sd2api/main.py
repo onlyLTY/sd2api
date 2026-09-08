@@ -5,6 +5,7 @@ import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 import logging
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import time
@@ -36,6 +37,7 @@ from .models import (
     VideoURLContent,
 )
 from .store import TaskRecord, TaskStore
+from .submissions import VideoSubmissionDispatcher
 from .tiktok import TikTokClient, TikTokUpstreamError
 from .uploads import StagedMedia, UploadManager
 from . import __version__
@@ -53,6 +55,7 @@ elif settings.sd2api_mode.lower() == "browser":
 else:
     client = TikTokClient(settings)
 feishu_notifier = FeishuNotifier(settings)
+submission_dispatcher: VideoSubmissionDispatcher | None = None
 
 
 def public_runtime_config(config: RuntimeConfig) -> dict[str, Any]:
@@ -85,6 +88,7 @@ def audit_event(
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    global submission_dispatcher
     audit_event("info", "system", "sd2api 服务已启动")
     if isinstance(client, (BrowserTikTokClient, BrowserPoolClient)) and settings.sd2api_browser_autostart:
         try:
@@ -97,9 +101,19 @@ async def lifespan(_: FastAPI):
             feishu_notifier.run(client.list_accounts),
             name="sd2api-feishu-notifications",
         )
+    submission_dispatcher = VideoSubmissionDispatcher(
+        store=store,
+        uploads=uploads,
+        client=client,
+        concurrency=settings.sd2api_submission_concurrency,
+        audit=audit_event,
+    )
+    await submission_dispatcher.start()
     try:
         yield
     finally:
+        await submission_dispatcher.stop()
+        submission_dispatcher = None
         if notification_task:
             notification_task.cancel()
             await asyncio.gather(notification_task, return_exceptions=True)
@@ -139,6 +153,8 @@ T2V、I2V、R2V 的成功任务当前均实测为竖屏 `720 × 1280`。单首�
 
 OPENAI_CREATE_DESCRIPTION = """
 以 OpenAI Videos 风格创建 TikTok Seedance 视频。既接受 `application/json`，也接受上传文件用的 `multipart/form-data`。
+
+请求完成校验和本地持久化后立即返回 HTTP 202 与本地任务 ID。素材上传到 TikTok 和创建上游任务由后台执行；使用 `GET /v1/videos/{video_id}` 轮询同一个本地任务 ID。
 
 - `seconds` 是唯一可控的视频规格参数：支持 **4–15 秒**的任意整数。
 - `size` 只为 OpenAI SDK 兼容而保存和回显，**不会发送给 TikTok**；当前实测输出固定为竖屏 `720 × 1280`。
@@ -415,7 +431,9 @@ def not_found(task_id: str) -> HTTPException:
 async def refresh(record: TaskRecord, *, force: bool = False) -> TaskRecord:
     if not force and record.status in {"succeeded", "failed"} and record.video_url:
         return record
-    upstream = await client.check_task(record.id)
+    if record.submission_status in {"queued", "submitting"}:
+        return record
+    upstream = await client.check_task(record.upstream_task_id or record.id)
     updated = store.update(
         record.id,
         status=upstream.status,
@@ -781,6 +799,10 @@ async def admin_config_status() -> dict[str, Any]:
         "novnc_public_port": settings.sd2api_novnc_public_port,
         "protocol_transport": "curl_cffi/chrome",
         "protocol_upload_concurrency": settings.sd2api_protocol_upload_concurrency,
+        "submission_concurrency": settings.sd2api_submission_concurrency,
+        "submission_staging_max_bytes": (
+            settings.sd2api_submission_staging_max_bytes
+        ),
         "rate_limit_cooldown": settings.sd2api_pool_rate_limit_cooldown,
         "generation_limit_cooldown": settings.sd2api_pool_generation_limit_cooldown,
         "daily_quota_codes": settings.sd2api_pool_daily_quota_codes,
@@ -882,6 +904,8 @@ async def update_admin_runtime_config(body: RuntimeConfig) -> dict[str, Any]:
         "browser_headless",
         "browser_autostart",
         "pool_start_concurrency",
+        "submission_concurrency",
+        "submission_staging_max_bytes",
         "protocol_upload_concurrency",
         "upload_dir",
     }
@@ -1465,6 +1489,7 @@ def validate_reference_media(media: list[StagedMedia]) -> None:
     "/v1/videos",
     dependencies=[Depends(require_api_key)],
     summary="创建视频（OpenAI 兼容）",
+    status_code=202,
     description=OPENAI_CREATE_DESCRIPTION,
     responses={
         403: {
@@ -1541,95 +1566,128 @@ def validate_reference_media(media: list[StagedMedia]) -> None:
     },
 )
 async def create_openai_video(request: Request) -> dict[str, Any]:
+    idempotency_key = request.headers.get("idempotency-key", "").strip()
+    idempotency_key_hash = (
+        store.api_key_hash(f"{supplied_bearer(request)}\0{idempotency_key}")
+        if idempotency_key
+        else None
+    )
+    if idempotency_key_hash:
+        existing = store.get_by_idempotency_key_hash(idempotency_key_hash)
+        if existing is not None:
+            return openai_video(existing)
     body, input_image, reference_media = await parse_openai_create_request(request)
+    staged = ([input_image] if input_image else []) + reference_media
     try:
-        if body.input_reference is not None:
-            if body.input_reference.file_id:
-                raise HTTPException(
-                    status_code=501,
-                    detail="OpenAI file_id references are not supported; upload the image as multipart or use image_url",
-                )
-            input_image = await uploads.save_media_url(
-                body.input_reference.image_url or "",
-                kind="image",
+        if body.input_reference is not None and body.input_reference.file_id:
+            raise HTTPException(
+                status_code=501,
+                detail="OpenAI file_id references are not supported; upload the image as multipart or use image_url",
             )
-        for item in body.references:
-            reference_media.append(
-                await uploads.save_media_url(
-                    reference_content_url(item),
-                    kind=reference_content_kind(item),
-                )
-            )
-        if input_image and reference_media:
+        if (input_image or body.input_reference) and (
+            reference_media or body.references
+        ):
             raise HTTPException(
                 status_code=422,
                 detail="input_reference and references/reference_media are mutually exclusive",
             )
-        if (input_image or reference_media) and not isinstance(
+        has_media = bool(
+            input_image or body.input_reference or reference_media or body.references
+        )
+        if has_media and not isinstance(
             client, (BrowserTikTokClient, BrowserPoolClient)
         ):
             raise HTTPException(
                 status_code=501,
                 detail="Image and reference video modes require SD2API_MODE=browser or browser_pool",
             )
-        if reference_media:
-            validate_reference_media(reference_media)
+        reference_kinds = [item.kind for item in reference_media] + [
+            reference_content_kind(item) for item in body.references
+        ]
+        if reference_kinds:
+            images = reference_kinds.count("image")
+            videos = reference_kinds.count("video")
+            audios = reference_kinds.count("audio")
+            if not (images or videos):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Reference to video requires at least one image or video",
+                )
+            if images > 9 or videos > 3 or audios > 3:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Reference limits are 9 images, 3 videos, and 3 audio clips",
+                )
+        if (
+            store.count_tasks(status=("queued", "running"))
+            >= settings.sd2api_pool_max_pending
+        ):
+            raise TikTokUpstreamError(
+                "The video submission queue is full",
+                status_code=429,
+                code="pool_queue_full",
+            )
+        if has_media:
+            uploads.ensure_staging_capacity()
     except Exception:
-        uploads.cleanup(reference_media)
-        if input_image:
-            uploads.cleanup([input_image])
+        uploads.cleanup(staged)
         raise
 
     seconds = int(body.seconds)
-    try:
-        if reference_media:
-            task_id = await client.create_reference_video(
-                prompt=body.prompt,
-                model=body.model,
-                duration=seconds,
-                media=reference_media,
-            )
-        elif input_image:
-            task_id = await client.create_image_video(
-                prompt=body.prompt,
-                model=body.model,
-                duration=seconds,
-                image_path=input_image.path,
-            )
-        else:
-            task_id = await client.create_text_video(
-                prompt=body.prompt,
-                model=body.model,
-                duration=seconds,
-            )
-    except Exception:
-        uploads.cleanup(reference_media)
-        if input_image:
-            uploads.cleanup([input_image])
-        raise
-    record = store.create(
-        task_id=task_id,
-        api="openai",
-        model=body.model,
-        prompt=body.prompt,
-        seconds=seconds,
-        size=body.size,
-        api_key_mask=getattr(request.state, "api_key_mask", None),
-        account_id=client.account_for_task(task_id) if isinstance(client, BrowserPoolClient) else None,
-        advertiser_id=(
-            client.advertiser_for_task(task_id)
-            if isinstance(client, BrowserPoolClient)
-            else None
-        ),
+    media_payload = [
+        {"kind": item.kind, "source": "path", "value": item.path}
+        for item in staged
+    ]
+    if body.input_reference is not None:
+        media_payload.append(
+            {
+                "kind": "image",
+                "source": "url",
+                "value": body.input_reference.image_url,
+            }
+        )
+    media_payload.extend(
+        {
+            "kind": reference_content_kind(item),
+            "source": "url",
+            "value": reference_content_url(item),
+        }
+        for item in body.references
     )
+    mode = "reference" if reference_kinds else "image" if media_payload else "text"
+    try:
+        record = store.create_submission(
+            task_id="video_" + secrets.token_hex(16),
+            model=body.model,
+            prompt=body.prompt,
+            seconds=seconds,
+            size=body.size,
+            api_key_mask=getattr(request.state, "api_key_mask", None),
+            idempotency_key_hash=idempotency_key_hash,
+            payload={"mode": mode, "media": media_payload},
+        )
+    except sqlite3.IntegrityError:
+        uploads.cleanup(staged)
+        existing = (
+            store.get_by_idempotency_key_hash(idempotency_key_hash)
+            if idempotency_key_hash
+            else None
+        )
+        if existing is not None:
+            return openai_video(existing)
+        raise
+    except Exception:
+        uploads.cleanup(staged)
+        raise
+    if submission_dispatcher is not None:
+        submission_dispatcher.wake()
     audit_event(
         "info",
         "video",
-        "视频任务已提交",
-        account_id=record.account_id,
+        "视频任务已受理",
         task_id=record.id,
         details={
-            "mode": "reference" if reference_media else "image" if input_image else "text",
+            "mode": mode,
             "model": upstream_model_name(record.model),
             "duration": record.seconds,
         },
@@ -1661,6 +1719,20 @@ async def list_openai_videos(
 
 @app.delete("/v1/videos/{video_id}", dependencies=[Depends(require_api_key)])
 async def delete_openai_video(video_id: str) -> dict[str, Any]:
+    record = store.get(video_id)
+    if record is None:
+        raise not_found(video_id)
+    if record.submission_status in {"queued", "submitting"}:
+        if submission_dispatcher is not None:
+            await submission_dispatcher.cancel(video_id)
+        elif record.submission_payload:
+            uploads.cleanup(
+                [
+                    StagedMedia(kind=item["kind"], path=item["value"])
+                    for item in record.submission_payload.get("media", [])
+                    if item.get("source") == "path"
+                ]
+            )
     if not store.delete(video_id):
         raise not_found(video_id)
     return {"id": video_id, "object": "video.deleted", "deleted": True}
