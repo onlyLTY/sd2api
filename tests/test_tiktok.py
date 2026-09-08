@@ -357,6 +357,15 @@ def test_store_round_trip(tmp_path: Path) -> None:
     }
     assert store.task_counts(created_since=created.created_at)["today"] == 1
     assert store.task_counts(created_since=created.created_at + 1)["today"] == 0
+    with store._connect() as connection:
+        task_indexes = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'tasks'"
+            )
+        }
+    assert "tasks_account_advertiser_created_idx" in task_indexes
+    assert "tasks_status_created_idx" in task_indexes
 
     event = store.add_event(
         level="success",
