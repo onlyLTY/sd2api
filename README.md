@@ -143,6 +143,13 @@ print(f"Current Status: {status.status}")
 
 创建接口返回 HTTP `202 Accepted`。响应中的 `id` 是 sd2api 本地任务 ID；后台随后下载远程素材、上传到 TikTok 并创建上游任务。调用方应使用该 ID 轮询，不需要为创建请求设置几十分钟的读取超时。
 
+任务查询、删除和内容下载同时兼容两种 ID：
+
+- sd2api 创建接口返回的本地任务 ID，例如 `video_abc123`（推荐）。
+- TikTok 创建任务后返回的上游 task ID，供仍保存旧 ID 的调用方兼容使用。
+
+兼容范围包括 `GET /v1/videos/{video_id}`、`DELETE /v1/videos/{video_id}`、`GET /v1/videos/{video_id}/content`，以及 Seedance 风格的任务查询和删除接口。使用 TikTok task ID 查询新异步任务时，响应体中的 `id` 仍返回对应的 sd2api 本地任务 ID。历史数据中直接以 TikTok task ID 作为主 ID 的任务不受影响。
+
 调用方重试创建请求时应携带稳定的 `Idempotency-Key` 请求头。同一 API Key 与幂等键会返回第一次受理的本地任务，避免网络重试造成重复生成和重复扣费。
 
 #### cURL 调用示例
@@ -188,14 +195,18 @@ curl -X POST http://127.0.0.1:8765/v1/videos \
 ##### 状态查询与视频下载
 
 ```bash
-# 查询任务状态
-curl http://127.0.0.1:8765/v1/videos/{video_id} \
+# 查询任务状态；可传本地 video_* ID 或 TikTok task ID
+curl http://127.0.0.1:8765/v1/videos/{video_id_or_tiktok_task_id} \
   -H "Authorization: Bearer your-custom-api-key"
 
-# 下载原始 MP4 视频
-curl http://127.0.0.1:8765/v1/videos/{video_id}/content \
+# 下载原始 MP4 视频；两种 ID 均可
+curl http://127.0.0.1:8765/v1/videos/{video_id_or_tiktok_task_id}/content \
   -H "Authorization: Bearer your-custom-api-key" \
   -o result.mp4
+
+# 删除任务；两种 ID 均可
+curl -X DELETE http://127.0.0.1:8765/v1/videos/{video_id_or_tiktok_task_id} \
+  -H "Authorization: Bearer your-custom-api-key"
 ```
 
 ---
@@ -238,9 +249,11 @@ curl -X POST http://127.0.0.1:8765/api/v3/contents/generations/tasks \
 #### 查询任务
 
 ```bash
-curl http://127.0.0.1:8765/api/v3/contents/generations/tasks/{task_id} \
+curl http://127.0.0.1:8765/api/v3/contents/generations/tasks/{local_or_tiktok_task_id} \
   -H "Authorization: Bearer your-custom-api-key"
 ```
+
+`task_id` 可使用 sd2api 本地任务 ID 或 TikTok task ID；删除接口 `DELETE /api/v3/contents/generations/tasks/{task_id}` 同样兼容。
 
 ---
 

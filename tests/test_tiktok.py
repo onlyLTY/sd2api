@@ -2589,6 +2589,18 @@ def test_openapi_documents_video_parameters_and_both_openai_body_formats() -> No
     assert multipart_properties["input_reference"]["format"] == "binary"
     assert multipart_properties["reference_media"]["items"]["format"] == "binary"
 
+    compatible_id_operations = [
+        schema["paths"]["/v1/videos/{video_id}"]["get"],
+        schema["paths"]["/v1/videos/{video_id}"]["delete"],
+        schema["paths"]["/v1/videos/{video_id}/content"]["get"],
+        schema["paths"]["/api/v3/contents/generations/tasks/{task_id}"]["get"],
+        schema["paths"]["/api/v3/contents/generations/tasks/{task_id}"]["delete"],
+    ]
+    for operation in compatible_id_operations:
+        assert "本地 `video_*` ID" in operation["description"]
+        assert "TikTok 上游 task ID" in operation["description"]
+        assert "响应体中的 `id`" in operation["description"]
+
 
 def test_protocol_session_derives_device_id_from_browser_cookie() -> None:
     session = ProtocolSession.from_dict(
