@@ -428,6 +428,10 @@ def not_found(task_id: str) -> HTTPException:
     return HTTPException(status_code=404, detail=f"Video task {task_id!r} was not found")
 
 
+def find_task(task_id: str) -> TaskRecord | None:
+    return store.get(task_id) or store.get_by_upstream_task_id(task_id)
+
+
 async def refresh(record: TaskRecord, *, force: bool = False) -> TaskRecord:
     if record.submission_status == "failed":
         return record
@@ -1342,7 +1346,7 @@ async def create_seedance_video(
 
 @app.get("/api/v3/contents/generations/tasks/{task_id}", dependencies=[Depends(require_api_key)])
 async def retrieve_seedance_video(task_id: str) -> dict[str, Any]:
-    record = store.get(task_id)
+    record = find_task(task_id)
     if record is None:
         raise not_found(task_id)
     return seedance_task(await refresh(record))
@@ -1360,9 +1364,10 @@ async def list_seedance_videos(
 
 @app.delete("/api/v3/contents/generations/tasks/{task_id}", dependencies=[Depends(require_api_key)])
 async def delete_seedance_video(task_id: str) -> dict[str, Any]:
-    if not store.delete(task_id):
+    record = find_task(task_id)
+    if record is None or not store.delete(record.id):
         raise not_found(task_id)
-    return {"id": task_id, "deleted": True}
+    return {"id": record.id, "deleted": True}
 
 
 async def parse_openai_create_request(
@@ -1699,7 +1704,7 @@ async def create_openai_video(request: Request) -> dict[str, Any]:
 
 @app.get("/v1/videos/{video_id}", dependencies=[Depends(require_api_key)])
 async def retrieve_openai_video(video_id: str) -> dict[str, Any]:
-    record = store.get(video_id)
+    record = find_task(video_id)
     if record is None:
         raise not_found(video_id)
     return openai_video(await refresh(record))
@@ -1721,12 +1726,12 @@ async def list_openai_videos(
 
 @app.delete("/v1/videos/{video_id}", dependencies=[Depends(require_api_key)])
 async def delete_openai_video(video_id: str) -> dict[str, Any]:
-    record = store.get(video_id)
+    record = find_task(video_id)
     if record is None:
         raise not_found(video_id)
     if record.submission_status in {"queued", "submitting"}:
         if submission_dispatcher is not None:
-            await submission_dispatcher.cancel(video_id)
+            await submission_dispatcher.cancel(record.id)
         elif record.submission_payload:
             uploads.cleanup(
                 [
@@ -1735,14 +1740,14 @@ async def delete_openai_video(video_id: str) -> dict[str, Any]:
                     if item.get("source") == "path"
                 ]
             )
-    if not store.delete(video_id):
+    if not store.delete(record.id):
         raise not_found(video_id)
-    return {"id": video_id, "object": "video.deleted", "deleted": True}
+    return {"id": record.id, "object": "video.deleted", "deleted": True}
 
 
 @app.get("/v1/videos/{video_id}/content", dependencies=[Depends(require_api_key)])
 async def download_openai_video(video_id: str) -> Response:
-    record = store.get(video_id)
+    record = find_task(video_id)
     if record is None:
         raise not_found(video_id)
     record = await refresh(
