@@ -969,12 +969,11 @@ async def pool_status() -> dict[str, Any]:
     return await require_pool().status()
 
 
-def admin_task(record: TaskRecord) -> dict[str, Any]:
-    account = store.get_account(record.account_id) if record.account_id else None
+def admin_task(record: TaskRecord, account_names: dict[str, str]) -> dict[str, Any]:
     return {
         "id": record.id,
         "api": record.api,
-        "account_email": (account or {}).get("email_address") or (account or {}).get("username"),
+        "account_email": account_names.get(record.account_id or ""),
         "advertiser_id": record.advertiser_id,
         "api_key": record.api_key_mask,
         "status": record.status,
@@ -1092,6 +1091,7 @@ async def list_admin_tasks(
         account_id=account_id,
         status=selected_status,
         search=search,
+        include_large_fields=False,
     )
     if refresh_pending:
         pending = [record for record in records if record.status in {"queued", "running"}]
@@ -1111,7 +1111,11 @@ async def list_admin_tasks(
             account_id=account_id,
             status=selected_status,
             search=search,
+            include_large_fields=False,
         )
+    account_names = store.account_names(
+        {record.account_id for record in records if record.account_id}
+    )
     now = int(time.time())
     timezone_shift = timezone_offset * 60
     today_since = now - ((now + timezone_shift) % 86400)
@@ -1124,7 +1128,7 @@ async def list_admin_tasks(
         .timestamp()
     )
     return {
-        "data": [admin_task(record) for record in records],
+        "data": [admin_task(record, account_names) for record in records],
         "summary": store.task_counts(
             created_since=today_since, week_since=week_since
         ),

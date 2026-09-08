@@ -366,6 +366,24 @@ def test_store_round_trip(tmp_path: Path) -> None:
         }
     assert "tasks_account_advertiser_created_idx" in task_indexes
     assert "tasks_status_created_idx" in task_indexes
+    assert "tasks_created_idx" in task_indexes
+
+    with store._connect() as connection:
+        plan = connection.execute(
+            "EXPLAIN QUERY PLAN SELECT * FROM tasks "
+            "ORDER BY created_at DESC, id DESC LIMIT 50"
+        ).fetchall()
+    assert any("tasks_created_idx" in str(row[3]) for row in plan)
+
+    store.update(
+        "task-1",
+        raw={"large": "x" * 10_000},
+        submission_payload={"media": [{"value": "unused"}]},
+    )
+    compact = store.list(include_large_fields=False)[0]
+    assert compact.raw is None
+    assert compact.submission_payload is None
+    assert store.get("task-1").raw == {"large": "x" * 10_000}
 
     event = store.add_event(
         level="success",
@@ -387,7 +405,14 @@ def test_store_round_trip(tmp_path: Path) -> None:
     assert analytics_rows[0]["status"] == "succeeded"
     assert analytics_rows[0]["completed_at"] == updated.completed_at
 
-    account = store.create_account(account_id="account-a", name="Account A")
+    account = store.create_account(
+        account_id="account-a",
+        name="Account A",
+        email_address="account@example.com",
+    )
+    assert store.account_names({"account-a", "missing"}) == {
+        "account-a": "account@example.com"
+    }
     assert account["enabled"] is True
     assert store.update_account("account-a", enabled=False)["enabled"] is False
     assert store.list_accounts()[0]["id"] == "account-a"
@@ -4264,6 +4289,11 @@ def test_admin_tasks_and_logs_support_pagination(
     import sd2api.main as main
 
     task_store = TaskStore(str(tmp_path / "pagination.db"))
+    task_store.create_account(
+        account_id="account-a",
+        name="Account A",
+        email_address="account@example.com",
+    )
     for index in range(3):
         task_store.create(
             task_id=f"task-{index}",
@@ -4271,11 +4301,17 @@ def test_admin_tasks_and_logs_support_pagination(
             model="sora-2",
             prompt=f"Prompt {index}",
             seconds=5,
+            account_id="account-a",
         )
         task_store.add_event(
             level="info", category="video", message=f"Event {index}"
         )
     monkeypatch.setattr(main, "store", task_store)
+    monkeypatch.setattr(
+        task_store,
+        "get_account",
+        lambda *args, **kwargs: pytest.fail("admin list must batch account lookups"),
+    )
     api = TestClient(main.app)
     headers = {
         "Authorization": f"Bearer {main.settings.sd2api_admin_key or main.settings.sd2api_api_key}"
@@ -4288,6 +4324,7 @@ def test_admin_tasks_and_logs_support_pagination(
 
     assert tasks.status_code == 200
     assert len(tasks.json()["data"]) == 1
+    assert tasks.json()["data"][0]["account_email"] == "account@example.com"
     assert tasks.json()["pagination"] == {
         "page": 2, "page_size": 2, "total": 3
     }

@@ -132,6 +132,10 @@ class TaskStore:
                 "ON tasks(status, created_at, id)"
             )
             connection.execute(
+                "CREATE INDEX IF NOT EXISTS tasks_created_idx "
+                "ON tasks(created_at, id)"
+            )
+            connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS api_keys (
                     id TEXT PRIMARY KEY,
@@ -568,6 +572,7 @@ class TaskStore:
         account_id: str | None = None,
         status: str | tuple[str, ...] | None = None,
         search: str | None = None,
+        include_large_fields: bool = True,
     ) -> list[TaskRecord]:
         direction = "ASC" if order == "asc" else "DESC"
         params: list[Any] = []
@@ -597,13 +602,43 @@ class TaskStore:
             pattern = f"%{search}%"
             params.extend([pattern] * 6)
         where = "WHERE " + " AND ".join(conditions) if conditions else ""
+        columns = "*"
+        if not include_large_fields:
+            columns = (
+                "id, api, model, prompt, seconds, size, ratio, resolution, status, "
+                "progress, created_at, updated_at, api_key_mask, account_id, "
+                "advertiser_id, completed_at, video_id, video_url, poster_url, "
+                "error_code, error_message, NULL AS raw, upstream_task_id, "
+                "submission_status, NULL AS submission_payload, idempotency_key_hash"
+            )
         params.extend([limit, offset])
         with self._lock, self._connect() as connection:
             rows = connection.execute(
-                f"SELECT * FROM tasks {where} ORDER BY created_at {direction}, id {direction} LIMIT ? OFFSET ?",
+                f"SELECT {columns} FROM tasks {where} "
+                f"ORDER BY created_at {direction}, id {direction} LIMIT ? OFFSET ?",
                 params,
             ).fetchall()
         return [self._decode(row) for row in rows]
+
+    def account_names(self, account_ids: set[str]) -> dict[str, str]:
+        if not account_ids:
+            return {}
+        result: dict[str, str] = {}
+        values = sorted(account_ids)
+        with self._lock, self._connect() as connection:
+            for start in range(0, len(values), 900):
+                chunk = values[start : start + 900]
+                placeholders = ", ".join("?" for _ in chunk)
+                rows = connection.execute(
+                    f"SELECT id, email_address, username FROM accounts "
+                    f"WHERE id IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                for row in rows:
+                    result[str(row["id"])] = str(
+                        row["email_address"] or row["username"] or ""
+                    )
+        return result
 
     def count_tasks(
         self,
