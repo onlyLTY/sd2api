@@ -124,6 +124,14 @@ class TaskStore:
                 "ON tasks(idempotency_key_hash) WHERE idempotency_key_hash IS NOT NULL"
             )
             connection.execute(
+                "CREATE INDEX IF NOT EXISTS tasks_account_advertiser_created_idx "
+                "ON tasks(account_id, advertiser_id, created_at, id)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS tasks_status_created_idx "
+                "ON tasks(status, created_at, id)"
+            )
+            connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS api_keys (
                     id TEXT PRIMARY KEY,
