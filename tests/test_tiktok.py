@@ -4391,3 +4391,10 @@ def test_video_api_records_upstream_model_permission_error_as_failed_task(
     assert failed.status == "failed"
     assert failed.error_code == "10001100"
     assert failed.error_message == "没有模型使用权限"
+    retrieved = api.get(f"/v1/videos/{task_id}", headers=headers)
+    assert retrieved.status_code == 200
+    assert retrieved.json()["status"] == "failed"
+    assert retrieved.json()["error"] == {
+        "code": "10001100",
+        "message": "没有模型使用权限",
+    }
