@@ -175,13 +175,22 @@ class VideoSubmissionDispatcher:
                 )
             except KeyError:
                 return
+            context = (
+                dict(exc.context)
+                if isinstance(exc, TikTokUpstreamError)
+                else {}
+            )
             self.audit(
                 "error",
                 "video",
                 "视频任务提交失败",
-                account_id=failed.account_id,
+                account_id=context.get("account_id") or failed.account_id,
                 task_id=failed.id,
-                details={"error_code": code, "error_message": str(exc)},
+                details={
+                    "error_code": code,
+                    "error_message": str(exc),
+                    **context,
+                },
             )
         finally:
             self.uploads.cleanup(media)

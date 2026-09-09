@@ -63,6 +63,13 @@ class TikTokUpstreamError(RuntimeError):
         super().__init__(message)
         self.status_code = status_code
         self.code = code
+        self.context: dict[str, Any] = {}
+
+    def with_context(self, **values: Any) -> TikTokUpstreamError:
+        self.context.update(
+            {key: value for key, value in values.items() if value is not None}
+        )
+        return self
 
 
 def is_tiktok_authentication_error(exc: BaseException) -> bool:

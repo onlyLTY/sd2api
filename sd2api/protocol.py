@@ -436,6 +436,7 @@ class ProtocolTikTokClient:
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         client = await self._get_client()
+        request_context = {"request_method": method, "request_path": path}
         try:
             request_params: dict[str, Any] = dict(self.params)
             if params:
@@ -450,13 +451,18 @@ class ProtocolTikTokClient:
         except (httpx.HTTPError, CurlRequestException) as exc:
             raise TikTokUpstreamError(
                 f"TikTok request failed: {exc.__class__.__name__}"
-            ) from exc
+            ).with_context(**request_context) from exc
+        response_context = {
+            **request_context,
+            "upstream_status": response.status_code,
+            "response_excerpt": " ".join(response.text.split())[:1000] or None,
+        }
         if response.status_code == 401:
             raise TikTokUpstreamError(
                 "TikTok session expired; the account must log in again",
                 status_code=401,
                 code="tiktok_authentication_error",
-            )
+            ).with_context(**response_context)
         if response.status_code == 403:
             try:
                 forbidden = response.json()
@@ -485,9 +491,11 @@ class ProtocolTikTokClient:
                 str(message or "TikTok denied access to this model or operation"),
                 status_code=403,
                 code=str(code or "tiktok_permission_denied"),
-            )
+            ).with_context(**response_context)
             if is_tiktok_authentication_error(error):
-                raise tiktok_authentication_error() from error
+                raise tiktok_authentication_error().with_context(
+                    **error.context
+                ) from error
             raise error
         if response.status_code >= 400:
             try:
@@ -522,16 +530,22 @@ class ProtocolTikTokClient:
                 ),
                 status_code=response.status_code,
                 code=str(rejected_code or f"tiktok_http_{response.status_code}"),
-            )
+            ).with_context(**response_context)
             if is_tiktok_authentication_error(error):
-                raise tiktok_authentication_error() from error
+                raise tiktok_authentication_error().with_context(
+                    **error.context
+                ) from error
             raise error
         try:
             payload = response.json()
         except ValueError as exc:
-            raise TikTokUpstreamError("TikTok returned a non-JSON response") from exc
+            raise TikTokUpstreamError(
+                "TikTok returned a non-JSON response"
+            ).with_context(**response_context) from exc
         if not isinstance(payload, dict):
-            raise TikTokUpstreamError("TikTok returned an unexpected response shape")
+            raise TikTokUpstreamError(
+                "TikTok returned an unexpected response shape"
+            ).with_context(**response_context)
         base_response = payload.get("BaseResp")
         base_code = (
             base_response.get("StatusCode") if isinstance(base_response, dict) else None
@@ -554,9 +568,11 @@ class ProtocolTikTokClient:
                     403 if str(effective) in MODEL_PERMISSION_CODES else 502
                 ),
                 code=str(effective),
-            )
+            ).with_context(**response_context)
             if is_tiktok_authentication_error(error):
-                raise tiktok_authentication_error() from error
+                raise tiktok_authentication_error().with_context(
+                    **error.context
+                ) from error
             raise error
         return payload
 
