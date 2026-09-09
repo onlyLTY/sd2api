@@ -1643,6 +1643,28 @@ class BrowserPoolClient:
                                 kwargs["advertiser_id"] = advertiser_id
                             task_id = await target.create_text_video(**kwargs)
                     except TikTokUpstreamError as exc:
+                        exc.with_context(
+                            account_id=account_id,
+                            advertiser_id=advertiser_id,
+                            model=self._model_key(model),
+                            operation=mode,
+                            protocol_mode=protocol_mode,
+                        )
+                        self.store.add_event(
+                            level="warning",
+                            category="video",
+                            message="Subaccount task submission failed",
+                            account_id=account_id,
+                            details={
+                                "advertiser_id": advertiser_id,
+                                "model": self._model_key(model),
+                                "operation": mode,
+                                "protocol_mode": protocol_mode,
+                                "upstream_code": exc.code,
+                                "upstream_message": str(exc),
+                                **exc.context,
+                            },
+                        )
                         if (
                             self._is_retryable_submission_error(exc)
                             and submission_retries < 2

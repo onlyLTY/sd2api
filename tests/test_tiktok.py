@@ -1960,6 +1960,15 @@ async def test_protocol_http_error_preserves_upstream_code_and_message() -> None
     assert error.value.status_code == 429
     assert error.value.code == "daily-quota-code"
     assert str(error.value) == "Daily generation limit reached"
+    assert error.value.context == {
+        "request_method": "POST",
+        "request_path": "/creative_bff_i18n/api/cue/t2v/create_generate_task",
+        "upstream_status": 429,
+        "response_excerpt": (
+            '{"BaseResp":{"StatusCode":"daily-quota-code",'
+            '"StatusMessage":"Daily generation limit reached"}}'
+        ),
+    }
 
 
 @pytest.mark.asyncio
@@ -3560,6 +3569,25 @@ async def test_pool_retries_transient_submission_timeout(
         if event.message == "Retrying task submission after transient upstream error"
     ]
     assert len(retry_events) == 2
+    failure_events = [
+        event
+        for event in store.list_events()
+        if event.message == "Subaccount task submission failed"
+    ]
+    assert len(failure_events) == 2
+    assert failure_events[0].account_id == "a"
+    assert failure_events[0].details == {
+        "advertiser_id": "sub-a",
+        "model": "seedance-2.0",
+        "operation": "text",
+        "protocol_mode": True,
+        "upstream_code": "50000",
+        "upstream_message": (
+            "biz error: remote or network error[remote]: "
+            "THRIFT_EGRESS request timeout connect_timeout=50ms"
+        ),
+        "account_id": "a",
+    }
 
 
 @pytest.mark.asyncio
@@ -4507,6 +4535,13 @@ def test_video_api_records_upstream_model_permission_error_as_failed_task(
                 "没有模型使用权限",
                 status_code=403,
                 code="10001100",
+            ).with_context(
+                account_id="account-a",
+                advertiser_id="advertiser-a",
+                request_method="POST",
+                request_path="/creative/create",
+                upstream_status=403,
+                response_excerpt='{"code":10001100}',
             )
 
     monkeypatch.setattr(main, "client", DeniedClient())
@@ -4525,12 +4560,17 @@ def test_video_api_records_upstream_model_permission_error_as_failed_task(
     )
     assert response.status_code == 202
     task_id = response.json()["id"]
+    audit_calls: list[dict[str, Any]] = []
+
+    def capture_audit(*args: Any, **kwargs: Any) -> None:
+        audit_calls.append({"args": args, **kwargs})
+
     dispatcher = VideoSubmissionDispatcher(
         store=main.store,
         uploads=main.uploads,
         client=main.client,
         concurrency=1,
-        audit=lambda *args, **kwargs: None,
+        audit=capture_audit,
     )
     asyncio.run(dispatcher._submit(task_id))
     failed = main.store.get(task_id)
@@ -4538,6 +4578,19 @@ def test_video_api_records_upstream_model_permission_error_as_failed_task(
     assert failed.status == "failed"
     assert failed.error_code == "10001100"
     assert failed.error_message == "没有模型使用权限"
+    failure_event = audit_calls[-1]
+    assert failure_event["account_id"] == "account-a"
+    assert failure_event["task_id"] == task_id
+    assert failure_event["details"] == {
+        "error_code": "10001100",
+        "error_message": "没有模型使用权限",
+        "account_id": "account-a",
+        "advertiser_id": "advertiser-a",
+        "request_method": "POST",
+        "request_path": "/creative/create",
+        "upstream_status": 403,
+        "response_excerpt": '{"code":10001100}',
+    }
     retrieved = api.get(f"/v1/videos/{task_id}", headers=headers)
     assert retrieved.status_code == 200
     assert retrieved.json()["status"] == "failed"
