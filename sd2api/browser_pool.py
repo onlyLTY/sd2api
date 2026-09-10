@@ -1134,6 +1134,7 @@ class BrowserPoolClient:
                 details={"url": "https://ads.tiktok.com/creative/creativestudio/image-to-video"},
             )
             worker = self._worker(account_id)
+            schedule_login_after_cleanup = False
             try:
                 existing_session = self._protocol_session(account_id)
                 result = await worker.renew_protocol_session()
@@ -1190,6 +1191,7 @@ class BrowserPoolClient:
                     await self._mark_account_session_expired(
                         account_id, exc, schedule_login=False
                     )
+                    schedule_login_after_cleanup = True
                 self.store.update_account(
                     account_id,
                     keepalive_state="failed",
@@ -1216,6 +1218,16 @@ class BrowserPoolClient:
                     self._workers.pop(account_id, None)
                     self._keepalive_accounts.discard(account_id)
                     await self._notify_keepalive_finished()
+            if schedule_login_after_cleanup:
+                account = self.store.get_account(account_id)
+                if (
+                    account
+                    and account["enabled"]
+                    and self.settings.sd2api_auto_login
+                    and account.get("auto_login")
+                    and account.get("credentials_configured")
+                ):
+                    self._schedule_login(account_id)
 
     async def _notify_keepalive_finished(self) -> None:
         async with self._keepalive_condition:
