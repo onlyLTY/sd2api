@@ -201,6 +201,43 @@ async def test_feishu_notifier_deduplicates_manual_action_until_recovery(
     await notifier.check_accounts(manual)
     assert len(fake.messages) == 2
 
+    changed_incident = [{
+        **manual[0],
+        "login_state": "login_failed",
+        "login_error": "TikTok session expired; re-login required",
+    }]
+    await notifier.check_accounts(changed_incident)
+    assert len(fake.messages) == 3
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "TikTokUpstreamError: The persistent Chromium profile is no longer logged in",
+        "TikTokUpstreamError: Profile signed out",
+        "TikTok session expired; the account must log in again",
+    ],
+)
+def test_feishu_notifier_recognizes_authentication_errors_in_any_account_state(
+    error: str,
+) -> None:
+    assert FeishuNotifier._needs_manual_action(
+        {
+            "login_state": "logged_in",
+            "last_error": error,
+        }
+    )
+
+
+def test_feishu_notifier_does_not_treat_transient_keepalive_failure_as_manual() -> None:
+    assert not FeishuNotifier._needs_manual_action(
+        {
+            "login_state": "logged_in",
+            "last_error": "Session keepalive failed: request timed out",
+            "keepalive_error": "request timed out",
+        }
+    )
+
 
 @pytest.mark.parametrize(
     ("payload", "expected"),
@@ -2784,7 +2821,9 @@ async def test_pool_keepalive_tracks_success_and_closes_browser(
 
 
 @pytest.mark.asyncio
-async def test_pool_keepalive_failure_does_not_schedule_login(tmp_path: Path) -> None:
+async def test_pool_keepalive_auth_failure_invalidates_session_without_scheduling_login(
+    tmp_path: Path,
+) -> None:
     store = TaskStore(str(tmp_path / "keepalive-failure.db"))
     store.create_account(account_id="due", name="Due")
     store.update_account(
@@ -2823,7 +2862,11 @@ async def test_pool_keepalive_failure_does_not_schedule_login(tmp_path: Path) ->
     account = store.get_account("due")
     assert scheduled == []
     assert worker.stopped is True
-    assert account is not None and account["session_available"] is True
+    assert account is not None and account["session_available"] is False
+    assert account["login_state"] == "pending"
+    assert account["last_error"] == (
+        "TikTok session expired; the account must log in again"
+    )
     assert account["keepalive_state"] == "failed"
     assert "Profile signed out" in account["keepalive_error"]
 
@@ -4148,7 +4191,12 @@ def test_admin_feishu_config_hides_and_preserves_secret_and_can_send_test(
 
     tested = api.post("/admin/notifications/feishu/test", headers=headers)
     assert tested.status_code == 200
-    assert tested.json() == {"sent": True, "message_id": "om_test_message"}
+    assert tested.json() == {
+        "sent": True,
+        "message_id": "om_test_message",
+        "notifications_enabled": False,
+        "manual_action_enabled": True,
+    }
     main.settings.replace_runtime(previous_runtime, source=previous_source)
 
 

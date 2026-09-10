@@ -572,7 +572,11 @@ class BrowserPoolClient:
         )
 
     async def _mark_account_session_expired(
-        self, account_id: str, exc: TikTokUpstreamError
+        self,
+        account_id: str,
+        exc: TikTokUpstreamError,
+        *,
+        schedule_login: bool = True,
     ) -> None:
         """Remove an invalid login session before trying another account."""
         await self._close_protocol_clients(account_id)
@@ -598,6 +602,7 @@ class BrowserPoolClient:
         if (
             account
             and account["enabled"]
+            and schedule_login
             and self.settings.sd2api_auto_login
             and account.get("auto_login")
             and account.get("credentials_configured")
@@ -1177,13 +1182,25 @@ class BrowserPoolClient:
             except Exception as exc:
                 finished_at = int(time.time())
                 message = f"{exc.__class__.__name__}: {exc}"
+                authentication_failed = (
+                    isinstance(exc, TikTokUpstreamError)
+                    and is_tiktok_authentication_error(exc)
+                )
+                if authentication_failed:
+                    await self._mark_account_session_expired(
+                        account_id, exc, schedule_login=False
+                    )
                 self.store.update_account(
                     account_id,
                     keepalive_state="failed",
                     keepalive_finished_at=finished_at,
                     keepalive_next_at=finished_at + min(1800, interval),
                     keepalive_error=message,
-                    last_error=f"Session keepalive failed: {message}",
+                    last_error=(
+                        "TikTok session expired; the account must log in again"
+                        if authentication_failed
+                        else f"Session keepalive failed: {message}"
+                    ),
                 )
                 self.store.add_event(
                     level="error",

@@ -950,7 +950,12 @@ async def test_feishu_notification() -> dict[str, Any]:
     except FeishuError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     audit_event("info", "system", "飞书测试消息已发送")
-    return {"sent": True, "message_id": message_id}
+    return {
+        "sent": True,
+        "message_id": message_id,
+        "notifications_enabled": settings.sd2api_feishu_enabled,
+        "manual_action_enabled": settings.sd2api_feishu_notify_manual_action,
+    }
 
 
 @app.get("/admin/notifications/feishu/targets", dependencies=[Depends(require_admin_key)])
