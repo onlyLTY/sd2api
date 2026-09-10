@@ -44,6 +44,7 @@ R2V_MODELS: dict[str, str] = {
 
 MODEL_PERMISSION_CODES = {"10001100"}
 AUTHENTICATION_ERROR_CODES = {
+    "browser_login_required",
     "tiktok_authentication_error",
     "invalidlogin",
     "38001001",
@@ -52,6 +53,9 @@ AUTHENTICATION_ERROR_MARKERS = (
     "invalidlogin",
     "invalid login",
     "not logged in",
+    "no longer logged in",
+    "logged out",
+    "signed out",
     "login required",
     "session expired",
     "log in again",

@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 
 from .config import Settings
+from .tiktok import is_tiktok_authentication_error
 
 logger = logging.getLogger("sd2api.feishu")
 FEISHU_BASE_URL = "https://open.feishu.cn"
@@ -262,22 +263,46 @@ class FeishuNotifier:
         self.settings = settings
         self.client = feishu_client or FeishuClient(settings)
         self.poll_seconds = poll_seconds
-        self._active_incidents: set[str] = set()
+        self._active_incidents: dict[str, tuple[str, str]] = {}
 
     @staticmethod
     def _needs_manual_action(account: dict[str, Any]) -> bool:
         state = str(account.get("login_state") or "")
-        error = str(account.get("login_error") or account.get("last_error") or "")
         if state in MANUAL_ACTION_STATES:
             return True
-        return state == "pending" and any(
-            marker in error.lower()
-            for marker in ("session expired", "re-login", "login required", "重新登录")
+        error = "\n".join(
+            str(value)
+            for value in (
+                account.get("login_error"),
+                account.get("last_error"),
+                account.get("keepalive_error"),
+            )
+            if value
         )
+        return bool(error) and (
+            is_tiktok_authentication_error(RuntimeError(error))
+            or any(marker in error.lower() for marker in ("re-login", "重新登录"))
+        )
+
+    @staticmethod
+    def _incident_fingerprint(account: dict[str, Any]) -> tuple[str, str]:
+        state = str(account.get("login_state") or "")
+        error = str(
+            account.get("login_error")
+            or account.get("last_error")
+            or account.get("keepalive_error")
+            or ""
+        )
+        return state, error
 
     def _manual_action_message(self, account: dict[str, Any]) -> str:
         state = str(account.get("login_state") or "unknown")
-        error = str(account.get("login_error") or account.get("last_error") or "无")
+        error = str(
+            account.get("login_error")
+            or account.get("last_error")
+            or account.get("keepalive_error")
+            or "无"
+        )
         lines = [
             "[sd2api] 账号需要人工操作",
             f"实例：{self.settings.sd2api_feishu_instance_name or 'sd2api'}",
@@ -292,11 +317,15 @@ class FeishuNotifier:
 
     async def check_accounts(self, accounts: list[dict[str, Any]]) -> None:
         current = {
-            str(account["id"])
+            str(account["id"]): self._incident_fingerprint(account)
             for account in accounts
             if account.get("enabled", True) and self._needs_manual_action(account)
         }
-        self._active_incidents.intersection_update(current)
+        self._active_incidents = {
+            account_id: fingerprint
+            for account_id, fingerprint in self._active_incidents.items()
+            if account_id in current
+        }
         if not (
             self.settings.sd2api_feishu_enabled
             and self.settings.sd2api_feishu_notify_manual_action
@@ -304,10 +333,13 @@ class FeishuNotifier:
             return
         for account in accounts:
             account_id = str(account.get("id") or "")
-            if account_id not in current or account_id in self._active_incidents:
+            if (
+                account_id not in current
+                or self._active_incidents.get(account_id) == current[account_id]
+            ):
                 continue
             await self.client.send_text(self._manual_action_message(account))
-            self._active_incidents.add(account_id)
+            self._active_incidents[account_id] = current[account_id]
 
     async def run(
         self, account_loader: Callable[[], Awaitable[list[dict[str, Any]]]]

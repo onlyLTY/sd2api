@@ -395,7 +395,14 @@ async function testFeishuNotification() {
   try {
     await api("/admin/config", { method: "PUT", body: JSON.stringify(settingsPayload()) });
     const result = await api("/admin/notifications/feishu/test", { method: "POST" });
-    toast("测试消息已发送", result.message_id || "请检查飞书接收端");
+    const automaticEnabled = result.notifications_enabled && result.manual_action_enabled;
+    toast(
+      automaticEnabled ? "测试消息已发送" : "测试已发送，但自动通知未启用",
+      automaticEnabled
+        ? (result.message_id || "请检查飞书接收端")
+        : "请同时打开“启用飞书通知”和“人工操作时通知”并保存",
+      automaticEnabled ? undefined : "error",
+    );
   } catch (error) {
     toast("测试发送失败", error.message, "error");
   } finally {
