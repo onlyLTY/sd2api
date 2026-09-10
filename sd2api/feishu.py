@@ -22,6 +22,15 @@ MANUAL_ACTION_STATES = {
     "login_failed",
     "not_configured",
 }
+AUTO_LOGIN_STATES = {
+    "pending",
+    "logging_in",
+    "entering_credentials",
+    "submitting_email_code",
+    "waiting_email_code",
+    "waiting_for_login",
+    "recovering_browser",
+}
 
 
 class FeishuError(RuntimeError):
@@ -265,8 +274,7 @@ class FeishuNotifier:
         self.poll_seconds = poll_seconds
         self._active_incidents: dict[str, tuple[str, str]] = {}
 
-    @staticmethod
-    def _needs_manual_action(account: dict[str, Any]) -> bool:
+    def _needs_manual_action(self, account: dict[str, Any]) -> bool:
         state = str(account.get("login_state") or "")
         if state in MANUAL_ACTION_STATES:
             return True
@@ -279,10 +287,19 @@ class FeishuNotifier:
             )
             if value
         )
-        return bool(error) and (
+        authentication_failed = bool(error) and (
             is_tiktok_authentication_error(RuntimeError(error))
             or any(marker in error.lower() for marker in ("re-login", "重新登录"))
         )
+        if not authentication_failed:
+            return False
+        auto_recovering = (
+            self.settings.sd2api_auto_login
+            and account.get("auto_login")
+            and account.get("credentials_configured")
+            and state in AUTO_LOGIN_STATES
+        )
+        return not auto_recovering
 
     @staticmethod
     def _incident_fingerprint(account: dict[str, Any]) -> tuple[str, str]:

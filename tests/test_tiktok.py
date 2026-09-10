@@ -221,7 +221,7 @@ async def test_feishu_notifier_deduplicates_manual_action_until_recovery(
 def test_feishu_notifier_recognizes_authentication_errors_in_any_account_state(
     error: str,
 ) -> None:
-    assert FeishuNotifier._needs_manual_action(
+    assert FeishuNotifier(Settings())._needs_manual_action(
         {
             "login_state": "logged_in",
             "last_error": error,
@@ -229,8 +229,25 @@ def test_feishu_notifier_recognizes_authentication_errors_in_any_account_state(
     )
 
 
+def test_feishu_notifier_waits_for_automatic_relogin_before_alerting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    notifier = FeishuNotifier(Settings(sd2api_auto_login=True))
+    account = {
+        "login_state": "pending",
+        "last_error": "TikTok session expired; re-login required",
+        "auto_login": True,
+        "credentials_configured": True,
+    }
+
+    assert not notifier._needs_manual_action(account)
+    assert notifier._needs_manual_action({**account, "login_state": "login_failed"})
+    assert notifier._needs_manual_action({**account, "login_state": "captcha_required"})
+
+
 def test_feishu_notifier_does_not_treat_transient_keepalive_failure_as_manual() -> None:
-    assert not FeishuNotifier._needs_manual_action(
+    assert not FeishuNotifier(Settings())._needs_manual_action(
         {
             "login_state": "logged_in",
             "last_error": "Session keepalive failed: request timed out",
@@ -2821,11 +2838,16 @@ async def test_pool_keepalive_tracks_success_and_closes_browser(
 
 
 @pytest.mark.asyncio
-async def test_pool_keepalive_auth_failure_invalidates_session_without_scheduling_login(
+async def test_pool_keepalive_auth_failure_invalidates_session_and_schedules_login(
     tmp_path: Path,
 ) -> None:
     store = TaskStore(str(tmp_path / "keepalive-failure.db"))
-    store.create_account(account_id="due", name="Due")
+    store.create_account(
+        account_id="due",
+        name="Due",
+        username="due@example.com",
+        password_ciphertext="encrypted-password",
+    )
     store.update_account(
         "due",
         session_ciphertext="encrypted-session",
@@ -2860,7 +2882,7 @@ async def test_pool_keepalive_auth_failure_invalidates_session_without_schedulin
     await pool._run_session_keepalive_once(now=7201)
 
     account = store.get_account("due")
-    assert scheduled == []
+    assert scheduled == ["due"]
     assert worker.stopped is True
     assert account is not None and account["session_available"] is False
     assert account["login_state"] == "pending"
