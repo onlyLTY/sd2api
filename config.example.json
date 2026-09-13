@@ -8,6 +8,7 @@
   "browser_channel": "",
   "browser_headless": false,
   "browser_max_wait": 1800,
+  "browser_renderer_process_limit": 8,
   "browser_autostart": true,
   "novnc_public_port": 6080,
   "pool_max_pending": 500,

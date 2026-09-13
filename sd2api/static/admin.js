@@ -69,6 +69,7 @@ const settingsSchema = [
     ["browser_autostart", "启动时恢复号池", "boolean"],
     ["novnc_public_port", "noVNC 公网端口", "number", { min: 1, max: 65535 }],
     ["browser_max_wait", "浏览器最长等待（秒）", "number", { min: 60, max: 7200 }],
+    ["browser_renderer_process_limit", "Chromium Renderer 上限", "number", { min: 2, max: 64 }],
     ["auto_login", "自动登录", "boolean"],
     ["login_timeout", "登录超时（秒）", "number", { min: 60, max: 3600 }],
     ["relogin_interval", "登录状态检查间隔（秒）", "number", { min: 30, max: 86400 }],
