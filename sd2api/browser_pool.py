@@ -45,6 +45,11 @@ class BrowserPoolClient:
         self._login_semaphore = asyncio.Semaphore(
             self.settings.sd2api_pool_start_concurrency
         )
+        self._browser_semaphore = asyncio.Semaphore(
+            self.settings.sd2api_pool_start_concurrency
+        )
+        self._browser_slot_accounts: set[str] = set()
+        self._browser_slot_locks: dict[str, asyncio.Lock] = {}
         self._monitor_task: asyncio.Task[None] | None = None
         self._keepalive_task: asyncio.Task[None] | None = None
         self._keepalive_accounts: set[str] = set()
@@ -145,6 +150,36 @@ class BrowserPoolClient:
             self._workers[account_id] = worker
         return worker
 
+    async def _acquire_browser_slot(self, account_id: str) -> None:
+        lock = self._browser_slot_locks.setdefault(account_id, asyncio.Lock())
+        async with lock:
+            if account_id in self._browser_slot_accounts:
+                return
+            await self._browser_semaphore.acquire()
+            self._browser_slot_accounts.add(account_id)
+
+    async def _release_browser_slot(self, account_id: str) -> None:
+        lock = self._browser_slot_locks.setdefault(account_id, asyncio.Lock())
+        async with lock:
+            if account_id not in self._browser_slot_accounts:
+                return
+            self._browser_slot_accounts.remove(account_id)
+            self._browser_semaphore.release()
+
+    async def _stop_browser_worker(
+        self,
+        account_id: str,
+        worker: BrowserTikTokClient | None = None,
+    ) -> None:
+        selected = worker or self._workers.get(account_id)
+        try:
+            if selected is not None:
+                await selected.stop()
+        finally:
+            if selected is None or self._workers.get(account_id) is selected:
+                self._workers.pop(account_id, None)
+            await self._release_browser_slot(account_id)
+
     async def _capture_protocol_session(
         self,
         account_id: str,
@@ -242,9 +277,14 @@ class BrowserPoolClient:
             task.cancel()
         await asyncio.gather(*login_tasks, return_exceptions=True)
         self._login_tasks.clear()
-        workers = list(self._workers.values())
-        await asyncio.gather(*(worker.stop() for worker in workers), return_exceptions=True)
-        self._workers.clear()
+        workers = list(self._workers.items())
+        await asyncio.gather(
+            *(
+                self._stop_browser_worker(account_id, worker)
+                for account_id, worker in workers
+            ),
+            return_exceptions=True,
+        )
         await self._close_protocol_clients()
         self._started_accounts.clear()
         self._keepalive_accounts.clear()
@@ -806,29 +846,31 @@ class BrowserPoolClient:
                     # One-time migration for sessions captured by older builds.
                     # Reuse the persistent authenticated profile; no password,
                     # CAPTCHA, or email code should be required.
+                    await self._acquire_browser_slot(account_id)
                     worker = self._worker(account_id)
-                    await worker.start()
-                    browser_status = await worker.status()
-                    for _ in range(30):
-                        if browser_status["logged_in"]:
-                            break
-                        await asyncio.sleep(0.5)
+                    try:
+                        await worker.start()
                         browser_status = await worker.status()
-                    if not browser_status["logged_in"]:
-                        raise TikTokUpstreamError(
-                            "The saved browser profile must sign in once to capture its web identity",
-                            status_code=401,
-                            code="protocol_identity_missing",
-                        )
-                    session = await self._capture_protocol_session(account_id, worker)
-                    if not session.fp_id:
-                        raise TikTokUpstreamError(
-                            "TikTok did not expose a web fingerprint ID during session capture",
-                            status_code=409,
-                            code="protocol_fp_id_missing",
-                        )
-                    await worker.stop()
-                    self._workers.pop(account_id, None)
+                        for _ in range(30):
+                            if browser_status["logged_in"]:
+                                break
+                            await asyncio.sleep(0.5)
+                            browser_status = await worker.status()
+                        if not browser_status["logged_in"]:
+                            raise TikTokUpstreamError(
+                                "The saved browser profile must sign in once to capture its web identity",
+                                status_code=401,
+                                code="protocol_identity_missing",
+                            )
+                        session = await self._capture_protocol_session(account_id, worker)
+                        if not session.fp_id:
+                            raise TikTokUpstreamError(
+                                "TikTok did not expose a web fingerprint ID during session capture",
+                                status_code=409,
+                                code="protocol_fp_id_missing",
+                            )
+                    finally:
+                        await self._stop_browser_worker(account_id, worker)
                 await self._protocol_client(account_id).validate()
                 self.store.update_account(
                     account_id,
@@ -852,9 +894,16 @@ class BrowserPoolClient:
                     login_state="pending",
                     last_error="Stored TikTok session expired; re-login required",
                 )
+        worker: BrowserTikTokClient | None = None
         try:
-            await self._worker(account_id).start()
+            await self._acquire_browser_slot(account_id)
+            worker = self._worker(account_id)
+            await worker.start()
+        except asyncio.CancelledError:
+            await self._stop_browser_worker(account_id, worker)
+            raise
         except Exception as exc:
+            await self._stop_browser_worker(account_id, worker)
             message = f"Could not start Chromium: {exc.__class__.__name__}: {exc}"
             self.store.update_account(
                 account_id, login_state="browser_error", last_error=message
@@ -881,9 +930,7 @@ class BrowserPoolClient:
                     last_error=f"Subaccount scan failed: {exc.__class__.__name__}: {exc}",
                 )
             finally:
-                await worker.stop()
-                if self._workers.get(account_id) is worker:
-                    self._workers.pop(account_id, None)
+                await self._stop_browser_worker(account_id, worker)
         return await self.account_status(account_id)
 
     async def stop_account(self, account_id: str, *, force: bool = False) -> None:
@@ -916,7 +963,9 @@ class BrowserPoolClient:
                     status_code=409,
                     code="account_busy",
                 )
-            await worker.stop()
+            await self._stop_browser_worker(account_id, worker)
+        else:
+            await self._release_browser_slot(account_id)
         if force:
             self.store.fail_active_tasks_for_account(
                 account_id,
@@ -927,10 +976,16 @@ class BrowserPoolClient:
         self._started_accounts.discard(account_id)
 
     async def focus_account(self, account_id: str) -> dict[str, Any]:
-        worker = self._worker(account_id)
+        worker: BrowserTikTokClient | None = None
         try:
+            await self._acquire_browser_slot(account_id)
+            worker = self._worker(account_id)
             await worker.focus()
+        except asyncio.CancelledError:
+            await self._stop_browser_worker(account_id, worker)
+            raise
         except Exception as exc:
+            await self._stop_browser_worker(account_id, worker)
             raise TikTokUpstreamError(
                 f"Could not open Chromium: {exc.__class__.__name__}: {exc}",
                 status_code=503,
@@ -966,6 +1021,7 @@ class BrowserPoolClient:
     async def _run_login_with_slot(self, account_id: str) -> None:
         worker: BrowserTikTokClient | None = None
         try:
+            await self._acquire_browser_slot(account_id)
             self._started_accounts.add(account_id)
             credentials = self.store.account_credentials(account_id)
             if credentials is None:
@@ -1012,10 +1068,7 @@ class BrowserPoolClient:
             except KeyError:
                 pass
         finally:
-            if worker is not None:
-                await worker.stop()
-                if self._workers.get(account_id) is worker:
-                    self._workers.pop(account_id, None)
+            await self._stop_browser_worker(account_id, worker)
 
     async def _login_monitor_loop(self) -> None:
         while True:
@@ -1142,9 +1195,11 @@ class BrowserPoolClient:
                 account_id=account_id,
                 details={"url": "https://ads.tiktok.com/creative/creativestudio/image-to-video"},
             )
-            worker = self._worker(account_id)
+            worker: BrowserTikTokClient | None = None
             schedule_login_after_cleanup = False
             try:
+                await self._acquire_browser_slot(account_id)
+                worker = self._worker(account_id)
                 existing_session = self._protocol_session(account_id)
                 result = await worker.renew_protocol_session()
                 await self._capture_protocol_session(
@@ -1222,9 +1277,8 @@ class BrowserPoolClient:
                 )
             finally:
                 try:
-                    await worker.stop()
+                    await self._stop_browser_worker(account_id, worker)
                 finally:
-                    self._workers.pop(account_id, None)
                     self._keepalive_accounts.discard(account_id)
                     await self._notify_keepalive_finished()
             if schedule_login_after_cleanup:

@@ -2946,6 +2946,106 @@ async def test_all_login_sources_share_the_configured_concurrency_limit(
 
 
 @pytest.mark.asyncio
+async def test_direct_account_starts_hold_browser_slot_until_stopped(
+    tmp_path: Path,
+) -> None:
+    store = TaskStore(str(tmp_path / "browser-lifecycle-concurrency.db"))
+    for account_id in ("account-a", "account-b"):
+        store.create_account(account_id=account_id, name=account_id)
+    pool = BrowserPoolClient(
+        Settings(sd2api_auto_login=False, sd2api_pool_start_concurrency=1),
+        store,
+    )
+    started: list[str] = []
+
+    class Worker:
+        load = 0
+
+        def __init__(self, account_id: str) -> None:
+            self.account_id = account_id
+
+        async def start(self) -> None:
+            started.append(self.account_id)
+
+        async def stop(self) -> None:
+            pass
+
+    workers = {
+        account_id: Worker(account_id) for account_id in ("account-a", "account-b")
+    }
+    pool._worker = lambda account_id: workers[account_id]  # type: ignore[method-assign]
+
+    async def account_status(account_id: str) -> dict[str, Any]:
+        return {"id": account_id, "logged_in": False}
+
+    pool.account_status = account_status  # type: ignore[method-assign]
+
+    await pool.start_account("account-a")
+    second = asyncio.create_task(pool.start_account("account-b"))
+    await asyncio.sleep(0)
+
+    assert started == ["account-a"]
+    assert not second.done()
+
+    await pool.stop_account("account-a")
+    await asyncio.wait_for(second, timeout=1)
+    assert started == ["account-a", "account-b"]
+    await pool.stop_account("account-b")
+    await pool.stop()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_browser_open_releases_slot(tmp_path: Path) -> None:
+    store = TaskStore(str(tmp_path / "browser-slot-cancellation.db"))
+    for account_id in ("account-a", "account-b"):
+        store.create_account(account_id=account_id, name=account_id)
+    pool = BrowserPoolClient(
+        Settings(sd2api_pool_start_concurrency=1),
+        store,
+    )
+    first_opened = asyncio.Event()
+    block_first = asyncio.Event()
+
+    class Worker:
+        load = 0
+
+        def __init__(self, account_id: str) -> None:
+            self.account_id = account_id
+            self.stopped = False
+
+        async def focus(self) -> None:
+            if self.account_id == "account-a":
+                first_opened.set()
+                await block_first.wait()
+
+        async def stop(self) -> None:
+            self.stopped = True
+
+    workers = {
+        account_id: Worker(account_id) for account_id in ("account-a", "account-b")
+    }
+    pool._worker = lambda account_id: workers[account_id]  # type: ignore[method-assign]
+
+    async def account_status(account_id: str) -> dict[str, Any]:
+        return {"id": account_id}
+
+    pool.account_status = account_status  # type: ignore[method-assign]
+
+    first = asyncio.create_task(pool.focus_account("account-a"))
+    await asyncio.wait_for(first_opened.wait(), timeout=1)
+    second = asyncio.create_task(pool.focus_account("account-b"))
+    await asyncio.sleep(0)
+    assert not second.done()
+
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    await asyncio.wait_for(second, timeout=1)
+    assert workers["account-a"].stopped is True
+    await pool.stop_account("account-b")
+
+
+@pytest.mark.asyncio
 async def test_pool_stop_and_delete_cancel_login_tasks(tmp_path: Path) -> None:
     store = TaskStore(str(tmp_path / "cancel-login.db"))
     pool = BrowserPoolClient(Settings(), store)

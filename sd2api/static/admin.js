@@ -77,12 +77,12 @@ const settingsSchema = [
     ["temp_mail_poll_seconds", "邮箱轮询间隔（秒）", "number", { min: 1, max: 30, step: 0.5 }],
     ["temp_mail_timeout", "邮箱验证码超时（秒）", "number", { min: 30, max: 900 }],
   ]},
-  { title: "号池调度", description: "控制全池活动任务、启动并发和按模型每日额度熔断。", fields: [
+  { title: "号池调度", description: "控制全池活动任务、Chromium 实例并发和按模型每日额度熔断。", fields: [
     ["pool_max_pending", "全池最大活动任务", "number", { min: 1, max: 100000 }],
     ["pool_daily_quota_codes", "每日额度错误码", "text", { placeholder: "多个错误码用逗号分隔" }],
     ["pool_rate_limit_cooldown", "RPM 限流冷却（秒）", "number", { min: 1, max: 3600 }],
     ["pool_generation_limit_cooldown", "5 分钟限流冷却（秒）", "number", { min: 1, max: 3600 }],
-    ["pool_start_concurrency", "号池启动并发", "number", { min: 1, max: 50 }],
+    ["pool_start_concurrency", "Chromium 最大并发", "number", { min: 1, max: 50 }],
     ["submission_concurrency", "任务提交并发", "number", { min: 1, max: 32 }],
     ["submission_staging_max_bytes", "异步暂存上限（字节）", "number", { min: 536870912, max: 536870912000 }],
   ]},
