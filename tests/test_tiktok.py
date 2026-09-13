@@ -951,6 +951,18 @@ async def test_start_reopens_a_closed_browser_page(tmp_path: Path) -> None:
     await client.stop()
 
 
+def test_browser_login_process_limits_are_applied(tmp_path: Path) -> None:
+    client = BrowserTikTokClient(
+        Settings(
+            sd2api_browser_profile=str(tmp_path / "profile"),
+            sd2api_browser_renderer_process_limit=6,
+        )
+    )
+
+    assert "--disable-site-isolation-trials" in client._chromium_args()
+    assert "--renderer-process-limit=6" in client._chromium_args()
+
+
 def test_browser_removes_singleton_locks_from_an_old_container(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
