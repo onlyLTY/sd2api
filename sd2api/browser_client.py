@@ -153,13 +153,7 @@ class BrowserTikTokClient:
                     channel=self.settings.sd2api_browser_channel or None,
                     headless=self.settings.sd2api_browser_headless,
                     viewport={"width": 1280, "height": 900},
-                    args=[
-                        "--disable-blink-features=AutomationControlled",
-                        (
-                            "--renderer-process-limit="
-                            f"{self.settings.sd2api_browser_renderer_process_limit}"
-                        ),
-                    ],
+                    args=self._chromium_args(),
                 )
                 self._context = context
                 context.on("close", lambda *_: self._mark_context_closed(context))
@@ -173,6 +167,16 @@ class BrowserTikTokClient:
             ):
                 await page.goto(target_url, wait_until="domcontentloaded", timeout=90_000)
         return await self.status()
+
+    def _chromium_args(self) -> list[str]:
+        return [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-site-isolation-trials",
+            (
+                "--renderer-process-limit="
+                f"{self.settings.sd2api_browser_renderer_process_limit}"
+            ),
+        ]
 
     async def stop(self) -> None:
         async with self._stop_lock:
