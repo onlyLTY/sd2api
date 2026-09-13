@@ -50,6 +50,7 @@ class BrowserPoolClient:
         )
         self._browser_slot_accounts: set[str] = set()
         self._browser_slot_locks: dict[str, asyncio.Lock] = {}
+        self._startup_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
         self._monitor_task: asyncio.Task[None] | None = None
         self._keepalive_task: asyncio.Task[None] | None = None
         self._keepalive_accounts: set[str] = set()
@@ -234,23 +235,46 @@ class BrowserPoolClient:
     async def start(self) -> dict[str, Any]:
         self._ensure_background_tasks()
         accounts = [account for account in self.store.list_accounts() if account["enabled"]]
-
-        semaphore = asyncio.Semaphore(self.settings.sd2api_pool_start_concurrency)
-
-        async def start_one(account_id: str) -> dict[str, Any]:
-            async with semaphore:
-                return await self.start_account(account_id)
-
-        results = await asyncio.gather(
-            *(start_one(account["id"]) for account in accounts),
-            return_exceptions=True,
-        )
-        errors = {
-            account["id"]: f"{result.__class__.__name__}: {result}"
-            for account, result in zip(accounts, results, strict=True)
-            if isinstance(result, Exception)
+        queued: list[str] = []
+        for account in accounts:
+            account_id = account["id"]
+            current = self._startup_tasks.get(account_id)
+            if current is not None and not current.done():
+                continue
+            task = asyncio.create_task(
+                self.start_account(account_id),
+                name=f"sd2api-account-start-{account_id}",
+            )
+            self._startup_tasks[account_id] = task
+            task.add_done_callback(
+                lambda done, selected=account_id: self._finish_startup_task(
+                    selected, done
+                )
+            )
+            queued.append(account_id)
+        return {
+            "mode": "browser_pool",
+            "accounts": await self.list_accounts(),
+            "queued": queued,
+            "errors": {},
         }
-        return {"mode": "browser_pool", "accounts": await self.list_accounts(), "errors": errors}
+
+    def _finish_startup_task(
+        self, account_id: str, task: asyncio.Task[dict[str, Any]]
+    ) -> None:
+        if self._startup_tasks.get(account_id) is task:
+            self._startup_tasks.pop(account_id, None)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            self.store.add_event(
+                level="error",
+                category="account",
+                message="Account startup failed",
+                account_id=account_id,
+                details={"error": f"{error.__class__.__name__}: {error}"},
+            )
 
     def _ensure_background_tasks(self) -> None:
         if self._monitor_task is None:
@@ -264,6 +288,11 @@ class BrowserPoolClient:
             )
 
     async def stop(self) -> None:
+        startup_tasks = list(self._startup_tasks.values())
+        for task in startup_tasks:
+            task.cancel()
+        await asyncio.gather(*startup_tasks, return_exceptions=True)
+        self._startup_tasks.clear()
         if self._keepalive_task:
             self._keepalive_task.cancel()
             await asyncio.gather(self._keepalive_task, return_exceptions=True)
