@@ -2995,6 +2995,35 @@ async def test_direct_account_starts_hold_browser_slot_until_stopped(
 
 
 @pytest.mark.asyncio
+async def test_pool_start_queues_account_recovery_without_blocking_api_startup(
+    tmp_path: Path,
+) -> None:
+    store = TaskStore(str(tmp_path / "nonblocking-pool-start.db"))
+    for account_id in ("account-a", "account-b"):
+        store.create_account(account_id=account_id, name=account_id)
+    pool = BrowserPoolClient(Settings(), store)
+    release = asyncio.Event()
+    started: list[str] = []
+
+    async def start_account(account_id: str) -> dict[str, Any]:
+        started.append(account_id)
+        await release.wait()
+        return {"id": account_id}
+
+    pool.start_account = start_account  # type: ignore[method-assign]
+
+    result = await asyncio.wait_for(pool.start(), timeout=1)
+    await asyncio.sleep(0)
+
+    assert result["queued"] == ["account-a", "account-b"]
+    assert started == ["account-a", "account-b"]
+    assert len(pool._startup_tasks) == 2
+
+    await pool.stop()
+    assert not pool._startup_tasks
+
+
+@pytest.mark.asyncio
 async def test_cancelled_browser_open_releases_slot(tmp_path: Path) -> None:
     store = TaskStore(str(tmp_path / "browser-slot-cancellation.db"))
     for account_id in ("account-a", "account-b"):
