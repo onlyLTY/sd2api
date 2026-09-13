@@ -2894,6 +2894,46 @@ async def test_pool_keepalive_auth_failure_invalidates_session_and_schedules_log
 
 
 @pytest.mark.asyncio
+async def test_all_login_sources_share_the_configured_concurrency_limit(
+    tmp_path: Path,
+) -> None:
+    pool = BrowserPoolClient(
+        Settings(sd2api_pool_start_concurrency=2),
+        TaskStore(str(tmp_path / "login-concurrency.db")),
+    )
+    active = 0
+    maximum_active = 0
+    two_started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def login_with_slot(_account_id: str) -> None:
+        nonlocal active, maximum_active
+        active += 1
+        maximum_active = max(maximum_active, active)
+        if active == 2:
+            two_started.set()
+        try:
+            await release.wait()
+        finally:
+            active -= 1
+
+    pool._run_login_with_slot = login_with_slot  # type: ignore[method-assign]
+    tasks = [
+        asyncio.create_task(pool._run_login(f"account-{index}"))
+        for index in range(3)
+    ]
+    await asyncio.wait_for(two_started.wait(), timeout=1)
+    await asyncio.sleep(0)
+
+    assert maximum_active == 2
+    assert active == 2
+
+    release.set()
+    await asyncio.gather(*tasks)
+    assert maximum_active == 2
+
+
+@pytest.mark.asyncio
 async def test_pool_stop_and_delete_cancel_login_tasks(tmp_path: Path) -> None:
     store = TaskStore(str(tmp_path / "cancel-login.db"))
     pool = BrowserPoolClient(Settings(), store)

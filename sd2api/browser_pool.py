@@ -42,6 +42,9 @@ class BrowserPoolClient:
         self._last_selected: dict[str, int] = {}
         self._selection_counter = 0
         self._login_tasks: dict[str, asyncio.Task[None]] = {}
+        self._login_semaphore = asyncio.Semaphore(
+            self.settings.sd2api_pool_start_concurrency
+        )
         self._monitor_task: asyncio.Task[None] | None = None
         self._keepalive_task: asyncio.Task[None] | None = None
         self._keepalive_accounts: set[str] = set()
@@ -952,6 +955,15 @@ class BrowserPoolClient:
         return task
 
     async def _run_login(self, account_id: str) -> None:
+        try:
+            async with self._login_semaphore:
+                await self._run_login_with_slot(account_id)
+        finally:
+            current = self._login_tasks.get(account_id)
+            if current is asyncio.current_task():
+                self._login_tasks.pop(account_id, None)
+
+    async def _run_login_with_slot(self, account_id: str) -> None:
         worker: BrowserTikTokClient | None = None
         try:
             self._started_accounts.add(account_id)
@@ -1004,9 +1016,6 @@ class BrowserPoolClient:
                 await worker.stop()
                 if self._workers.get(account_id) is worker:
                     self._workers.pop(account_id, None)
-            current = self._login_tasks.get(account_id)
-            if current is asyncio.current_task():
-                self._login_tasks.pop(account_id, None)
 
     async def _login_monitor_loop(self) -> None:
         while True:
