@@ -375,6 +375,7 @@ flowchart LR
 | `pool_rate_limit_cooldown` | `90` | TikTok 返回 RPM/请求频率限制后，该子账号的短时冷却时间（秒） |
 | `pool_generation_limit_cooldown` | `300` | TikTok 返回 5 分钟生成限制后，该子账号对应模型的冷却时间（秒） |
 | `session_keepalive_interval` | `21600` | 会话自动保活周期（默认 6 小时） |
+| `browser_renderer_process_limit` | `8` | 单个登录 Chromium 最多使用的 renderer 进程数，防止复杂页面耗尽主机资源 |
 | `novnc_public_port` | `6080` | 管理端“打开 noVNC”按钮使用的公网端口；端口映射不同时需同步修改 |
 | `feishu_enabled` | `false` | 是否在账号需要人工操作时发送飞书通知 |
 | `feishu_app_id` / `feishu_app_secret` | - | 飞书自建应用凭据；后台不会回显已保存的 App Secret |

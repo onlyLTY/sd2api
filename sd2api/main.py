@@ -915,6 +915,7 @@ async def update_admin_runtime_config(body: RuntimeConfig) -> dict[str, Any]:
         "browser_profile",
         "browser_channel",
         "browser_headless",
+        "browser_renderer_process_limit",
         "browser_autostart",
         "pool_start_concurrency",
         "submission_concurrency",

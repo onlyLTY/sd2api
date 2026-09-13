@@ -4336,6 +4336,7 @@ def test_runtime_config_migrates_old_dotenv_when_file_is_missing(
     assert source == "legacy_env"
     assert config.mode == "browser"
     assert "pool_subaccount_concurrency" not in config.model_dump()
+    assert config.browser_renderer_process_limit == 8
 
 
 def test_temp_mail_base_url_is_loaded_from_environment(

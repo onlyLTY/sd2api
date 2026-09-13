@@ -153,7 +153,13 @@ class BrowserTikTokClient:
                     channel=self.settings.sd2api_browser_channel or None,
                     headless=self.settings.sd2api_browser_headless,
                     viewport={"width": 1280, "height": 900},
-                    args=["--disable-blink-features=AutomationControlled"],
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        (
+                            "--renderer-process-limit="
+                            f"{self.settings.sd2api_browser_renderer_process_limit}"
+                        ),
+                    ],
                 )
                 self._context = context
                 context.on("close", lambda *_: self._mark_context_closed(context))
