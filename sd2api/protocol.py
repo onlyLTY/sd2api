@@ -31,6 +31,7 @@ from .tiktok import (
     _deep_find,
     _first,
     is_tiktok_authentication_error,
+    is_tiktok_transient_error,
     tiktok_authentication_error,
 )
 from .uploads import StagedMedia
@@ -450,7 +451,9 @@ class ProtocolTikTokClient:
             )
         except (httpx.HTTPError, CurlRequestException) as exc:
             raise TikTokUpstreamError(
-                f"TikTok request failed: {exc.__class__.__name__}"
+                "TikTok request temporarily failed",
+                status_code=503,
+                code="tiktok_transport_error",
             ).with_context(**request_context) from exc
         response_context = {
             **request_context,
@@ -577,7 +580,29 @@ class ProtocolTikTokClient:
         return payload
 
     async def validate(self) -> dict[str, Any]:
-        return await self._request("GET", ACCOUNT_INFO_PATH)
+        return await self._read_request_with_retry("GET", ACCOUNT_INFO_PATH)
+
+    async def _read_request_with_retry(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        for attempt in range(CHECK_TASK_MAX_RETRIES + 1):
+            try:
+                return await self._request(
+                    method, path, json_body=json_body, params=params
+                )
+            except TikTokUpstreamError as exc:
+                if (
+                    not is_tiktok_transient_error(exc)
+                    or attempt >= CHECK_TASK_MAX_RETRIES
+                ):
+                    raise
+                await asyncio.sleep(CHECK_TASK_RETRY_DELAY_SECONDS * (attempt + 1))
+        raise RuntimeError("Read request retry loop exited unexpectedly")
 
     async def discover_subaccounts(self) -> list[dict[str, Any]]:
         account_list, account_info = await asyncio.gather(
@@ -887,22 +912,9 @@ class ProtocolTikTokClient:
         )
 
     async def _check_task_payload(self, task_id: str) -> dict[str, Any]:
-        for attempt in range(CHECK_TASK_MAX_RETRIES + 1):
-            try:
-                return await self._request(
-                    "POST", CHECK_TASK_PATH, json_body={"taskId": task_id}
-                )
-            except TikTokUpstreamError as exc:
-                retryable = (
-                    500 <= exc.status_code < 600
-                    and exc.code.startswith("tiktok_http_")
-                )
-                if not retryable or attempt >= CHECK_TASK_MAX_RETRIES:
-                    raise
-                await asyncio.sleep(
-                    CHECK_TASK_RETRY_DELAY_SECONDS * (attempt + 1)
-                )
-        raise RuntimeError("Task status retry loop exited unexpectedly")
+        return await self._read_request_with_retry(
+            "POST", CHECK_TASK_PATH, json_body={"taskId": task_id}
+        )
 
     async def _video_info(self, vid: str) -> dict[str, Any]:
         try:

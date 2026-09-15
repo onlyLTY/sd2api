@@ -87,6 +87,31 @@ def is_tiktok_authentication_error(exc: BaseException) -> bool:
     return any(marker in code or marker in message for marker in AUTHENTICATION_ERROR_MARKERS)
 
 
+def is_tiktok_transient_error(exc: BaseException) -> bool:
+    """Recognize transport and upstream RPC failures that are safe to retry."""
+    code = str(getattr(exc, "code", "") or "").strip().lower()
+    message = str(exc).strip().lower()
+    if code == "tiktok_transport_error":
+        return True
+    if code.startswith("tiktok_http_"):
+        try:
+            return 500 <= int(code.removeprefix("tiktok_http_")) < 600
+        except ValueError:
+            return False
+    if code != "50000":
+        return False
+    return any(
+        marker in message
+        for marker in (
+            "remote or network error",
+            "request timeout",
+            "connect_timeout",
+            "thrift_egress",
+            "error_code=1204",
+        )
+    )
+
+
 def tiktok_authentication_error() -> TikTokUpstreamError:
     return TikTokUpstreamError(
         "TikTok session expired; the account must log in again",
