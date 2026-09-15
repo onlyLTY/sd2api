@@ -2210,6 +2210,81 @@ async def test_protocol_task_check_returns_last_5xx_after_three_retries(
 
 
 @pytest.mark.asyncio
+async def test_protocol_task_check_retries_transport_error_without_exposing_ssl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls <= 3:
+            raise httpx.ConnectError("SSL handshake failed", request=request)
+        return httpx.Response(200, json={"code": 0, "data": {"draft_infos": []}})
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    client = ProtocolTikTokClient(
+        Settings(),
+        protocol_session(),
+        account_id="account-a",
+        advertiser_id="123456789012",
+        transport=httpx.MockTransport(handler),
+    )
+    result = await client.check_task("task-transport-retry")
+    await client.close()
+
+    assert result.status == "queued"
+    assert calls == 4
+    assert sleeps == [0.5, 1.0, 1.5]
+
+
+@pytest.mark.asyncio
+async def test_protocol_validate_retries_tiktok_internal_rpc_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            return httpx.Response(
+                200,
+                json={
+                    "code": 50000,
+                    "message": (
+                        "biz error: remote or network error[remote]: "
+                        "error_code=1204 cds_key=THRIFT_EGRESS reason=request timeout"
+                    ),
+                },
+            )
+        return httpx.Response(200, json={"code": 0, "data": {}})
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    client = ProtocolTikTokClient(
+        Settings(),
+        protocol_session(),
+        account_id="account-a",
+        advertiser_id="123456789012",
+        transport=httpx.MockTransport(handler),
+    )
+    result = await client.validate()
+    await client.close()
+
+    assert result["code"] == 0
+    assert calls == 3
+    assert sleeps == [0.5, 1.0]
+
+
+@pytest.mark.asyncio
 async def test_protocol_task_check_does_not_retry_business_error() -> None:
     calls = 0
 
@@ -2234,6 +2309,48 @@ async def test_protocol_task_check_does_not_retry_business_error() -> None:
 
     assert calls == 1
     assert error.value.code == "10001202"
+
+
+@pytest.mark.asyncio
+async def test_refresh_keeps_cached_status_after_transient_retries_are_exhausted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sd2api.main as main
+
+    task_store = TaskStore(str(tmp_path / "cached-status.db"))
+    record = task_store.create(
+        task_id="video-cached",
+        api="openai",
+        model="seedance-2.0",
+        prompt="test",
+        seconds=5,
+        account_id="account-a",
+        advertiser_id="aio-a",
+    )
+    events: list[dict[str, Any]] = []
+
+    class Client:
+        async def check_task(self, _task_id: str) -> UpstreamTask:
+            raise TikTokUpstreamError(
+                "TikTok request temporarily failed",
+                status_code=503,
+                code="tiktok_transport_error",
+            )
+
+    monkeypatch.setattr(main, "client", Client())
+    monkeypatch.setattr(main, "store", task_store)
+    monkeypatch.setattr(
+        main,
+        "audit_event",
+        lambda *args, **kwargs: events.append({"args": args, **kwargs}),
+    )
+
+    refreshed = await main.refresh(record)
+
+    assert refreshed == record
+    assert refreshed.status == "queued"
+    assert len(events) == 1
+    assert events[0]["details"] == {"error_code": "tiktok_transport_error"}
 
 
 def test_protocol_video_url_ignores_empty_preview_and_prefers_original() -> None:

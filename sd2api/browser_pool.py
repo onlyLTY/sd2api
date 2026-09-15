@@ -18,6 +18,7 @@ from .temp_mail import TempMailClient
 from .tiktok import (
     TikTokUpstreamError,
     is_tiktok_authentication_error,
+    is_tiktok_transient_error,
     tiktok_authentication_error,
 )
 from .uploads import StagedMedia
@@ -1119,6 +1120,15 @@ class BrowserPoolClient:
                         continue
                     except TikTokUpstreamError as exc:
                         if not is_tiktok_authentication_error(exc):
+                            if is_tiktok_transient_error(exc):
+                                self.store.add_event(
+                                    level="warning",
+                                    category="account",
+                                    message="Protocol status check temporarily unavailable",
+                                    account_id=account["id"],
+                                    details={"code": exc.code},
+                                )
+                                continue
                             self.store.update_account(
                                 account["id"],
                                 last_error=f"Protocol status failed: {exc}",

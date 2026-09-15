@@ -38,7 +38,7 @@ from .models import (
 )
 from .store import TaskRecord, TaskStore
 from .submissions import VideoSubmissionDispatcher
-from .tiktok import TikTokClient, TikTokUpstreamError
+from .tiktok import TikTokClient, TikTokUpstreamError, is_tiktok_transient_error
 from .uploads import StagedMedia, UploadManager
 from . import __version__
 
@@ -446,7 +446,20 @@ async def refresh(record: TaskRecord, *, force: bool = False) -> TaskRecord:
         return record
     if record.submission_status in {"queued", "submitting"}:
         return record
-    upstream = await client.check_task(record.upstream_task_id or record.id)
+    try:
+        upstream = await client.check_task(record.upstream_task_id or record.id)
+    except TikTokUpstreamError as exc:
+        if not is_tiktok_transient_error(exc):
+            raise
+        audit_event(
+            "warning",
+            "video",
+            "TikTok 状态查询暂时不可用，保留上次任务状态",
+            account_id=record.account_id,
+            task_id=record.id,
+            details={"error_code": exc.code},
+        )
+        return record
     updated = store.update(
         record.id,
         status=upstream.status,
