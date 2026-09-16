@@ -3862,9 +3862,23 @@ def test_pool_normalizes_model_aliases_for_cooldowns() -> None:
     assert BrowserPoolClient._model_key("seedance-2-0-mini") == "seedance-2.0-mini"
 
 
+@pytest.mark.parametrize(
+    ("error_code", "error_message"),
+    [
+        (
+            "50000",
+            "biz error: remote or network error[remote]: "
+            "THRIFT_EGRESS request timeout connect_timeout=50ms",
+        ),
+        ("10001200", "Face check timed out"),
+    ],
+)
 @pytest.mark.asyncio
 async def test_pool_retries_transient_submission_timeout(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: str,
+    error_message: str,
 ) -> None:
     store = TaskStore(str(tmp_path / "submission-retry.db"))
     store.create_account(account_id="a", name="a")
@@ -3905,10 +3919,9 @@ async def test_pool_retries_transient_submission_timeout(
             self.attempts += 1
             if self.attempts < 3:
                 raise TikTokUpstreamError(
-                    "biz error: remote or network error[remote]: "
-                    "THRIFT_EGRESS request timeout connect_timeout=50ms",
+                    error_message,
                     status_code=502,
-                    code="50000",
+                    code=error_code,
                 )
             return "retried-task"
 
@@ -3944,11 +3957,8 @@ async def test_pool_retries_transient_submission_timeout(
         "model": "seedance-2.0",
         "operation": "text",
         "protocol_mode": True,
-        "upstream_code": "50000",
-        "upstream_message": (
-            "biz error: remote or network error[remote]: "
-            "THRIFT_EGRESS request timeout connect_timeout=50ms"
-        ),
+        "upstream_code": error_code,
+        "upstream_message": error_message,
         "account_id": "a",
     }
 

@@ -565,6 +565,8 @@ class BrowserPoolClient:
 
     @staticmethod
     def _is_retryable_submission_error(exc: TikTokUpstreamError) -> bool:
+        if exc.code == "10001200":
+            return "face check timed out" in str(exc).lower()
         if exc.code != "50000":
             return False
         text = str(exc).lower()
