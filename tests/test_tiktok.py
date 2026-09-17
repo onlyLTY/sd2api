@@ -4353,7 +4353,12 @@ def test_admin_account_routes_without_starting_browser(
     assert "state.skipVideoPendingRefresh = true" in script.text
     assert "部分模型冷却" in script.text
     assert "模型限额：" in script.text
-    assert "admin.js?v=20" in dashboard.text
+    assert "admin.css?v=15" in dashboard.text
+    assert "admin.js?v=21" in dashboard.text
+    assert 'id="collapseAllAccounts"' in dashboard.text
+    assert "data-account-collapse" in script.text
+    assert "sd2api_collapsed_subaccounts" in script.text
+    assert ".subaccount-toggle" in styles.text
     assert "/admin/version" in script.text
     assert "ttoh" not in dashboard.text.lower()
     assert "ttoh" not in styles.text.lower()

@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>sd2api 控制台</title>
-  <link rel="stylesheet" href="/admin/assets/admin.css?v=14">
-  <script defer src="/admin/assets/admin.js?v=20"></script>
+  <link rel="stylesheet" href="/admin/assets/admin.css?v=15">
+  <script defer src="/admin/assets/admin.js?v=21"></script>
 </head>
 <body>
   <div id="auth" class="auth-screen">
@@ -192,7 +192,7 @@
         <section class="panel accounts-panel">
           <div class="panel-heading">
             <div><p class="eyebrow">ACCOUNT POOL</p><h2>登录账号与 TikTok 子账号</h2><p class="muted">“加入调度”开关决定该子账号是否接收新任务；没有 Seedance 权限的子账号无法开启。</p></div>
-            <div class="button-group"><a id="novnc" class="button ghost" target="_blank" rel="noreferrer">打开 noVNC</a><button id="addAccountButton" class="button primary" type="button">添加账号</button></div>
+            <div class="button-group"><button id="collapseAllAccounts" class="button ghost" type="button">收起全部子账号</button><a id="novnc" class="button ghost" target="_blank" rel="noreferrer">打开 noVNC</a><button id="addAccountButton" class="button primary" type="button">添加账号</button></div>
           </div>
           <div class="table-wrap"><table class="accounts-table"><thead><tr><th>登录账号</th><th>状态</th><th>运行后端</th><th>子账号</th><th>任务</th><th>最近错误</th><th>操作</th></tr></thead><tbody id="accounts"></tbody></table></div>
         </section>
