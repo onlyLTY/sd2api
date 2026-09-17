@@ -288,6 +288,13 @@ tbody > tr:not(.detail-row):not(.subaccount-row):hover > td { background: rgba(2
 .cell-sub { display: block; margin-top: 3px; color: var(--muted); font-size: 10px; }
 .row-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .row-actions .button { min-height: 29px; padding: 4px 8px; font-size: 10px; }
+.subaccount-toggle { display: inline-flex; align-items: center; gap: 9px; min-width: 118px; border: 0; border-radius: 7px; background: transparent; color: var(--text); padding: 4px 5px; text-align: left; cursor: pointer; }
+.subaccount-toggle:hover { background: var(--surface-3); }
+.subaccount-toggle span { display: block; }
+.subaccount-toggle strong { font-size: 13px; }
+.subaccount-toggle small { display: block; margin-top: 2px; color: var(--muted); font-size: 10px; white-space: nowrap; }
+.collapse-chevron { width: 7px; height: 7px; flex: 0 0 7px; border-right: 1.5px solid var(--muted); border-bottom: 1.5px solid var(--muted); transform: rotate(45deg); transition: transform .16s ease; }
+.subaccount-toggle[aria-expanded="false"] .collapse-chevron { transform: rotate(-45deg); }
 .subaccount-row td { background: #0a0f16; padding: 10px; }
 .subaccounts { display: grid; gap: 7px; }
 .subaccounts-head, .sub-row { display: grid; grid-template-columns: minmax(230px, 1.25fr) 118px 88px 170px minmax(150px, .8fr); align-items: center; gap: 12px; }

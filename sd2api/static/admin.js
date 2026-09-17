@@ -6,6 +6,16 @@ const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
 const formatUnix = (value) => value
   ? new Date(Number(value) * 1000).toLocaleString("zh-CN", { hour12: false })
   : "—";
+const collapsedAccountsStorageKey = "sd2api_collapsed_subaccounts";
+
+function loadCollapsedAccounts() {
+  try {
+    const value = JSON.parse(localStorage.getItem(collapsedAccountsStorageKey) || "[]");
+    return new Set(Array.isArray(value) ? value.filter((item) => typeof item === "string") : []);
+  } catch {
+    return new Set();
+  }
+}
 
 const state = {
   key: sessionStorage.getItem("sd2api_admin_key") || "",
@@ -29,6 +39,7 @@ const state = {
   refreshing: false,
   refreshQueued: false,
   skipVideoPendingRefresh: false,
+  collapsedAccounts: loadCollapsedAccounts(),
   timer: null,
 };
 
@@ -536,14 +547,19 @@ function renderAccounts(items) {
   const body = $("accounts");
   if (!items.length) {
     body.innerHTML = '<tr><td colspan="7" class="table-empty">还没有账号。点击“添加账号”开始构建号池。</td></tr>';
+    updateCollapseAllAccountsButton();
     return;
   }
-  body.innerHTML = items.map((account) => `
+  body.innerHTML = items.map((account) => {
+    const collapsed = state.collapsedAccounts.has(account.id);
+    const enabledSubaccounts = (account.subaccounts || []).filter((sub) => sub.enabled).length;
+    const totalSubaccounts = (account.subaccounts || []).length;
+    return `
     <tr>
       <td><span class="cell-title">${esc(account.username || account.email_address || account.name)}</span>${account.name && account.name !== account.username && !String(account.name).startsWith("account_") ? `<span class="cell-sub">${esc(account.name)}</span>` : ""}</td>
       <td>${pill(account.keepalive_active ? "keepalive" : account.login_state)}<span class="cell-sub">${account.logged_in ? "协议会话有效" : "会话不可用"}</span>${keepaliveLabel(account)}</td>
       <td>${backendLabel(account)}</td>
-      <td><strong>${(account.subaccounts || []).filter((sub) => sub.enabled).length}</strong> / ${(account.subaccounts || []).length}<span class="cell-sub">已加入调度 / 已发现</span></td>
+      <td><button class="subaccount-toggle" data-account-collapse data-account-id="${esc(account.id)}" type="button" aria-expanded="${collapsed ? "false" : "true"}" aria-label="${collapsed ? "展开" : "收起"} ${esc(account.username || account.email_address || account.name)} 的子账号"><span><strong>${enabledSubaccounts}</strong> / ${totalSubaccounts}<small>已加入调度 / 已发现</small></span><i class="collapse-chevron" aria-hidden="true"></i></button></td>
       <td>${account.busy ? '<span class="pill info">运行中</span>' : '<span class="muted">空闲</span>'}<span class="cell-sub">队列 ${account.queued || 0}</span></td>
       <td><span class="task-error-inline">${esc(account.login_error || account.last_error || "")}</span></td>
       <td><div class="row-actions">
@@ -555,7 +571,45 @@ function renderAccounts(items) {
         <button class="button danger" data-account-action="delete" data-account-id="${esc(account.id)}" type="button">删除</button>
       </div></td>
     </tr>
-    <tr class="subaccount-row"><td colspan="7">${renderSubaccounts(account)}</td></tr>`).join("");
+    <tr class="subaccount-row" ${collapsed ? "hidden" : ""}><td colspan="7">${renderSubaccounts(account)}</td></tr>`;
+  }).join("");
+  updateCollapseAllAccountsButton();
+}
+
+function persistCollapsedAccounts() {
+  try {
+    localStorage.setItem(
+      collapsedAccountsStorageKey,
+      JSON.stringify([...state.collapsedAccounts]),
+    );
+  } catch { /* Local storage may be unavailable in private browsing. */ }
+}
+
+function updateCollapseAllAccountsButton() {
+  const button = $("collapseAllAccounts");
+  if (!button) return;
+  const allCollapsed = state.accounts.length > 0
+    && state.accounts.every((account) => state.collapsedAccounts.has(account.id));
+  button.textContent = allCollapsed ? "展开全部子账号" : "收起全部子账号";
+  button.disabled = state.accounts.length === 0;
+}
+
+function toggleAccountSubaccounts(accountId) {
+  if (state.collapsedAccounts.has(accountId)) state.collapsedAccounts.delete(accountId);
+  else state.collapsedAccounts.add(accountId);
+  persistCollapsedAccounts();
+  renderAccounts(state.accounts);
+}
+
+function toggleAllAccountSubaccounts() {
+  const allCollapsed = state.accounts.length > 0
+    && state.accounts.every((account) => state.collapsedAccounts.has(account.id));
+  state.accounts.forEach((account) => {
+    if (allCollapsed) state.collapsedAccounts.delete(account.id);
+    else state.collapsedAccounts.add(account.id);
+  });
+  persistCollapsedAccounts();
+  renderAccounts(state.accounts);
 }
 
 async function refreshAccounts() {
@@ -1088,6 +1142,7 @@ function bindEvents() {
     if (event.target.closest('[data-focus-action="download"]') && state.focusTask) downloadTask(state.focusTask.id);
   });
   $("addAccountButton").addEventListener("click", openAddAccount);
+  $("collapseAllAccounts").addEventListener("click", toggleAllAccountSubaccounts);
   $("accountForm").addEventListener("submit", saveAccount);
   $("settingsForm").addEventListener("submit", saveSettings);
   $("feishuTest").addEventListener("click", testFeishuNotification);
@@ -1102,6 +1157,11 @@ function bindEvents() {
   });
   $$('[data-dialog-close]').forEach((button) => button.addEventListener("click", () => $("accountDialog").close()));
   $("accounts").addEventListener("click", (event) => {
+    const collapse = event.target.closest("[data-account-collapse]");
+    if (collapse) {
+      toggleAccountSubaccounts(collapse.dataset.accountId);
+      return;
+    }
     const button = event.target.closest("[data-account-action]");
     if (button) accountAction(button.dataset.accountAction, button.dataset.accountId);
   });
