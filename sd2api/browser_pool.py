@@ -1975,13 +1975,22 @@ class BrowserPoolClient:
         advertiser_id = self._task_advertisers.get(task_id) or (
             record.advertiser_id if record else None
         )
+        upstream_task_id = record.upstream_task_id or record.id if record else task_id
+        browser_task = upstream_task_id.startswith("browser_")
         account = self.store.get_account(account_id)
         protocol_client: ProtocolTikTokClient | None = None
-        if account and account.get("session_available"):
+        if browser_task:
+            task = await self._worker(account_id).check_task(upstream_task_id)
+        elif account and account.get("session_available"):
             protocol_client = self._protocol_client(account_id, advertiser_id)
-            task = await protocol_client.check_task(task_id)
+            task = await protocol_client.check_task(upstream_task_id)
         else:
-            task = await self._worker(account_id).check_task(task_id)
+            raise TikTokUpstreamError(
+                "The protocol session is temporarily unavailable while checking "
+                f"task {upstream_task_id!r}",
+                status_code=503,
+                code="protocol_session_unavailable",
+            )
         credits = task.raw.get("credits") if task.raw else None
         if (
             advertiser_id

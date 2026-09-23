@@ -91,7 +91,7 @@ def is_tiktok_transient_error(exc: BaseException) -> bool:
     """Recognize transport and upstream RPC failures that are safe to retry."""
     code = str(getattr(exc, "code", "") or "").strip().lower()
     message = str(exc).strip().lower()
-    if code == "tiktok_transport_error":
+    if code in {"tiktok_transport_error", "protocol_session_unavailable"}:
         return True
     if code.startswith("tiktok_http_"):
         try:

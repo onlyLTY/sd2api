@@ -4269,6 +4269,77 @@ async def test_protocol_pool_refreshes_subaccount_credits_after_terminal_task(
     assert isinstance(updates["last_checked_at"], int)
 
 
+@pytest.mark.asyncio
+async def test_pool_does_not_fall_back_to_browser_for_persisted_protocol_task(
+    tmp_path: Path,
+) -> None:
+    store = TaskStore(str(tmp_path / "protocol-status-routing.db"))
+    store.create_account(account_id="login-a", name="Login A")
+    store.create(
+        task_id="video-local",
+        api="openai",
+        model="seedance-2.0-mini",
+        prompt="test",
+        seconds=15,
+        account_id="login-a",
+        advertiser_id="sub-a",
+    )
+    store.update(
+        "video-local",
+        status="running",
+        progress=50,
+        upstream_task_id="7688642324226408454",
+        submission_status="submitted",
+    )
+    pool = BrowserPoolClient(Settings(), store)
+
+    class UnexpectedBrowser:
+        async def check_task(self, _task_id: str) -> UpstreamTask:
+            raise AssertionError("protocol tasks must not use browser memory")
+
+    pool._worker = lambda _account_id: UnexpectedBrowser()  # type: ignore[method-assign]
+
+    with pytest.raises(TikTokUpstreamError) as error:
+        await pool.check_task("7688642324226408454")
+
+    assert error.value.status_code == 503
+    assert error.value.code == "protocol_session_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_refresh_keeps_protocol_task_status_while_session_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sd2api.main as main
+
+    task_store = TaskStore(str(tmp_path / "protocol-status-cache.db"))
+    task_store.create_account(account_id="login-a", name="Login A")
+    task_store.create(
+        task_id="video-local",
+        api="openai",
+        model="seedance-2.0-mini",
+        prompt="test",
+        seconds=15,
+        account_id="login-a",
+        advertiser_id="sub-a",
+    )
+    record = task_store.update(
+        "video-local",
+        status="running",
+        progress=50,
+        upstream_task_id="7688642324226408454",
+        submission_status="submitted",
+    )
+    monkeypatch.setattr(main, "store", task_store)
+    monkeypatch.setattr(main, "client", BrowserPoolClient(Settings(), task_store))
+
+    refreshed = await main.refresh(record)
+
+    assert refreshed.status == "running"
+    assert refreshed.progress == 50
+    assert task_store.get("video-local") == record
+
+
 def test_admin_account_routes_without_starting_browser(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
