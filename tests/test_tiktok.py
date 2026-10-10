@@ -24,7 +24,10 @@ from sd2api.browser_client import (
     IMAGE_STUDIO_URL,
     _clear_stale_chromium_profile_locks,
 )
-from sd2api.browser_pool import BrowserPoolClient
+from sd2api.browser_pool import (
+    SUBACCOUNT_REFRESH_ERROR_PREFIX,
+    BrowserPoolClient,
+)
 from sd2api.models import OpenAICreateVideoRequest, SeedanceCreateRequest, UpstreamTask
 from sd2api.protocol import ProtocolSession, ProtocolTikTokClient, _sign_gateway_request
 from sd2api.security import CredentialError, CredentialVault
@@ -254,6 +257,68 @@ def test_feishu_notifier_does_not_treat_transient_keepalive_failure_as_manual() 
             "keepalive_error": "request timed out",
         }
     )
+
+
+@pytest.mark.asyncio
+async def test_feishu_notifier_reports_deduplicated_subaccount_refresh_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    configured = Settings(
+        sd2api_feishu_enabled=True,
+        sd2api_feishu_instance_name="Instance A",
+    )
+
+    class FakeFeishu:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        async def send_text(self, message: str) -> str:
+            self.messages.append(message)
+            return "om_test"
+
+    fake = FakeFeishu()
+    notifier = FeishuNotifier(configured, feishu_client=fake)  # type: ignore[arg-type]
+    failure = {
+        "id": "account-a",
+        "enabled": True,
+        "name": "user@example.com",
+        "login_state": "logged_in",
+        "subaccounts": [
+            {
+                "advertiser_id": "aio-a",
+                "name": "AIO A",
+                "last_error": (
+                    f"{SUBACCOUNT_REFRESH_ERROR_PREFIX}: "
+                    "TikTokUpstreamError: Error 5: Out of memory"
+                ),
+            }
+        ],
+    }
+
+    await notifier.check_accounts([failure])
+    await notifier.check_accounts([failure])
+    assert len(fake.messages) == 1
+    assert "Instance A" in fake.messages[0]
+    assert "AIO A" in fake.messages[0]
+    assert "保留上次有效" in fake.messages[0]
+
+    recovered = {
+        **failure,
+        "subaccounts": [{**failure["subaccounts"][0], "last_error": None}],
+    }
+    await notifier.check_accounts([recovered])
+    await notifier.check_accounts([failure])
+    assert len(fake.messages) == 2
+
+    await notifier.check_accounts([recovered])
+    parent_failure = {
+        **recovered,
+        "last_error": f"{SUBACCOUNT_REFRESH_ERROR_PREFIX}: upstream unavailable",
+    }
+    await notifier.check_accounts([parent_failure])
+    assert len(fake.messages) == 3
+    assert "upstream unavailable" in fake.messages[2]
 
 
 @pytest.mark.parametrize(
@@ -2285,6 +2350,64 @@ async def test_protocol_validate_retries_tiktok_internal_rpc_timeout(
 
 
 @pytest.mark.asyncio
+async def test_protocol_capability_read_retries_upstream_out_of_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account_info_calls = 0
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal account_info_calls
+        if request.url.path.endswith("ClientGetAccountInfo"):
+            account_info_calls += 1
+            if account_info_calls <= 3:
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 5,
+                        "message": "Error 5: Out of memory (Needed 8384576 bytes)",
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"account": {"aioClientID": "aio-a"}}},
+            )
+        if request.url.path.endswith("QueryCreditAccount"):
+            return httpx.Response(200, json={"code": 0, "data": {"Credits": 100}})
+        if request.url.path.endswith("get_miniapp_permission_with_allowlist"):
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"allowlist": ["cue_mini_i2v_seedance_2"]}},
+            )
+        return httpx.Response(
+            200,
+            json={"code": 0, "data": {"user_segment_tier": "T1"}},
+        )
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    client = ProtocolTikTokClient(
+        Settings(),
+        protocol_session(),
+        account_id="account-a",
+        advertiser_id="aio-a",
+        transport=httpx.MockTransport(handler),
+    )
+    result = await client.account_capabilities()
+    await client.close()
+
+    assert result == {
+        "advertiser_id": "aio-a",
+        "credits": 100,
+        "seedance_access": True,
+    }
+    assert account_info_calls == 4
+    assert sleeps == [0.5, 1.0, 1.5]
+
+
+@pytest.mark.asyncio
 async def test_protocol_task_check_does_not_retry_business_error() -> None:
     calls = 0
 
@@ -4222,10 +4345,98 @@ async def test_refresh_subaccounts_is_allowed_while_generation_is_active(
             }
 
     pool._protocol_client = (  # type: ignore[method-assign]
-        lambda _account_id, advertiser_id=None: SubClient() if advertiser_id else RootClient()
+        lambda _account_id, advertiser_id=None: (
+            SubClient() if advertiser_id else RootClient()
+        )
     )
     result = await pool.refresh_subaccounts("login-a", check_access=True)
     assert result["subaccounts"][0]["credits"] == 95
+
+
+@pytest.mark.asyncio
+async def test_refresh_subaccounts_preserves_last_good_capabilities_after_retries_fail(
+    tmp_path: Path,
+) -> None:
+    store = TaskStore(str(tmp_path / "refresh-preserve.db"))
+    store.create_account(account_id="login-a", name="Login A")
+    store.upsert_subaccounts(
+        "login-a",
+        [
+            {
+                "advertiser_id": "sub-a",
+                "name": "Sub A",
+                "seedance_access": True,
+                "credits": 400,
+            }
+        ],
+    )
+    store.set_subaccount_enabled("login-a", "sub-a", True)
+    pool = BrowserPoolClient(Settings(), store)
+
+    class RootClient:
+        async def discover_subaccounts(self) -> list[dict[str, Any]]:
+            return [
+                {
+                    "advertiser_id": "sub-a",
+                    "name": "Sub A",
+                    "account_type": "client",
+                }
+            ]
+
+    class SubClient:
+        async def account_capabilities(self) -> dict[str, Any]:
+            raise TikTokUpstreamError(
+                "Error 5: Out of memory (Needed 8384576 bytes)",
+                code="5",
+            )
+
+    pool._protocol_client = (  # type: ignore[method-assign]
+        lambda _account_id, advertiser_id=None: SubClient() if advertiser_id else RootClient()
+    )
+
+    result = await pool.refresh_subaccounts("login-a", check_access=True)
+    subaccount = result["subaccounts"][0]
+    assert subaccount["enabled"] is True
+    assert subaccount["seedance_access"] is True
+    assert subaccount["credits"] == 400
+    assert subaccount["last_error"].startswith(SUBACCOUNT_REFRESH_ERROR_PREFIX)
+    event = store.list_events(level="error", category="account")[0]
+    assert event.message == SUBACCOUNT_REFRESH_ERROR_PREFIX
+    assert event.details == {
+        "advertiser_id": "sub-a",
+        "subaccount_name": "Sub A",
+        "upstream_code": "5",
+        "upstream_message": "Error 5: Out of memory (Needed 8384576 bytes)",
+    }
+
+
+@pytest.mark.asyncio
+async def test_scheduled_subaccount_refresh_only_runs_for_started_sessions(
+    tmp_path: Path,
+) -> None:
+    store = TaskStore(str(tmp_path / "scheduled-refresh.db"))
+    for account_id in ("ready", "stopped", "disabled"):
+        store.create_account(account_id=account_id, name=account_id)
+        store.update_account(
+            account_id,
+            session_ciphertext="stored-session",
+            session_updated_at=int(time.time()),
+            login_state="logged_in",
+            enabled=account_id != "disabled",
+        )
+    pool = BrowserPoolClient(Settings(), store)
+    pool._started_accounts.update({"ready", "disabled"})
+    refreshed: list[str] = []
+
+    async def refresh(account_id: str, *, check_access: bool = True) -> dict[str, Any]:
+        assert check_access is True
+        refreshed.append(account_id)
+        return {}
+
+    pool.refresh_subaccounts = refresh  # type: ignore[method-assign]
+    await pool._run_subaccount_refresh_once()
+
+    assert refreshed == ["ready"]
 
 
 @pytest.mark.asyncio

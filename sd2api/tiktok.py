@@ -98,6 +98,8 @@ def is_tiktok_transient_error(exc: BaseException) -> bool:
             return 500 <= int(code.removeprefix("tiktok_http_")) < 600
         except ValueError:
             return False
+    if code == "5" and "out of memory" in message:
+        return True
     if code != "50000":
         return False
     return any(

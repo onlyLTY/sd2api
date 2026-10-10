@@ -25,6 +25,8 @@
   "login_timeout": 600,
   "relogin_interval": 300,
   "session_keepalive_interval": 21600,
+  "subaccount_refresh_interval": 1800,
+  "subaccount_refresh_concurrency": 3,
   "feishu_enabled": false,
   "feishu_app_id": "",
   "feishu_app_secret": "",

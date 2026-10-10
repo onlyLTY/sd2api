@@ -50,6 +50,8 @@ class RuntimeConfig(BaseModel):
     login_timeout: int = Field(default=600, ge=60, le=3600)
     relogin_interval: int = Field(default=300, ge=30, le=86400)
     session_keepalive_interval: int = Field(default=21600, ge=3600, le=86400)
+    subaccount_refresh_interval: int = Field(default=1800, ge=60, le=86400)
+    subaccount_refresh_concurrency: int = Field(default=3, ge=1, le=20)
     feishu_enabled: bool = False
     feishu_app_id: str = ""
     feishu_app_secret: str = ""
@@ -107,6 +109,8 @@ LEGACY_ENV_FIELDS = {
     "SD2API_LOGIN_TIMEOUT": "login_timeout",
     "SD2API_RELOGIN_INTERVAL": "relogin_interval",
     "SD2API_SESSION_KEEPALIVE_INTERVAL": "session_keepalive_interval",
+    "SD2API_SUBACCOUNT_REFRESH_INTERVAL": "subaccount_refresh_interval",
+    "SD2API_SUBACCOUNT_REFRESH_CONCURRENCY": "subaccount_refresh_concurrency",
     "SD2API_FEISHU_ENABLED": "feishu_enabled",
     "SD2API_FEISHU_APP_ID": "feishu_app_id",
     "SD2API_FEISHU_APP_SECRET": "feishu_app_secret",
