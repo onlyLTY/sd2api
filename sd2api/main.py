@@ -816,6 +816,8 @@ async def admin_config_status() -> dict[str, Any]:
         "login_timeout": settings.sd2api_login_timeout,
         "relogin_interval": settings.sd2api_relogin_interval,
         "session_keepalive_interval": settings.sd2api_session_keepalive_interval,
+        "subaccount_refresh_interval": settings.sd2api_subaccount_refresh_interval,
+        "subaccount_refresh_concurrency": settings.sd2api_subaccount_refresh_concurrency,
         "feishu_enabled": settings.sd2api_feishu_enabled,
         "feishu_configured": bool(
             settings.sd2api_feishu_app_id
@@ -931,6 +933,8 @@ async def update_admin_runtime_config(body: RuntimeConfig) -> dict[str, Any]:
         "browser_renderer_process_limit",
         "browser_autostart",
         "pool_start_concurrency",
+        "subaccount_refresh_interval",
+        "subaccount_refresh_concurrency",
         "submission_concurrency",
         "submission_staging_max_bytes",
         "protocol_upload_concurrency",

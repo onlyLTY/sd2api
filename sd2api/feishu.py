@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 
+from .browser_pool import SUBACCOUNT_REFRESH_ERROR_PREFIX
 from .config import Settings
 from .tiktok import is_tiktok_authentication_error
 
@@ -273,6 +274,7 @@ class FeishuNotifier:
         self.client = feishu_client or FeishuClient(settings)
         self.poll_seconds = poll_seconds
         self._active_incidents: dict[str, tuple[str, str]] = {}
+        self._active_refresh_incidents: dict[str, str] = {}
 
     def _needs_manual_action(self, account: dict[str, Any]) -> bool:
         state = str(account.get("login_state") or "")
@@ -343,20 +345,103 @@ class FeishuNotifier:
             for account_id, fingerprint in self._active_incidents.items()
             if account_id in current
         }
-        if not (
+        if (
             self.settings.sd2api_feishu_enabled
             and self.settings.sd2api_feishu_notify_manual_action
         ):
+            for account in accounts:
+                account_id = str(account.get("id") or "")
+                if (
+                    account_id not in current
+                    or self._active_incidents.get(account_id) == current[account_id]
+                ):
+                    continue
+                await self.client.send_text(self._manual_action_message(account))
+                self._active_incidents[account_id] = current[account_id]
+
+        refresh_incidents = {
+            f"{account.get('id')}:{subaccount.get('advertiser_id')}": str(
+                subaccount.get("last_error")
+            )
+            for account in accounts
+            if account.get("enabled", True)
+            for subaccount in account.get("subaccounts", [])
+            if SUBACCOUNT_REFRESH_ERROR_PREFIX
+            in str(subaccount.get("last_error") or "")
+        }
+        refresh_incidents.update(
+            {
+                f"{account.get('id')}:*": str(
+                    account.get("login_error") or account.get("last_error")
+                )
+                for account in accounts
+                if account.get("enabled", True)
+                and SUBACCOUNT_REFRESH_ERROR_PREFIX
+                in str(account.get("login_error") or account.get("last_error") or "")
+            }
+        )
+        self._active_refresh_incidents = {
+            key: fingerprint
+            for key, fingerprint in self._active_refresh_incidents.items()
+            if key in refresh_incidents
+        }
+        if not self.settings.sd2api_feishu_enabled:
             return
         for account in accounts:
-            account_id = str(account.get("id") or "")
+            account_key = f"{account.get('id')}:*"
+            account_fingerprint = refresh_incidents.get(account_key)
             if (
-                account_id not in current
-                or self._active_incidents.get(account_id) == current[account_id]
+                account_fingerprint
+                and self._active_refresh_incidents.get(account_key)
+                != account_fingerprint
             ):
-                continue
-            await self.client.send_text(self._manual_action_message(account))
-            self._active_incidents[account_id] = current[account_id]
+                await self.client.send_text(
+                    self._subaccount_refresh_failure_message(
+                        account, None, account_fingerprint
+                    )
+                )
+                self._active_refresh_incidents[account_key] = account_fingerprint
+            for subaccount in account.get("subaccounts", []):
+                key = f"{account.get('id')}:{subaccount.get('advertiser_id')}"
+                fingerprint = refresh_incidents.get(key)
+                if (
+                    not fingerprint
+                    or self._active_refresh_incidents.get(key) == fingerprint
+                ):
+                    continue
+                await self.client.send_text(
+                    self._subaccount_refresh_failure_message(
+                        account, subaccount, fingerprint
+                    )
+                )
+                self._active_refresh_incidents[key] = fingerprint
+
+    def _subaccount_refresh_failure_message(
+        self,
+        account: dict[str, Any],
+        subaccount: dict[str, Any] | None,
+        error: str,
+    ) -> str:
+        lines = [
+            "[sd2api] 子账号刷新连续失败",
+            f"实例：{self.settings.sd2api_feishu_instance_name or 'sd2api'}",
+            f"账号：{account.get('name') or account.get('username') or account.get('id')}",
+        ]
+        if subaccount is not None:
+            lines.extend(
+                [
+                    f"子账号：{subaccount.get('name') or subaccount.get('advertiser_id')}",
+                    f"AIO：{subaccount.get('advertiser_id')}",
+                ]
+            )
+        lines.extend(
+            [
+                f"原因：{error}",
+                "处理：已保留上次有效状态，账号不会因本次刷新失败退出调度。",
+                f"时间：{datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}",
+            ]
+        )
+        return "\n".join(lines)
 
     async def run(
         self, account_loader: Callable[[], Awaitable[list[dict[str, Any]]]]

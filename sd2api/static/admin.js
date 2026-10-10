@@ -85,6 +85,8 @@ const settingsSchema = [
     ["login_timeout", "登录超时（秒）", "number", { min: 60, max: 3600 }],
     ["relogin_interval", "登录状态检查间隔（秒）", "number", { min: 30, max: 86400 }],
     ["session_keepalive_interval", "浏览器保活间隔（秒）", "number", { min: 3600, max: 86400 }],
+    ["subaccount_refresh_interval", "子账号定时刷新间隔（秒）", "number", { min: 60, max: 86400 }],
+    ["subaccount_refresh_concurrency", "子账号刷新并发", "number", { min: 1, max: 20 }],
     ["temp_mail_poll_seconds", "邮箱轮询间隔（秒）", "number", { min: 1, max: 30, step: 0.5 }],
     ["temp_mail_timeout", "邮箱验证码超时（秒）", "number", { min: 30, max: 900 }],
   ]},

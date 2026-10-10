@@ -606,8 +606,8 @@ class ProtocolTikTokClient:
 
     async def discover_subaccounts(self) -> list[dict[str, Any]]:
         account_list, account_info = await asyncio.gather(
-            self._request("GET", ACCOUNT_LIST_PATH),
-            self._request("GET", ACCOUNT_INFO_PATH),
+            self._read_request_with_retry("GET", ACCOUNT_LIST_PATH),
+            self._read_request_with_retry("GET", ACCOUNT_INFO_PATH),
         )
         list_data = _unwrap_data(account_list)
         info_data = _unwrap_data(account_info)
@@ -681,10 +681,10 @@ class ProtocolTikTokClient:
 
     async def account_capabilities(self) -> dict[str, Any]:
         info, credit, permissions, level = await asyncio.gather(
-            self._request("GET", ACCOUNT_INFO_PATH),
-            self._request("POST", CREDIT_ACCOUNT_PATH, json_body={}),
-            self._request("GET", MINIAPP_PERMISSION_PATH),
-            self._request("POST", USER_LEVEL_PATH, json_body={}),
+            self._read_request_with_retry("GET", ACCOUNT_INFO_PATH),
+            self._read_request_with_retry("POST", CREDIT_ACCOUNT_PATH, json_body={}),
+            self._read_request_with_retry("GET", MINIAPP_PERMISSION_PATH),
+            self._read_request_with_retry("POST", USER_LEVEL_PATH, json_body={}),
         )
         info_data = _unwrap_data(info)
         account = (

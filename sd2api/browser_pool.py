@@ -28,6 +28,9 @@ class _KeepalivePending(Exception):
     """Internal signal that scheduling should wait for browser maintenance."""
 
 
+SUBACCOUNT_REFRESH_ERROR_PREFIX = "Subaccount capability refresh failed after retries"
+
+
 class BrowserPoolClient:
     """Schedules jobs across isolated, persistent browser account profiles."""
 
@@ -54,6 +57,7 @@ class BrowserPoolClient:
         self._startup_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
         self._monitor_task: asyncio.Task[None] | None = None
         self._keepalive_task: asyncio.Task[None] | None = None
+        self._subaccount_refresh_task: asyncio.Task[None] | None = None
         self._keepalive_accounts: set[str] = set()
         self._keepalive_condition = asyncio.Condition()
         self._keepalive_revision = 0
@@ -287,6 +291,10 @@ class BrowserPoolClient:
             self._keepalive_task = asyncio.create_task(
                 self._session_keepalive_loop(), name="sd2api-session-keepalive"
             )
+        if self._subaccount_refresh_task is None:
+            self._subaccount_refresh_task = asyncio.create_task(
+                self._subaccount_refresh_loop(), name="sd2api-subaccount-refresh"
+            )
 
     async def stop(self) -> None:
         startup_tasks = list(self._startup_tasks.values())
@@ -294,6 +302,12 @@ class BrowserPoolClient:
             task.cancel()
         await asyncio.gather(*startup_tasks, return_exceptions=True)
         self._startup_tasks.clear()
+        if self._subaccount_refresh_task:
+            self._subaccount_refresh_task.cancel()
+            await asyncio.gather(
+                self._subaccount_refresh_task, return_exceptions=True
+            )
+            self._subaccount_refresh_task = None
         if self._keepalive_task:
             self._keepalive_task.cancel()
             await asyncio.gather(self._keepalive_task, return_exceptions=True)
@@ -1162,6 +1176,34 @@ class BrowserPoolClient:
                 if not status["logged_in"]:
                     self._schedule_login(account["id"])
 
+    async def _subaccount_refresh_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.settings.sd2api_subaccount_refresh_interval)
+            await self._run_subaccount_refresh_once()
+
+    async def _run_subaccount_refresh_once(self) -> None:
+        """Refresh eligible accounts serially to avoid an upstream request burst."""
+        for account in self.store.list_accounts():
+            account_id = str(account["id"])
+            if not (
+                account.get("enabled")
+                and account_id in self._started_accounts
+                and account.get("session_available")
+                and account_id not in self._keepalive_accounts
+            ):
+                continue
+            login_task = self._login_tasks.get(account_id)
+            if login_task is not None and not login_task.done():
+                continue
+            try:
+                await self.refresh_subaccounts(account_id, check_access=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # refresh_subaccounts records the exhausted failure for the UI
+                # and notification loop. Continue refreshing the other accounts.
+                continue
+
     def _recover_interrupted_keepalives(self) -> None:
         for account in self.store.list_accounts():
             if account.get("keepalive_state") != "running":
@@ -1385,13 +1427,18 @@ class BrowserPoolClient:
             root_client = self._protocol_client(account_id)
             discovered = await root_client.discover_subaccounts()
             if check_access:
+                semaphore = asyncio.Semaphore(
+                    self.settings.sd2api_subaccount_refresh_concurrency
+                )
+
                 async def inspect(item: dict[str, Any]) -> dict[str, Any]:
                     checked = dict(item)
                     try:
                         advertiser_id = str(item["advertiser_id"])
-                        capability = await self._protocol_client(
-                            account_id, advertiser_id
-                        ).account_capabilities()
+                        async with semaphore:
+                            capability = await self._protocol_client(
+                                account_id, advertiser_id
+                            ).account_capabilities()
                         if capability["advertiser_id"] != advertiser_id:
                             raise RuntimeError(
                                 "TikTok returned a different subaccount context"
@@ -1405,18 +1452,12 @@ class BrowserPoolClient:
                     except TikTokUpstreamError as exc:
                         if is_tiktok_authentication_error(exc):
                             raise
-                        checked.update(
-                            credits=None,
-                            seedance_access=False,
-                            last_error=f"{exc.__class__.__name__}: {exc}",
-                            last_checked_at=int(time.time()),
+                        self._record_subaccount_refresh_failure(
+                            account_id, checked, exc
                         )
                     except Exception as exc:
-                        checked.update(
-                            credits=None,
-                            seedance_access=False,
-                            last_error=f"{exc.__class__.__name__}: {exc}",
-                            last_checked_at=int(time.time()),
+                        self._record_subaccount_refresh_failure(
+                            account_id, checked, exc
                         )
                     return checked
 
@@ -1425,16 +1466,69 @@ class BrowserPoolClient:
             if is_tiktok_authentication_error(exc):
                 await self._mark_account_session_expired(account_id, exc)
                 raise tiktok_authentication_error() from exc
-            raise
-        except Exception as exc:
+            self._record_account_refresh_failure(account_id, exc)
             raise TikTokUpstreamError(
-                f"Subaccount scan failed: {exc.__class__.__name__}: {exc}",
+                f"{SUBACCOUNT_REFRESH_ERROR_PREFIX}: {exc}",
+                status_code=exc.status_code,
+                code="subaccount_scan_failed",
+            ) from exc
+        except Exception as exc:
+            self._record_account_refresh_failure(account_id, exc)
+            raise TikTokUpstreamError(
+                f"{SUBACCOUNT_REFRESH_ERROR_PREFIX}: {exc.__class__.__name__}: {exc}",
                 status_code=502,
                 code="subaccount_scan_failed",
             ) from exc
         self.store.upsert_subaccounts(account_id, discovered)
         self.store.update_account(account_id, last_error=None)
         return await self.account_status(account_id)
+
+    def _record_account_refresh_failure(
+        self, account_id: str, exc: BaseException
+    ) -> None:
+        message = (
+            f"{SUBACCOUNT_REFRESH_ERROR_PREFIX}: {exc.__class__.__name__}: {exc}"
+        )
+        self.store.update_account(account_id, last_error=message)
+        self.store.add_event(
+            level="error",
+            category="account",
+            message=SUBACCOUNT_REFRESH_ERROR_PREFIX,
+            account_id=account_id,
+            details={
+                "upstream_code": getattr(exc, "code", None),
+                "upstream_message": str(exc),
+            },
+        )
+
+    def _record_subaccount_refresh_failure(
+        self,
+        account_id: str,
+        checked: dict[str, Any],
+        exc: BaseException,
+    ) -> None:
+        advertiser_id = str(checked["advertiser_id"])
+        checked.update(
+            credits=None,
+            seedance_access=None,
+            last_error=(
+                f"{SUBACCOUNT_REFRESH_ERROR_PREFIX}: "
+                f"{exc.__class__.__name__}: {exc}"
+            ),
+            last_checked_at=int(time.time()),
+        )
+        self.store.add_event(
+            level="error",
+            category="account",
+            message=SUBACCOUNT_REFRESH_ERROR_PREFIX,
+            account_id=account_id,
+            details={
+                "advertiser_id": advertiser_id,
+                "subaccount_name": str(checked.get("name") or advertiser_id),
+                "upstream_code": getattr(exc, "code", None),
+                "upstream_message": str(exc),
+            },
+        )
 
     async def set_subaccount_enabled(
         self, account_id: str, advertiser_id: str, *, enabled: bool
