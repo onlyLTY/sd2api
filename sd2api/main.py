@@ -38,7 +38,12 @@ from .models import (
 )
 from .store import TaskRecord, TaskStore
 from .submissions import VideoSubmissionDispatcher
-from .tiktok import TikTokClient, TikTokUpstreamError, is_tiktok_transient_error
+from .tiktok import (
+    REFERENCE_ONLY_MODELS,
+    TikTokClient,
+    TikTokUpstreamError,
+    is_tiktok_transient_error,
+)
 from .uploads import StagedMedia, UploadManager
 from . import __version__
 
@@ -159,9 +164,9 @@ OPENAI_CREATE_DESCRIPTION = """
 - `seconds` 是唯一可控的视频规格参数：支持 **4–15 秒**的任意整数。
 - `size` 只为 OpenAI SDK 兼容而保存和回显，**不会发送给 TikTok**；当前实测输出固定为竖屏 `720 × 1280`。
 - `sora-2` 是本服务映射到 Dreamina Seedance 2.0 的兼容别名，并非 OpenAI Sora。
-- T2V / I2V 支持 `seedance-2.0`、`seedance-2.5`；R2V 还支持 `seedance-2.0-mini`、`seedance-2.0-fast`。
+- T2V / I2V 支持 `seedance-2.0`、`seedance-2.5`；Mini / Fast 始终通过 R2V 上游接口提交，即使未提供参考素材。
 - JSON 的 `input_reference` 或 multipart 的同名文件用于单首帧 I2V。
-- JSON 的 `references` 或 multipart 的 `reference_media` 用于 R2V；最多 9 张图片、3 个视频、3 段音频，且必须至少包含一张图片或一个视频。
+- JSON 的 `references` 或 multipart 的 `reference_media` 用于 R2V；最多 9 张图片、3 个视频、3 段音频。Mini / Fast 可不提供素材，上游是否接受由 Seedance 决定。
 """
 
 
@@ -256,7 +261,7 @@ OPENAI_JSON_CREATE_SCHEMA: dict[str, Any] = {
                 "seedance-2.0-mini",
                 "seedance-2.0-fast",
             ],
-            "description": "模型名。Mini 和 Fast 仅支持带 references 的 R2V；sora-2 映射到 Seedance 2.0。",
+            "description": "模型名。Mini 和 Fast 始终通过 R2V 接口提交，references 可以为空；sora-2 映射到 Seedance 2.0。",
         },
         "seconds": {
             "type": "integer",
@@ -306,7 +311,7 @@ OPENAI_MULTIPART_CREATE_SCHEMA: dict[str, Any] = {
                 "seedance-2.0-mini",
                 "seedance-2.0-fast",
             ],
-            "description": "Mini 和 Fast 仅支持上传 reference_media 的 R2V。",
+            "description": "Mini 和 Fast 始终通过 R2V 接口提交，reference_media 可以为空。",
         },
         "seconds": {
             "type": "integer",
@@ -1309,6 +1314,8 @@ async def create_seedance_video(
     ),
 ) -> dict[str, Any]:
     mode = body.generation_mode
+    if mode == "text" and body.model.lower() in REFERENCE_ONLY_MODELS:
+        mode = "reference"
     if mode == "first_last":
         raise HTTPException(
             status_code=501,
@@ -1524,7 +1531,7 @@ def validate_reference_media(media: list[StagedMedia]) -> None:
     images = sum(item.kind == "image" for item in media)
     videos = sum(item.kind == "video" for item in media)
     audios = sum(item.kind == "audio" for item in media)
-    if not (images or videos):
+    if media and not (images or videos):
         raise HTTPException(
             status_code=422,
             detail="Reference to video requires at least one image or video",
@@ -1705,7 +1712,13 @@ async def create_openai_video(request: Request) -> dict[str, Any]:
         }
         for item in body.references
     )
-    mode = "reference" if reference_kinds else "image" if media_payload else "text"
+    mode = (
+        "reference"
+        if reference_kinds or body.model.lower() in REFERENCE_ONLY_MODELS
+        else "image"
+        if media_payload
+        else "text"
+    )
     try:
         record = store.create_submission(
             task_id="video_" + secrets.token_hex(16),

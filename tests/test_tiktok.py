@@ -1556,6 +1556,113 @@ def test_openai_route_accepts_json_and_multipart(tmp_path: Path, monkeypatch: py
     assert first.json()["id"] == repeated.json()["id"]
 
 
+def test_empty_fast_request_is_queued_as_reference_video(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sd2api.main as main
+
+    class FakeBrowserClient:
+        calls: list[dict[str, object]] = []
+
+        async def create_reference_video(self, **kwargs: object) -> str:
+            self.calls.append(kwargs)
+            return "fast-reference-task"
+
+    fake = FakeBrowserClient()
+    monkeypatch.setattr(main, "BrowserTikTokClient", FakeBrowserClient)
+    monkeypatch.setattr(main, "client", fake)
+    monkeypatch.setattr(main, "store", TaskStore(str(tmp_path / "empty-fast.db")))
+    monkeypatch.setattr(
+        main,
+        "uploads",
+        UploadManager(Settings(sd2api_upload_dir=str(tmp_path / "uploads"))),
+    )
+    api = TestClient(main.app)
+    headers = {"Authorization": f"Bearer {main.settings.sd2api_api_key}"}
+
+    response = api.post(
+        "/v1/videos",
+        headers=headers,
+        json={
+            "model": "seedance-2.0-fast",
+            "prompt": "Create a fast product video without reference media",
+            "seconds": 5,
+            "references": [],
+        },
+    )
+
+    assert response.status_code == 202
+    task_id = response.json()["id"]
+    queued = main.store.get(task_id)
+    assert queued is not None
+    assert queued.submission_payload == {"mode": "reference", "media": []}
+
+    dispatcher = VideoSubmissionDispatcher(
+        store=main.store,
+        uploads=main.uploads,
+        client=fake,
+        concurrency=1,
+        audit=lambda *args, **kwargs: None,
+    )
+    asyncio.run(dispatcher._submit(task_id))
+
+    assert fake.calls == [
+        {
+            "prompt": "Create a fast product video without reference media",
+            "model": "seedance-2.0-fast",
+            "duration": 5,
+            "media": [],
+        }
+    ]
+    assert main.store.get(task_id).upstream_task_id == "fast-reference-task"
+
+
+def test_seedance_empty_mini_request_uses_reference_video(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sd2api.main as main
+
+    class FakeBrowserClient:
+        calls: list[dict[str, object]] = []
+
+        async def create_reference_video(self, **kwargs: object) -> str:
+            self.calls.append(kwargs)
+            return "mini-reference-task"
+
+    fake = FakeBrowserClient()
+    monkeypatch.setattr(main, "BrowserTikTokClient", FakeBrowserClient)
+    monkeypatch.setattr(main, "client", fake)
+    monkeypatch.setattr(main, "store", TaskStore(str(tmp_path / "empty-mini.db")))
+    monkeypatch.setattr(
+        main,
+        "uploads",
+        UploadManager(Settings(sd2api_upload_dir=str(tmp_path / "uploads"))),
+    )
+    api = TestClient(main.app)
+    headers = {"Authorization": f"Bearer {main.settings.sd2api_api_key}"}
+
+    response = api.post(
+        "/api/v3/contents/generations/tasks",
+        headers=headers,
+        json={
+            "model": "seedance-2.0-mini",
+            "content": [{"type": "text", "text": "Create a compact product video"}],
+            "duration": 5,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "mini-reference-task"
+    assert fake.calls == [
+        {
+            "prompt": "Create a compact product video",
+            "model": "seedance-2.0-mini",
+            "duration": 5,
+            "media": [],
+        }
+    ]
+
+
 def test_openai_multipart_image_routes_to_image_video(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2691,6 +2798,68 @@ async def test_protocol_reference_request_uses_image_video_audio_mentions(
     ]
     assert captured["model"] == "2000004"
     assert json.loads(captured["settings"])["aiModel"] == "2000004"
+
+
+@pytest.mark.asyncio
+async def test_protocol_fast_reference_request_allows_empty_media() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/i2v/gen_r2v_video")
+        captured.update(json.loads(request.content))
+        return httpx.Response(200, json={"code": 0, "data": {"taskId": "fast-task"}})
+
+    client = ProtocolTikTokClient(
+        Settings(),
+        protocol_session(),
+        account_id="account-a",
+        advertiser_id="123456789012",
+        transport=httpx.MockTransport(handler),
+    )
+
+    task_id = await client.create_reference_video(
+        prompt="No references",
+        model="seedance-2.0-fast",
+        duration=5,
+        media=[],
+    )
+    await client.close()
+
+    assert task_id == "fast-task"
+    assert captured["model"] == "2000012"
+    assert captured["images"] == []
+    assert captured["mentions"] == []
+    settings = json.loads(captured["settings"])
+    assert settings["aiModel"] == "2000012"
+    assert settings["images"] == []
+
+
+@pytest.mark.asyncio
+async def test_browser_reference_request_allows_empty_media(tmp_path: Path) -> None:
+    class EmptyReferenceClient(BrowserTikTokClient):
+        async def start(self, *args: object, **kwargs: object) -> dict[str, object]:
+            return {"running": True}
+
+        async def status(self) -> dict[str, object]:
+            return {"logged_in": True}
+
+    client = EmptyReferenceClient(
+        Settings(sd2api_browser_profile=str(tmp_path / "profile")),
+        account_id="empty-reference",
+    )
+
+    task_id = await client.create_reference_video(
+        prompt="No references",
+        model="seedance-2.0-mini",
+        duration=5,
+        media=[],
+    )
+
+    queued = await client._queue.get()
+    assert task_id.startswith("browser_")
+    assert queued.mode == "reference"
+    assert queued.media == ()
+    client._queue.task_done()
 
 
 @pytest.mark.asyncio

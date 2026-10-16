@@ -360,7 +360,7 @@ class BrowserTikTokClient:
             images = sum(item.kind == "image" for item in resolved_media)
             videos = sum(item.kind == "video" for item in resolved_media)
             audios = sum(item.kind == "audio" for item in resolved_media)
-            if not (images or videos):
+            if resolved_media and not (images or videos):
                 raise TikTokUpstreamError(
                     "Reference-to-video requires at least one image or video",
                     status_code=422,
@@ -1421,7 +1421,7 @@ class BrowserTikTokClient:
         await self._select_generation_mode(page, mode=job.mode)
         if job.mode == "image":
             await self._upload_input_image(page, job.media[0].path)
-        elif job.mode == "reference":
+        elif job.mode == "reference" and job.media:
             await self._upload_reference_media(page, list(job.media))
 
         await self._select_model(page, job.model)
