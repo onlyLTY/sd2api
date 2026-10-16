@@ -42,6 +42,8 @@ R2V_MODELS: dict[str, str] = {
     "dreamina-seedance-2-0-fast": "2000012",
 }
 
+REFERENCE_ONLY_MODELS = frozenset(R2V_MODELS).difference(T2V_MODELS)
+
 MODEL_PERMISSION_CODES = {"10001100"}
 AUTHENTICATION_ERROR_CODES = {
     "browser_login_required",

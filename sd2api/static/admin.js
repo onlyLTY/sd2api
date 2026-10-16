@@ -920,7 +920,7 @@ function updateDuration() {
 function validateReferences(files) {
   const counts = { image: 0, video: 0, audio: 0 };
   files.forEach((file) => { if (counts[file.type.split("/")[0]] !== undefined) counts[file.type.split("/")[0]] += 1; });
-  if (!counts.image && !counts.video) throw new Error("参考生视频至少需要一张图片或一个视频");
+  if (files.length && !counts.image && !counts.video) throw new Error("仅上传音频时还需要至少一张图片或一个视频");
   if (counts.image > 9 || counts.video > 3 || counts.audio > 3) throw new Error("参考素材上限为 9 张图片、3 个视频和 3 段音频");
 }
 
