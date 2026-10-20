@@ -153,6 +153,8 @@ print(f"Current Status: {status.status}")
 
 调用方重试创建请求时应携带稳定的 `Idempotency-Key` 请求头。同一 API Key 与幂等键会返回第一次受理的本地任务，避免网络重试造成重复生成和重复扣费。
 
+若 Seedance 已接受任务、但随后在生成结果中返回明确的账号 RPM 限制（例如 `EndpointAccountRpmRateLimitExceeded`），sd2api 会短时冷却该子账号，并使用同一个本地 `video_*` ID 自动换号重提，最多两次。该规则按 RPM provider 文案识别，不会仅凭 `10043100/10043101` 将每日额度错误误判为短时限流。
+
 #### cURL 调用示例
 
 ##### 文生视频 (T2V)

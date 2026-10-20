@@ -466,12 +466,45 @@ class TaskStore:
                 """
                 UPDATE tasks
                 SET upstream_task_id = ?, submission_status = 'submitted',
-                    submission_payload = NULL, account_id = ?, advertiser_id = ?,
+                    account_id = ?, advertiser_id = ?,
                     updated_at = ?
                 WHERE id = ?
                 """,
                 (upstream_task_id, account_id, advertiser_id, now, task_id),
             )
+        record = self.get(task_id)
+        if record is None:
+            raise KeyError(task_id)
+        return record
+
+    def retry_submitted_task(
+        self,
+        task_id: str,
+        *,
+        expected_upstream_task_id: str,
+        payload: dict[str, Any],
+    ) -> TaskRecord | None:
+        now = int(time.time())
+        encoded_payload = json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":")
+        )
+        with self._lock, self._connect() as connection:
+            result = connection.execute(
+                """
+                UPDATE tasks
+                SET status = 'queued', progress = 0, completed_at = NULL,
+                    video_id = NULL, video_url = NULL, poster_url = NULL,
+                    error_code = NULL, error_message = NULL, raw = NULL,
+                    upstream_task_id = NULL, submission_status = 'queued',
+                    submission_payload = ?, account_id = NULL,
+                    advertiser_id = NULL, updated_at = ?
+                WHERE id = ? AND upstream_task_id = ?
+                    AND submission_status = 'submitted'
+                """,
+                (encoded_payload, now, task_id, expected_upstream_task_id),
+            )
+        if result.rowcount == 0:
+            return None
         record = self.get(task_id)
         if record is None:
             raise KeyError(task_id)

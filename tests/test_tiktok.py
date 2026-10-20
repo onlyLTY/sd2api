@@ -34,7 +34,11 @@ from sd2api.security import CredentialError, CredentialVault
 from sd2api.store import TaskStore
 from sd2api.submissions import VideoSubmissionDispatcher
 from sd2api.temp_mail import TempMailClient
-from sd2api.tiktok import TikTokClient, TikTokUpstreamError
+from sd2api.tiktok import (
+    TikTokClient,
+    TikTokUpstreamError,
+    is_tiktok_rpm_rate_limit,
+)
 from sd2api.uploads import StagedMedia, UploadManager
 
 
@@ -1720,8 +1724,11 @@ def test_openai_multipart_image_routes_to_image_video(
     asyncio.run(dispatcher._submit(task_id))
     assert len(fake.calls) == 1
     assert fake.calls[0]["duration"] == 5
+    attempt_path = Path(str(fake.calls[0]["image_path"]))
+    assert attempt_path != staged_path
+    assert not attempt_path.exists()
     assert main.store.get(task_id).upstream_task_id == "image-task-1"
-    assert not staged_path.exists()
+    assert staged_path.exists()
 
     data_url = "data:image/png;base64," + base64.b64encode(png_bytes()).decode("ascii")
     seedance_response = api.post(
@@ -2581,6 +2588,164 @@ async def test_refresh_keeps_cached_status_after_transient_retries_are_exhausted
     assert refreshed.status == "queued"
     assert len(events) == 1
     assert events[0]["details"] == {"error_code": "tiktok_transport_error"}
+
+
+@pytest.mark.asyncio
+async def test_refresh_reroutes_terminal_rpm_twice_then_exposes_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sd2api.main as main
+
+    task_store = TaskStore(str(tmp_path / "terminal-rpm.db"))
+    upload_manager = UploadManager(
+        Settings(sd2api_upload_dir=str(tmp_path / "uploads"))
+    )
+    source = upload_manager.root / "source.png"
+    source.write_bytes(png_bytes())
+    for account_id, advertiser_id in (("account-a", "aio-a"), ("account-b", "aio-b")):
+        task_store.create_account(account_id=account_id, name=account_id)
+        task_store.upsert_subaccounts(
+            account_id,
+            [
+                {
+                    "advertiser_id": advertiser_id,
+                    "name": advertiser_id,
+                    "account_type": "client",
+                    "seedance_access": True,
+                    "credits": 100,
+                }
+            ],
+        )
+        task_store.set_subaccount_enabled(account_id, advertiser_id, True)
+
+    task_store.create_submission(
+        task_id="video-rpm",
+        model="seedance-2.0-fast",
+        prompt="retry on another account",
+        seconds=5,
+        size="720x1280",
+        api_key_mask=None,
+        idempotency_key_hash=None,
+        payload={
+            "mode": "reference",
+            "media": [{"kind": "image", "source": "path", "value": str(source)}],
+        },
+    )
+    task_store.claim_submission("video-rpm")
+    record = task_store.complete_submission(
+        "video-rpm",
+        upstream_task_id="upstream-1",
+        account_id="account-a",
+        advertiser_id="aio-a",
+    )
+
+    class Client:
+        async def check_task(self, task_id: str) -> UpstreamTask:
+            return UpstreamTask(
+                id=task_id,
+                status="failed",
+                progress=100,
+                error_code="10043101",
+                error_message=(
+                    "provider_code=EndpointAccountRpmRateLimitExceeded "
+                    "provider_message=RPM (Requests Per Minute) limit exceeded"
+                ),
+            )
+
+    class Dispatcher:
+        wakes = 0
+
+        def wake(self) -> None:
+            self.wakes += 1
+
+    dispatcher = Dispatcher()
+    monkeypatch.setattr(main, "client", Client())
+    monkeypatch.setattr(main, "store", task_store)
+    monkeypatch.setattr(main, "uploads", upload_manager)
+    monkeypatch.setattr(main, "submission_dispatcher", dispatcher)
+
+    first_retry = await main.refresh(record)
+    assert first_retry.status == "queued"
+    assert first_retry.upstream_task_id is None
+    assert first_retry.submission_payload["terminal_rpm_retries"] == 1
+    assert source.exists()
+    assert int(
+        task_store.list_subaccounts("account-a")[0]["rate_limited_until"] or 0
+    ) > int(time.time())
+
+    task_store.claim_submission("video-rpm")
+    second_record = task_store.complete_submission(
+        "video-rpm",
+        upstream_task_id="upstream-2",
+        account_id="account-b",
+        advertiser_id="aio-b",
+    )
+    second_retry = await main.refresh(second_record)
+    assert second_retry.status == "queued"
+    assert second_retry.submission_payload["terminal_rpm_retries"] == 2
+    assert int(
+        task_store.list_subaccounts("account-b")[0]["rate_limited_until"] or 0
+    ) > int(time.time())
+
+    task_store.claim_submission("video-rpm")
+    final_record = task_store.complete_submission(
+        "video-rpm",
+        upstream_task_id="upstream-3",
+        account_id="account-a",
+        advertiser_id="aio-a",
+    )
+    failed = await main.refresh(final_record)
+
+    assert failed.status == "failed"
+    assert failed.error_code == "10043101"
+    assert failed.submission_payload is None
+    assert not source.exists()
+    assert dispatcher.wakes == 2
+
+
+@pytest.mark.asyncio
+async def test_refresh_does_not_reroute_daily_limit_with_overlapping_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sd2api.main as main
+
+    task_store = TaskStore(str(tmp_path / "daily-limit.db"))
+    task_store.create_submission(
+        task_id="video-daily",
+        model="seedance-2.0",
+        prompt="daily limit",
+        seconds=5,
+        size="720x1280",
+        api_key_mask=None,
+        idempotency_key_hash=None,
+        payload={"mode": "text", "media": []},
+    )
+    task_store.claim_submission("video-daily")
+    record = task_store.complete_submission(
+        "video-daily",
+        upstream_task_id="upstream-daily",
+        account_id="account-a",
+        advertiser_id="aio-a",
+    )
+
+    class Client:
+        async def check_task(self, task_id: str) -> UpstreamTask:
+            return UpstreamTask(
+                id=task_id,
+                status="failed",
+                progress=100,
+                error_code="10043101",
+                error_message="User Generation Day Limit: limit_level=STRATEGY",
+            )
+
+    monkeypatch.setattr(main, "client", Client())
+    monkeypatch.setattr(main, "store", task_store)
+
+    failed = await main.refresh(record)
+
+    assert failed.status == "failed"
+    assert failed.error_message == "User Generation Day Limit: limit_level=STRATEGY"
+    assert failed.submission_payload is None
 
 
 def test_protocol_video_url_ignores_empty_preview_and_prefers_original() -> None:
@@ -4146,6 +4311,17 @@ def test_daily_pool_boundaries_use_utc_midnight() -> None:
     assert BrowserPoolClient._utc_today_start(1_756_684_800) == 1_756_684_800
     assert BrowserPoolClient._next_utc_day_start(1_756_684_799) == 1_756_684_800
     assert BrowserPoolClient._next_utc_day_start(1_756_684_800) == 1_756_771_200
+
+
+def test_rpm_limit_detection_requires_rpm_provider_semantics() -> None:
+    assert is_tiktok_rpm_rate_limit(
+        "10043101",
+        "provider_code=EndpointAccountRpmRateLimitExceeded "
+        "provider_message=RPM (Requests Per Minute) limit exceeded",
+    )
+    assert not is_tiktok_rpm_rate_limit(
+        "10043101", "User Generation Day Limit: limit_level=STRATEGY"
+    )
 
 
 def test_pool_normalizes_model_aliases_for_cooldowns() -> None:

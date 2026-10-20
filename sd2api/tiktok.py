@@ -62,6 +62,10 @@ AUTHENTICATION_ERROR_MARKERS = (
     "session expired",
     "log in again",
 )
+RPM_RATE_LIMIT_MARKERS = (
+    "endpointaccountrpmratelimitexceeded",
+    "requests per minute",
+)
 
 
 class TikTokUpstreamError(RuntimeError):
@@ -89,10 +93,22 @@ def is_tiktok_authentication_error(exc: BaseException) -> bool:
     return any(marker in code or marker in message for marker in AUTHENTICATION_ERROR_MARKERS)
 
 
+def is_tiktok_rpm_rate_limit(
+    error_code: str | None, error_message: str | None = None
+) -> bool:
+    """Recognize account RPM limits by provider semantics, not overloaded codes."""
+    text = f"{error_code or ''} {error_message or ''}".strip().lower()
+    return any(marker in text for marker in RPM_RATE_LIMIT_MARKERS) or (
+        "rpm" in text and ("limit" in text or "exceeded" in text)
+    )
+
+
 def is_tiktok_transient_error(exc: BaseException) -> bool:
     """Recognize transport and upstream RPC failures that are safe to retry."""
     code = str(getattr(exc, "code", "") or "").strip().lower()
     message = str(exc).strip().lower()
+    if is_tiktok_rpm_rate_limit(code, message):
+        return True
     if code in {"tiktok_transport_error", "protocol_session_unavailable"}:
         return True
     if code.startswith("tiktok_http_"):
