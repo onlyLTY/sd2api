@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any
 
 from .browser_pool import BrowserPoolClient
@@ -100,14 +99,11 @@ class VideoSubmissionDispatcher:
                     self.uploads.ensure_staging_capacity(kind=kind)
                     media.append(await self.uploads.save_media_url(item["value"], kind=kind))
                 else:
-                    path = Path(item["value"])
-                    if not path.is_file():
-                        raise TikTokUpstreamError(
-                            f"Queued {kind} file is no longer available",
-                            status_code=422,
-                            code="staged_media_missing",
+                    media.append(
+                        self.uploads.clone_staged_media(
+                            StagedMedia(kind=kind, path=item["value"])
                         )
-                    media.append(StagedMedia(kind=kind, path=str(path)))
+                    )
 
             mode = payload.get("mode", "text")
             if mode == "reference":
@@ -175,6 +171,7 @@ class VideoSubmissionDispatcher:
                 )
             except KeyError:
                 return
+            self._cleanup_payload(record.submission_payload)
             context = (
                 dict(exc.context)
                 if isinstance(exc, TikTokUpstreamError)

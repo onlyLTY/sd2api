@@ -42,6 +42,7 @@ from .tiktok import (
     REFERENCE_ONLY_MODELS,
     TikTokClient,
     TikTokUpstreamError,
+    is_tiktok_rpm_rate_limit,
     is_tiktok_transient_error,
 )
 from .uploads import StagedMedia, UploadManager
@@ -49,6 +50,7 @@ from . import __version__
 
 
 logger = logging.getLogger("sd2api")
+TERMINAL_RPM_MAX_RETRIES = 2
 store = TaskStore(settings.sd2api_database)
 uploads = UploadManager(settings)
 admin_static_dir = Path(__file__).with_name("static")
@@ -167,6 +169,7 @@ OPENAI_CREATE_DESCRIPTION = """
 - T2V / I2V 支持 `seedance-2.0`、`seedance-2.5`；Mini / Fast 始终通过 R2V 上游接口提交，即使未提供参考素材。
 - JSON 的 `input_reference` 或 multipart 的同名文件用于单首帧 I2V。
 - JSON 的 `references` 或 multipart 的 `reference_media` 用于 R2V；最多 9 张图片、3 个视频、3 段音频。Mini / Fast 可不提供素材，上游是否接受由 Seedance 决定。
+- 若已提交的生成任务返回明确的账号 RPM 限制，服务会短时冷却该子账号并自动换号重提，最多两次；本地 `video_*` ID 保持不变。
 """
 
 
@@ -444,6 +447,16 @@ def find_task(task_id: str) -> TaskRecord | None:
     return store.get(task_id) or store.get_by_upstream_task_id(task_id)
 
 
+def cleanup_submission_payload(payload: dict[str, Any] | None) -> None:
+    uploads.cleanup(
+        [
+            StagedMedia(kind=item["kind"], path=item["value"])
+            for item in (payload or {}).get("media", [])
+            if item.get("source") == "path"
+        ]
+    )
+
+
 async def refresh(record: TaskRecord, *, force: bool = False) -> TaskRecord:
     if record.submission_status == "failed":
         return record
@@ -465,17 +478,70 @@ async def refresh(record: TaskRecord, *, force: bool = False) -> TaskRecord:
             details={"error_code": exc.code},
         )
         return record
-    updated = store.update(
-        record.id,
-        status=upstream.status,
-        progress=upstream.progress,
-        video_id=upstream.video_id,
-        video_url=upstream.video_url,
-        poster_url=upstream.poster_url,
-        error_code=upstream.error_code,
-        error_message=upstream.error_message,
-        raw=upstream.raw,
-    )
+    if (
+        upstream.status == "failed"
+        and record.submission_payload is not None
+        and record.upstream_task_id is not None
+        and record.account_id is not None
+        and record.advertiser_id is not None
+        and is_tiktok_rpm_rate_limit(upstream.error_code, upstream.error_message)
+    ):
+        payload = dict(record.submission_payload)
+        retry_count = int(payload.get("terminal_rpm_retries") or 0)
+        if retry_count < TERMINAL_RPM_MAX_RETRIES:
+            blocked_until = int(time.time()) + settings.sd2api_pool_rate_limit_cooldown
+            reason = upstream.error_message or upstream.error_code or "RPM limit"
+            store.update_subaccount(
+                record.account_id,
+                record.advertiser_id,
+                rate_limited_until=blocked_until,
+                rate_limit_reason=reason,
+                rate_limit_updated_at=int(time.time()),
+                last_error=reason,
+            )
+            payload["terminal_rpm_retries"] = retry_count + 1
+            retried = store.retry_submitted_task(
+                record.id,
+                expected_upstream_task_id=record.upstream_task_id,
+                payload=payload,
+            )
+            if retried is not None:
+                audit_event(
+                    "warning",
+                    "video",
+                    "生成阶段触发 RPM 限制，已换号重新提交",
+                    account_id=record.account_id,
+                    task_id=record.id,
+                    details={
+                        "advertiser_id": record.advertiser_id,
+                        "retry": retry_count + 1,
+                        "max_retries": TERMINAL_RPM_MAX_RETRIES,
+                        "blocked_until": blocked_until,
+                        "error_code": upstream.error_code,
+                    },
+                )
+                if submission_dispatcher is not None:
+                    submission_dispatcher.wake()
+                return retried
+            current = store.get(record.id)
+            if current is not None:
+                return current
+
+    changes: dict[str, Any] = {
+        "status": upstream.status,
+        "progress": upstream.progress,
+        "video_id": upstream.video_id,
+        "video_url": upstream.video_url,
+        "poster_url": upstream.poster_url,
+        "error_code": upstream.error_code,
+        "error_message": upstream.error_message,
+        "raw": upstream.raw,
+    }
+    if upstream.status in {"succeeded", "failed"}:
+        changes["submission_payload"] = None
+    updated = store.update(record.id, **changes)
+    if upstream.status in {"succeeded", "failed"}:
+        cleanup_submission_payload(record.submission_payload)
     if updated.status != record.status:
         if updated.status == "succeeded":
             audit_event(
@@ -1796,17 +1862,11 @@ async def delete_openai_video(video_id: str) -> dict[str, Any]:
     record = find_task(video_id)
     if record is None:
         raise not_found(video_id)
-    if record.submission_status in {"queued", "submitting"}:
+    if record.submission_payload:
         if submission_dispatcher is not None:
             await submission_dispatcher.cancel(record.id)
-        elif record.submission_payload:
-            uploads.cleanup(
-                [
-                    StagedMedia(kind=item["kind"], path=item["value"])
-                    for item in record.submission_payload.get("media", [])
-                    if item.get("source") == "path"
-                ]
-            )
+        else:
+            cleanup_submission_payload(record.submission_payload)
     if not store.delete(record.id):
         raise not_found(video_id)
     return {"id": record.id, "object": "video.deleted", "deleted": True}

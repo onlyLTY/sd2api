@@ -18,6 +18,7 @@ from .temp_mail import TempMailClient
 from .tiktok import (
     TikTokUpstreamError,
     is_tiktok_authentication_error,
+    is_tiktok_rpm_rate_limit,
     is_tiktok_transient_error,
     tiktok_authentication_error,
 )
@@ -598,12 +599,9 @@ class BrowserPoolClient:
     def _rate_limit_cooldown(exc: TikTokUpstreamError, settings: Settings) -> int:
         text = f"{exc.code} {exc}".lower()
         if not (
-            "10043101" in text
+            is_tiktok_rpm_rate_limit(exc.code, str(exc))
             or "10001113" in text
-            or "endpointaccountrpmratelimitexceeded" in text
-            or "requests per minute" in text
             or "too many requests" in text
-            or ("rpm" in text and ("limit" in text or "exceeded" in text))
             or "user generation 5min limit" in text
         ):
             return 0

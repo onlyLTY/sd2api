@@ -4,6 +4,8 @@ import asyncio
 import base64
 import binascii
 import ipaddress
+import os
+import shutil
 import socket
 import uuid
 from dataclasses import dataclass
@@ -172,6 +174,22 @@ class UploadManager:
             path = Path(item.path).resolve()
             if path.is_relative_to(self.root):
                 path.unlink(missing_ok=True)
+
+    def clone_staged_media(self, media: StagedMedia) -> StagedMedia:
+        """Create an expendable per-attempt copy while retaining the retry source."""
+        source = Path(media.path).resolve()
+        if not source.is_file() or not source.is_relative_to(self.root):
+            raise TikTokUpstreamError(
+                f"The staged {media.kind} reference is no longer available",
+                status_code=422,
+                code="staged_media_missing",
+            )
+        target = self.root / f"attempt_{uuid.uuid4().hex}{source.suffix}"
+        try:
+            os.link(source, target)
+        except OSError:
+            shutil.copy2(source, target)
+        return StagedMedia(kind=media.kind, path=str(target))
 
     def _save_data_url(self, value: str, *, kind: MediaKind) -> StagedMedia:
         header, separator, encoded = value.partition(",")
