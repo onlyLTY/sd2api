@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import sqlite3
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -63,8 +65,17 @@ class TaskStore:
         connection.row_factory = sqlite3.Row
         return connection
 
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        connection = self._connect()
+        try:
+            with connection as managed:
+                yield managed
+        finally:
+            connection.close()
+
     def _initialize(self) -> None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute(
                 """
@@ -340,7 +351,7 @@ class TaskStore:
         )
         values = asdict(record)
         values["raw"] = None
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             connection.execute(
                 """
                 INSERT INTO tasks (
@@ -395,7 +406,7 @@ class TaskStore:
         values["submission_payload"] = json.dumps(
             payload, ensure_ascii=False, separators=(",", ":")
         )
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             connection.execute(
                 """
                 INSERT INTO tasks (
@@ -418,7 +429,7 @@ class TaskStore:
 
     def claim_submission(self, task_id: str) -> TaskRecord | None:
         now = int(time.time())
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             result = connection.execute(
                 """
                 UPDATE tasks
@@ -435,7 +446,7 @@ class TaskStore:
         return self._decode(row) if row else None
 
     def queued_submission_ids(self) -> list[str]:
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             rows = connection.execute(
                 """
                 SELECT id FROM tasks
@@ -446,7 +457,7 @@ class TaskStore:
         return [str(row["id"]) for row in rows]
 
     def interrupted_submissions(self) -> list[TaskRecord]:
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             rows = connection.execute(
                 "SELECT * FROM tasks WHERE submission_status = 'submitting'"
             ).fetchall()
@@ -461,7 +472,7 @@ class TaskStore:
         advertiser_id: str | None,
     ) -> TaskRecord:
         now = int(time.time())
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             connection.execute(
                 """
                 UPDATE tasks
@@ -488,7 +499,7 @@ class TaskStore:
         encoded_payload = json.dumps(
             payload, ensure_ascii=False, separators=(",", ":")
         )
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             result = connection.execute(
                 """
                 UPDATE tasks
@@ -514,7 +525,7 @@ class TaskStore:
         self, task_id: str, *, error_code: str, error_message: str
     ) -> TaskRecord:
         now = int(time.time())
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             connection.execute(
                 """
                 UPDATE tasks
@@ -531,19 +542,19 @@ class TaskStore:
         return record
 
     def get(self, task_id: str) -> TaskRecord | None:
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             row = connection.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         return self._decode(row) if row else None
 
     def get_by_upstream_task_id(self, task_id: str) -> TaskRecord | None:
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             row = connection.execute(
                 "SELECT * FROM tasks WHERE upstream_task_id = ?", (task_id,)
             ).fetchone()
         return self._decode(row) if row else None
 
     def get_by_idempotency_key_hash(self, key_hash: str) -> TaskRecord | None:
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             row = connection.execute(
                 "SELECT * FROM tasks WHERE idempotency_key_hash = ?", (key_hash,)
             ).fetchone()
@@ -588,7 +599,7 @@ class TaskStore:
             )
         assignments = ", ".join(f"{name} = :{name}" for name in encoded)
         encoded["id"] = task_id
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             connection.execute(f"UPDATE tasks SET {assignments} WHERE id = :id", encoded)
         record = self.get(task_id)
         if record is None:
@@ -645,7 +656,7 @@ class TaskStore:
                 "submission_status, NULL AS submission_payload, idempotency_key_hash"
             )
         params.extend([limit, offset])
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             rows = connection.execute(
                 f"SELECT {columns} FROM tasks {where} "
                 f"ORDER BY created_at {direction}, id {direction} LIMIT ? OFFSET ?",
@@ -658,7 +669,7 @@ class TaskStore:
             return {}
         result: dict[str, str] = {}
         values = sorted(account_ids)
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             for start in range(0, len(values), 900):
                 chunk = values[start : start + 900]
                 placeholders = ", ".join("?" for _ in chunk)
@@ -701,7 +712,7 @@ class TaskStore:
             pattern = f"%{search}%"
             params.extend([pattern] * 6)
         where = "WHERE " + " AND ".join(conditions) if conditions else ""
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             row = connection.execute(
                 f"SELECT COUNT(*) AS count FROM tasks {where}", params
             ).fetchone()
@@ -723,7 +734,7 @@ class TaskStore:
             if details
             else None
         )
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO events (
@@ -755,7 +766,7 @@ class TaskStore:
         week_since: int | None = None,
     ) -> dict[str, int]:
         counts = {"total": 0, "queued": 0, "running": 0, "succeeded": 0, "failed": 0}
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             rows = connection.execute(
                 "SELECT status, COUNT(*) AS count FROM tasks GROUP BY status"
             ).fetchall()
@@ -807,7 +818,7 @@ class TaskStore:
         conditions = ["created_at >= ?", "created_at < ?"]
         params: list[Any] = [since, until]
         where = " AND ".join(conditions)
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             rows = connection.execute(
                 f"""
                 SELECT status, model, account_id, created_at, completed_at
@@ -822,7 +833,7 @@ class TaskStore:
     def active_task_ids(
         self, account_id: str, advertiser_id: str
     ) -> list[str]:
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             rows = connection.execute(
                 """
                 SELECT id FROM tasks
@@ -842,7 +853,7 @@ class TaskStore:
         error_message: str,
     ) -> int:
         now = int(time.time())
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             cursor = connection.execute(
                 """
                 UPDATE tasks
@@ -857,7 +868,7 @@ class TaskStore:
     def task_count_since(
         self, account_id: str, advertiser_id: str, since: int
     ) -> int:
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             row = connection.execute(
                 """
                 SELECT COUNT(*) AS count FROM tasks
@@ -892,7 +903,7 @@ class TaskStore:
             params.extend([pattern] * 4)
         where = "WHERE " + " AND ".join(conditions) if conditions else ""
         params.extend([limit, offset])
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             rows = connection.execute(
                 f"SELECT * FROM events {where} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
                 params,
@@ -921,14 +932,14 @@ class TaskStore:
             pattern = f"%{search}%"
             params.extend([pattern] * 4)
         where = "WHERE " + " AND ".join(conditions) if conditions else ""
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             row = connection.execute(
                 f"SELECT COUNT(*) AS count FROM events {where}", params
             ).fetchone()
         return int(row["count"] if row else 0)
 
     def delete(self, task_id: str) -> bool:
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             result = connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return result.rowcount > 0
 
@@ -940,7 +951,7 @@ class TaskStore:
         self, *, key_id: str, name: str, api_key: str, key_mask: str
     ) -> dict[str, Any]:
         created_at = int(time.time())
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             connection.execute(
                 "INSERT INTO api_keys (id, name, key_hash, key_mask, created_at) "
                 "VALUES (?, ?, ?, ?, ?)",
@@ -955,7 +966,7 @@ class TaskStore:
         }
 
     def list_api_keys(self) -> list[dict[str, Any]]:
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             rows = connection.execute(
                 "SELECT id, name, key_mask, created_at FROM api_keys "
                 "ORDER BY created_at ASC, id ASC"
@@ -972,7 +983,7 @@ class TaskStore:
         ]
 
     def api_key_mask_for(self, api_key: str) -> str | None:
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             row = connection.execute(
                 "SELECT key_mask FROM api_keys WHERE key_hash = ?",
                 (self.api_key_hash(api_key),),
@@ -980,7 +991,7 @@ class TaskStore:
         return str(row["key_mask"]) if row else None
 
     def delete_api_key(self, key_id: str) -> bool:
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             result = connection.execute("DELETE FROM api_keys WHERE id = ?", (key_id,))
         return result.rowcount > 0
 
@@ -996,7 +1007,7 @@ class TaskStore:
     ) -> dict[str, Any]:
         now = int(time.time())
         login_state = "pending" if username and password_ciphertext else "not_configured"
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             connection.execute(
                 """
                 INSERT INTO accounts (
@@ -1038,7 +1049,7 @@ class TaskStore:
     def get_account(
         self, account_id: str, *, include_secret: bool = False
     ) -> dict[str, Any] | None:
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             row = connection.execute(
                 "SELECT * FROM accounts WHERE id = ?", (account_id,)
             ).fetchone()
@@ -1047,7 +1058,7 @@ class TaskStore:
         return self._decode_account(row, include_secret=include_secret)
 
     def list_accounts(self) -> list[dict[str, Any]]:
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             rows = connection.execute(
                 "SELECT * FROM accounts ORDER BY created_at ASC, id ASC"
             ).fetchall()
@@ -1084,7 +1095,7 @@ class TaskStore:
         encoded = dict(changes)
         encoded["id"] = account_id
         assignments = ", ".join(f"{name} = :{name}" for name in changes)
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             result = connection.execute(
                 f"UPDATE accounts SET {assignments} WHERE id = :id", encoded
             )
@@ -1112,7 +1123,7 @@ class TaskStore:
         return str(account["session_ciphertext"])
 
     def delete_account(self, account_id: str) -> bool:
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             connection.execute(
                 "DELETE FROM subaccount_model_limits WHERE account_id = ?",
                 (account_id,),
@@ -1131,7 +1142,7 @@ class TaskStore:
         return result
 
     def list_subaccounts(self, account_id: str | None = None) -> list[dict[str, Any]]:
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             if account_id is None:
                 rows = connection.execute(
                     "SELECT * FROM subaccounts ORDER BY account_id, account_type, name, advertiser_id"
@@ -1151,7 +1162,7 @@ class TaskStore:
         self, account_id: str, subaccounts: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
         now = int(time.time())
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             connection.execute(
                 "UPDATE subaccounts SET active = 0 WHERE account_id = ?", (account_id,)
             )
@@ -1191,7 +1202,7 @@ class TaskStore:
     def set_subaccount_enabled(
         self, account_id: str, advertiser_id: str, enabled: bool
     ) -> dict[str, Any]:
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             result = connection.execute(
                 """
                 UPDATE subaccounts SET enabled = ?
@@ -1233,7 +1244,7 @@ class TaskStore:
                 changes[key] = int(bool(changes[key]))
         assignments = ", ".join(f"{name} = :{name}" for name in changes)
         encoded = {**changes, "account_id": account_id, "advertiser_id": advertiser_id}
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             result = connection.execute(
                 f"""
                 UPDATE subaccounts SET {assignments}
@@ -1263,7 +1274,7 @@ class TaskStore:
             conditions.append("advertiser_id = ?")
             params.append(advertiser_id)
         where = "WHERE " + " AND ".join(conditions) if conditions else ""
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             rows = connection.execute(
                 f"""
                 SELECT * FROM subaccount_model_limits
@@ -1305,7 +1316,7 @@ class TaskStore:
         assignments = ", ".join(
             f"{name} = excluded.{name}" for name in changes
         )
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             connection.execute(
                 f"""
                 INSERT INTO subaccount_model_limits (
@@ -1332,7 +1343,7 @@ class TaskStore:
     def clear_subaccount_model_limit(
         self, account_id: str, advertiser_id: str, model: str
     ) -> bool:
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             result = connection.execute(
                 """
                 DELETE FROM subaccount_model_limits
