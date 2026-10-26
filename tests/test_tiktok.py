@@ -5,6 +5,7 @@ import errno
 import time
 import base64
 import json
+import sqlite3
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -450,6 +451,40 @@ async def test_session_cookie_is_a_login_candidate_outside_login_page(
 
     assert await client._has_browser_login_candidate(chat) is True  # type: ignore[arg-type]
     assert await client._has_browser_login_candidate(login) is False  # type: ignore[arg-type]
+
+
+def test_store_closes_each_connection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = TaskStore(str(tmp_path / "closed-connections.db"))
+    original_connect = store._connect
+    closed: list[bool] = []
+
+    class TrackingConnection:
+        def __init__(self) -> None:
+            self.connection = original_connect()
+            self.was_closed = False
+            closed.append(False)
+
+        def __enter__(self) -> sqlite3.Connection:
+            return self.connection.__enter__()
+
+        def __exit__(self, *args: object) -> bool:
+            return bool(self.connection.__exit__(*args))
+
+        def close(self) -> None:
+            self.connection.close()
+            self.was_closed = True
+            closed[-1] = True
+
+    monkeypatch.setattr(store, "_connect", TrackingConnection)
+
+    assert store.count_tasks() == 0
+    assert closed == [True]
+
+    closed.clear()
+    with pytest.raises(sqlite3.OperationalError):
+        with store._connection() as connection:
+            connection.execute("SELECT * FROM missing_table")
+    assert closed == [True]
 
 
 def test_store_round_trip(tmp_path: Path) -> None:
