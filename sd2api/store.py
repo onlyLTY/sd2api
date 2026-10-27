@@ -54,6 +54,13 @@ class EventRecord:
     details: dict[str, Any] | None = None
 
 
+@dataclass(slots=True)
+class ExpiredTask:
+    id: str
+    account_id: str | None
+    submission_payload: dict[str, Any] | None
+
+
 class TaskStore:
     def __init__(self, path: str) -> None:
         self.path = str(Path(path))
@@ -690,6 +697,7 @@ class TaskStore:
         account_id: str | None = None,
         status: str | tuple[str, ...] | None = None,
         search: str | None = None,
+        created_after: int | None = None,
     ) -> int:
         conditions: list[str] = []
         params: list[Any] = []
@@ -711,6 +719,9 @@ class TaskStore:
             )
             pattern = f"%{search}%"
             params.extend([pattern] * 6)
+        if created_after is not None:
+            conditions.append("created_at >= ?")
+            params.append(created_after)
         where = "WHERE " + " AND ".join(conditions) if conditions else ""
         with self._lock, self._connection() as connection:
             row = connection.execute(
@@ -831,19 +842,99 @@ class TaskStore:
         return [dict(row) for row in rows]
 
     def active_task_ids(
-        self, account_id: str, advertiser_id: str
+        self,
+        account_id: str,
+        advertiser_id: str,
+        *,
+        created_after: int | None = None,
     ) -> list[str]:
+        conditions = [
+            "account_id = ?",
+            "advertiser_id = ?",
+            "status IN ('queued', 'running')",
+        ]
+        params: list[Any] = [account_id, advertiser_id]
+        if created_after is not None:
+            conditions.append("created_at >= ?")
+            params.append(created_after)
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                "SELECT id FROM tasks WHERE "
+                + " AND ".join(conditions)
+                + " ORDER BY created_at, id",
+                params,
+            ).fetchall()
+        return [str(row["id"]) for row in rows]
+
+    def reconcilable_tasks(
+        self,
+        *,
+        created_after: int,
+        updated_before: int,
+        limit: int,
+    ) -> list[TaskRecord]:
         with self._lock, self._connection() as connection:
             rows = connection.execute(
                 """
-                SELECT id FROM tasks
-                WHERE account_id = ? AND advertiser_id = ?
-                  AND status IN ('queued', 'running')
+                SELECT * FROM tasks
+                WHERE status IN ('queued', 'running')
+                  AND submission_status = 'submitted'
+                  AND upstream_task_id IS NOT NULL
+                  AND created_at >= ? AND updated_at <= ?
+                ORDER BY updated_at, created_at, id
+                LIMIT ?
+                """,
+                (created_after, updated_before, limit),
+            ).fetchall()
+        return [self._decode(row) for row in rows]
+
+    def expire_active_tasks(
+        self,
+        *,
+        created_before: int,
+        error_code: str,
+        error_message: str,
+    ) -> list[ExpiredTask]:
+        now = int(time.time())
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, account_id, submission_payload FROM tasks
+                WHERE status IN ('queued', 'running') AND created_at < ?
                 ORDER BY created_at, id
                 """,
-                (account_id, advertiser_id),
+                (created_before,),
             ).fetchall()
-        return [str(row["id"]) for row in rows]
+            if rows:
+                connection.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'failed', progress = 100,
+                        submission_status = CASE
+                            WHEN submission_status IS NULL
+                              OR submission_status IN ('queued', 'submitting')
+                            THEN 'failed'
+                            ELSE submission_status
+                        END,
+                        submission_payload = NULL,
+                        error_code = ?, error_message = ?,
+                        completed_at = ?, updated_at = ?
+                    WHERE status IN ('queued', 'running') AND created_at < ?
+                    """,
+                    (error_code, error_message, now, now, created_before),
+                )
+        return [
+            ExpiredTask(
+                id=str(row["id"]),
+                account_id=row["account_id"],
+                submission_payload=(
+                    json.loads(row["submission_payload"])
+                    if row["submission_payload"]
+                    else None
+                ),
+            )
+            for row in rows
+        ]
 
     def fail_active_tasks_for_account(
         self,

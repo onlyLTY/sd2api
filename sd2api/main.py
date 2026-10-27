@@ -23,6 +23,7 @@ from .browser_client import BrowserTikTokClient
 from .browser_pool import BrowserPoolClient
 from .config import CONFIG_PATH, RuntimeConfig, save_runtime_config, settings
 from .feishu import FeishuError, FeishuNotifier
+from .maintenance import TaskMaintenance
 from .models import (
     AccountCreateRequest,
     AccountLoginRequest,
@@ -63,6 +64,7 @@ else:
     client = TikTokClient(settings)
 feishu_notifier = FeishuNotifier(settings)
 submission_dispatcher: VideoSubmissionDispatcher | None = None
+task_maintenance: TaskMaintenance | None = None
 
 
 def public_runtime_config(config: RuntimeConfig) -> dict[str, Any]:
@@ -95,7 +97,7 @@ def audit_event(
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global submission_dispatcher
+    global submission_dispatcher, task_maintenance
     audit_event("info", "system", "sd2api 服务已启动")
     if isinstance(client, (BrowserTikTokClient, BrowserPoolClient)) and settings.sd2api_browser_autostart:
         try:
@@ -108,6 +110,16 @@ async def lifespan(_: FastAPI):
             feishu_notifier.run(client.list_accounts),
             name="sd2api-feishu-notifications",
         )
+    task_maintenance = TaskMaintenance(
+        store=store,
+        uploads=uploads,
+        refresh=refresh,
+        audit=audit_event,
+        expiry_seconds=settings.sd2api_task_expiry_seconds,
+        reconcile_interval=settings.sd2api_task_reconcile_interval,
+        reconcile_concurrency=settings.sd2api_task_reconcile_concurrency,
+    )
+    await task_maintenance.start()
     submission_dispatcher = VideoSubmissionDispatcher(
         store=store,
         uploads=uploads,
@@ -119,6 +131,8 @@ async def lifespan(_: FastAPI):
     try:
         yield
     finally:
+        await task_maintenance.stop()
+        task_maintenance = None
         await submission_dispatcher.stop()
         submission_dispatcher = None
         if notification_task:
@@ -898,7 +912,11 @@ async def admin_config_status() -> dict[str, Any]:
         "novnc_public_port": settings.sd2api_novnc_public_port,
         "protocol_transport": "curl_cffi/chrome",
         "protocol_upload_concurrency": settings.sd2api_protocol_upload_concurrency,
+        "protocol_session_idle_seconds": settings.sd2api_protocol_session_idle_seconds,
         "submission_concurrency": settings.sd2api_submission_concurrency,
+        "task_expiry_seconds": settings.sd2api_task_expiry_seconds,
+        "task_reconcile_interval": settings.sd2api_task_reconcile_interval,
+        "task_reconcile_concurrency": settings.sd2api_task_reconcile_concurrency,
         "submission_staging_max_bytes": (
             settings.sd2api_submission_staging_max_bytes
         ),
@@ -1007,8 +1025,12 @@ async def update_admin_runtime_config(body: RuntimeConfig) -> dict[str, Any]:
         "subaccount_refresh_interval",
         "subaccount_refresh_concurrency",
         "submission_concurrency",
+        "task_expiry_seconds",
+        "task_reconcile_interval",
+        "task_reconcile_concurrency",
         "submission_staging_max_bytes",
         "protocol_upload_concurrency",
+        "protocol_session_idle_seconds",
         "upload_dir",
     }
     restart_required = bool(restart_fields.intersection(changed))
@@ -1743,7 +1765,10 @@ async def create_openai_video(request: Request) -> dict[str, Any]:
                     detail="Reference limits are 9 images, 3 videos, and 3 audio clips",
                 )
         if (
-            store.count_tasks(status=("queued", "running"))
+            store.count_tasks(
+                status=("queued", "running"),
+                created_after=int(time.time()) - settings.sd2api_task_expiry_seconds,
+            )
             >= settings.sd2api_pool_max_pending
         ):
             raise TikTokUpstreamError(

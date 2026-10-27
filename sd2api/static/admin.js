@@ -97,7 +97,11 @@ const settingsSchema = [
     ["pool_generation_limit_cooldown", "5 分钟限流冷却（秒）", "number", { min: 1, max: 3600 }],
     ["pool_start_concurrency", "Chromium 最大并发", "number", { min: 1, max: 50 }],
     ["submission_concurrency", "任务提交并发", "number", { min: 1, max: 32 }],
+    ["task_expiry_seconds", "任务最长非终态时间（秒）", "number", { min: 3600, max: 2592000 }],
+    ["task_reconcile_interval", "任务状态刷新间隔（秒）", "number", { min: 10, max: 3600 }],
+    ["task_reconcile_concurrency", "任务状态刷新并发", "number", { min: 1, max: 32 }],
     ["submission_staging_max_bytes", "异步暂存上限（字节）", "number", { min: 536870912, max: 536870912000 }],
+    ["protocol_session_idle_seconds", "协议连接空闲回收（秒）", "number", { min: 60, max: 86400 }],
   ]},
   { title: "飞书通知", description: "账号需要验证码、手动接码、重新登录或浏览器恢复时通知个人或群聊。", fields: [
     ["feishu_enabled", "启用飞书通知", "boolean"],
