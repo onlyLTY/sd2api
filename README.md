@@ -373,6 +373,10 @@ flowchart LR
 | `mode` | `browser_pool` | 运行模式，推荐保持 `browser_pool`（纯协议调度 + 按需浏览器登录） |
 | `pool_max_pending` | `500` | 全池允许同时处于排队或生成中的最大任务数；单个子账号不设本地并发上限 |
 | `submission_concurrency` | `4` | 后台同时准备/提交的任务数；修改后需重启实例 |
+| `task_expiry_seconds` | `259200` | 非终态任务最长保留时间；默认 3 天，超时后自动失败并清理暂存素材 |
+| `task_reconcile_interval` | `60` | 后台主动刷新非终态任务状态的间隔秒数 |
+| `task_reconcile_concurrency` | `4` | 后台任务状态刷新并发数 |
+| `protocol_session_idle_seconds` | `300` | 子账号协议 Session 空闲回收时间，用于释放连接缓存 |
 | `submission_staging_max_bytes` | `8589934592` | 异步队列素材暂存目录上限（默认 8 GiB）；超过后拒绝新任务以保护磁盘 |
 | `pool_daily_quota_codes` | 空 | 补充识别为每日额度的上游错误码；命中后仅冷却对应模型至下一个 UTC 00:00 |
 | `pool_rate_limit_cooldown` | `90` | TikTok 返回 RPM/请求频率限制后，该子账号的短时冷却时间（秒） |

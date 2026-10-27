@@ -34,12 +34,16 @@ class RuntimeConfig(BaseModel):
     pool_generation_limit_cooldown: int = Field(default=300, ge=1, le=3600)
     pool_start_concurrency: int = Field(default=3, ge=1, le=50)
     submission_concurrency: int = Field(default=4, ge=1, le=32)
+    task_expiry_seconds: int = Field(default=3 * 24 * 60 * 60, ge=3600, le=2592000)
+    task_reconcile_interval: int = Field(default=60, ge=10, le=3600)
+    task_reconcile_concurrency: int = Field(default=4, ge=1, le=32)
     submission_staging_max_bytes: int = Field(
         default=8 * 1024 * 1024 * 1024,
         ge=512 * 1024 * 1024,
         le=500 * 1024 * 1024 * 1024,
     )
     protocol_upload_concurrency: int = Field(default=3, ge=1, le=16)
+    protocol_session_idle_seconds: int = Field(default=300, ge=60, le=86400)
     protocol_direct_upload_bytes: int = Field(
         default=5 * 1024 * 1024, ge=256 * 1024, le=64 * 1024 * 1024
     )
@@ -101,8 +105,12 @@ LEGACY_ENV_FIELDS = {
     "SD2API_POOL_GENERATION_LIMIT_COOLDOWN": "pool_generation_limit_cooldown",
     "SD2API_POOL_START_CONCURRENCY": "pool_start_concurrency",
     "SD2API_SUBMISSION_CONCURRENCY": "submission_concurrency",
+    "SD2API_TASK_EXPIRY_SECONDS": "task_expiry_seconds",
+    "SD2API_TASK_RECONCILE_INTERVAL": "task_reconcile_interval",
+    "SD2API_TASK_RECONCILE_CONCURRENCY": "task_reconcile_concurrency",
     "SD2API_SUBMISSION_STAGING_MAX_BYTES": "submission_staging_max_bytes",
     "SD2API_PROTOCOL_UPLOAD_CONCURRENCY": "protocol_upload_concurrency",
+    "SD2API_PROTOCOL_SESSION_IDLE_SECONDS": "protocol_session_idle_seconds",
     "SD2API_PROTOCOL_DIRECT_UPLOAD_BYTES": "protocol_direct_upload_bytes",
     "SD2API_PROTOCOL_SLICE_BYTES": "protocol_slice_bytes",
     "SD2API_AUTO_LOGIN": "auto_login",

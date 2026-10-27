@@ -30,6 +30,7 @@ from sd2api.browser_pool import (
     BrowserPoolClient,
 )
 from sd2api.models import OpenAICreateVideoRequest, SeedanceCreateRequest, UpstreamTask
+from sd2api.maintenance import TaskMaintenance
 from sd2api.protocol import ProtocolSession, ProtocolTikTokClient, _sign_gateway_request
 from sd2api.security import CredentialError, CredentialVault
 from sd2api.store import TaskStore
@@ -5016,7 +5017,7 @@ def test_admin_account_routes_without_starting_browser(
     assert "部分模型冷却" in script.text
     assert "模型限额：" in script.text
     assert "admin.css?v=15" in dashboard.text
-    assert "admin.js?v=21" in dashboard.text
+    assert "admin.js?v=22" in dashboard.text
     assert 'id="collapseAllAccounts"' in dashboard.text
     assert "data-account-collapse" in script.text
     assert "sd2api_collapsed_subaccounts" in script.text
@@ -5644,3 +5645,183 @@ def test_video_api_records_upstream_model_permission_error_as_failed_task(
         "code": "10001100",
         "message": "没有模型使用权限",
     }
+
+
+@pytest.mark.asyncio
+async def test_task_maintenance_expires_three_day_tasks_and_cleans_media(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 2_000_000_000
+    expiry = 3 * 24 * 60 * 60
+    database = tmp_path / "maintenance.db"
+    upload_dir = tmp_path / "uploads"
+    upload_dir.mkdir()
+    stale_media = upload_dir / "stale.png"
+    stale_media.write_bytes(png_bytes())
+    store = TaskStore(str(database))
+    monkeypatch.setattr("sd2api.store.time.time", lambda: now - expiry - 1)
+    stale = store.create_submission(
+        task_id="video_stale",
+        model="seedance-2.0",
+        prompt="stale",
+        seconds=5,
+        size="720x1280",
+        api_key_mask=None,
+        idempotency_key_hash=None,
+        payload={
+            "mode": "image",
+            "media": [
+                {"kind": "image", "source": "path", "value": str(stale_media)}
+            ],
+        },
+    )
+    store.complete_submission(
+        stale.id,
+        upstream_task_id="upstream-stale",
+        account_id="account-a",
+        advertiser_id="sub-a",
+    )
+    monkeypatch.setattr("sd2api.store.time.time", lambda: now - expiry)
+    recent = store.create_submission(
+        task_id="video_boundary",
+        model="seedance-2.0",
+        prompt="boundary",
+        seconds=5,
+        size="720x1280",
+        api_key_mask=None,
+        idempotency_key_hash=None,
+        payload={"mode": "text", "media": []},
+    )
+    audits: list[dict[str, Any]] = []
+
+    async def refresh(record: Any) -> Any:
+        return record
+
+    maintenance = TaskMaintenance(
+        store=store,
+        uploads=UploadManager(Settings(sd2api_upload_dir=str(upload_dir))),
+        refresh=refresh,
+        audit=lambda *args, **kwargs: audits.append({"args": args, **kwargs}),
+        expiry_seconds=expiry,
+        reconcile_interval=60,
+        reconcile_concurrency=2,
+    )
+    expired = maintenance.expire_tasks(now=now)
+
+    assert [record.id for record in expired] == [stale.id]
+    stale_result = store.get(stale.id)
+    assert stale_result is not None
+    assert stale_result.status == "failed"
+    assert stale_result.error_code == "task_expired"
+    assert stale_result.submission_payload is None
+    assert not stale_media.exists()
+    assert store.get(recent.id).status == "queued"  # type: ignore[union-attr]
+    assert audits[-1]["details"] == {
+        "expired_tasks": 1,
+        "expiry_seconds": expiry,
+    }
+
+
+@pytest.mark.asyncio
+async def test_task_maintenance_reconciles_recent_submitted_tasks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 2_000_000_000
+    store = TaskStore(str(tmp_path / "reconcile.db"))
+    monkeypatch.setattr("sd2api.store.time.time", lambda: now - 120)
+    record = store.create_submission(
+        task_id="video_pending",
+        model="seedance-2.0",
+        prompt="pending",
+        seconds=5,
+        size="720x1280",
+        api_key_mask=None,
+        idempotency_key_hash=None,
+        payload={"mode": "text", "media": []},
+    )
+    store.complete_submission(
+        record.id,
+        upstream_task_id="upstream-pending",
+        account_id="account-a",
+        advertiser_id="sub-a",
+    )
+    refreshed: list[str] = []
+
+    async def refresh(pending: Any) -> Any:
+        refreshed.append(pending.id)
+        return pending
+
+    maintenance = TaskMaintenance(
+        store=store,
+        uploads=UploadManager(Settings(sd2api_upload_dir=str(tmp_path / "uploads"))),
+        refresh=refresh,
+        audit=lambda *args, **kwargs: None,
+        expiry_seconds=3 * 24 * 60 * 60,
+        reconcile_interval=60,
+        reconcile_concurrency=2,
+    )
+
+    assert await maintenance.run_once(now=now) == 1
+    assert refreshed == [record.id]
+
+
+def test_expired_tasks_are_excluded_from_active_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 2_000_000_000
+    expiry = 3 * 24 * 60 * 60
+    store = TaskStore(str(tmp_path / "active-load.db"))
+    monkeypatch.setattr("sd2api.store.time.time", lambda: now - expiry - 1)
+    store.create(
+        task_id="stale",
+        api="openai",
+        model="seedance-2.0",
+        prompt="stale",
+        seconds=5,
+        account_id="account-a",
+        advertiser_id="sub-a",
+    )
+    monkeypatch.setattr("sd2api.store.time.time", lambda: now - expiry)
+    store.create(
+        task_id="boundary",
+        api="openai",
+        model="seedance-2.0",
+        prompt="boundary",
+        seconds=5,
+        account_id="account-a",
+        advertiser_id="sub-a",
+    )
+
+    assert store.active_task_ids(
+        "account-a", "sub-a", created_after=now - expiry
+    ) == ["boundary"]
+    assert store.count_tasks(
+        status=("queued", "running"), created_after=now - expiry
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_protocol_client_recycles_only_when_idle() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        entered.set()
+        await release.wait()
+        return httpx.Response(200, json={"BaseResp": {"StatusCode": 0}})
+
+    client = ProtocolTikTokClient(
+        Settings(),
+        ProtocolSession(cookies=(), device_id="device", user_agent="test"),
+        account_id="account-a",
+        transport=httpx.MockTransport(handler),
+    )
+    request = asyncio.create_task(client._request("GET", "/test"))
+    await entered.wait()
+    assert await client.recycle_if_idle(300, now=time.monotonic() + 301) is False
+    release.set()
+    await request
+    underlying = await client._get_client()
+    assert await client.recycle_if_idle(300, now=time.monotonic() + 301) is True
+    assert isinstance(underlying, httpx.AsyncClient)
+    assert underlying.is_closed

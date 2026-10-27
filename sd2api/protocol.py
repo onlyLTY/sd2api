@@ -10,6 +10,8 @@ import mimetypes
 import time
 import uuid
 import zlib
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -318,6 +320,8 @@ class ProtocolTikTokClient:
         self.transport = transport
         self._client: httpx.AsyncClient | CurlAsyncSession | None = None
         self._client_lock = asyncio.Lock()
+        self._request_inflight = 0
+        self._last_request_at = time.monotonic()
         self._active_tasks: set[str] = set()
         self._inflight = 0
         self._upload_semaphore = asyncio.Semaphore(
@@ -366,57 +370,92 @@ class ProtocolTikTokClient:
             result["sec-ch-ua-platform"] = self.session.sec_ch_ua_platform
         return result
 
+    def _new_client(self) -> httpx.AsyncClient | CurlAsyncSession:
+        if self.transport is not None:
+            # MockTransport keeps protocol tests deterministic. Real traffic
+            # uses curl_cffi so TikTok sees Chromium's HTTP/2/TLS fingerprint.
+            return httpx.AsyncClient(
+                base_url=self.settings.tiktok_base_url,
+                headers=self.headers,
+                cookies=self.session.cookie_jar(self.advertiser_id),
+                timeout=self.settings.sd2api_request_timeout,
+                follow_redirects=True,
+                transport=self.transport,
+            )
+        cookies = CurlCookies()
+        for item in self.session.cookies:
+            name = str(item.get("name") or "")
+            if not name or (
+                self.advertiser_id and name == ACCOUNT_CONTEXT_COOKIE
+            ):
+                continue
+            cookies.set(
+                name,
+                str(item.get("value") or ""),
+                domain=str(item.get("domain") or ".tiktok.com"),
+                path=str(item.get("path") or "/"),
+                secure=bool(item.get("secure")),
+            )
+        if self.advertiser_id:
+            cookies.set(
+                ACCOUNT_CONTEXT_COOKIE,
+                self.advertiser_id,
+                domain=".tiktok.com",
+                path="/",
+                secure=True,
+            )
+        return CurlAsyncSession(
+            base_url=self.settings.tiktok_base_url,
+            headers=self.headers,
+            cookies=cookies,
+            timeout=self.settings.sd2api_request_timeout,
+            allow_redirects=True,
+            impersonate="chrome",
+            default_headers=False,
+            max_clients=max(
+                4, self.settings.sd2api_protocol_upload_concurrency + 2
+            ),
+        )
+
     async def _get_client(self) -> httpx.AsyncClient | CurlAsyncSession:
         async with self._client_lock:
             if self._client is None:
-                if self.transport is not None:
-                    # MockTransport keeps protocol tests deterministic. Real
-                    # traffic uses curl_cffi below so TikTok sees Chromium's
-                    # HTTP/2 and TLS fingerprint instead of Python/OpenSSL.
-                    self._client = httpx.AsyncClient(
-                        base_url=self.settings.tiktok_base_url,
-                        headers=self.headers,
-                        cookies=self.session.cookie_jar(self.advertiser_id),
-                        timeout=self.settings.sd2api_request_timeout,
-                        follow_redirects=True,
-                        transport=self.transport,
-                    )
-                else:
-                    cookies = CurlCookies()
-                    for item in self.session.cookies:
-                        name = str(item.get("name") or "")
-                        if not name or (
-                            self.advertiser_id and name == ACCOUNT_CONTEXT_COOKIE
-                        ):
-                            continue
-                        cookies.set(
-                            name,
-                            str(item.get("value") or ""),
-                            domain=str(item.get("domain") or ".tiktok.com"),
-                            path=str(item.get("path") or "/"),
-                            secure=bool(item.get("secure")),
-                        )
-                    if self.advertiser_id:
-                        cookies.set(
-                            ACCOUNT_CONTEXT_COOKIE,
-                            self.advertiser_id,
-                            domain=".tiktok.com",
-                            path="/",
-                            secure=True,
-                        )
-                    self._client = CurlAsyncSession(
-                        base_url=self.settings.tiktok_base_url,
-                        headers=self.headers,
-                        cookies=cookies,
-                        timeout=self.settings.sd2api_request_timeout,
-                        allow_redirects=True,
-                        impersonate="chrome",
-                        default_headers=False,
-                        max_clients=max(
-                            4, self.settings.sd2api_protocol_upload_concurrency + 2
-                        ),
-                    )
+                self._client = self._new_client()
             return self._client
+
+    @asynccontextmanager
+    async def _request_client(
+        self,
+    ) -> AsyncIterator[httpx.AsyncClient | CurlAsyncSession]:
+        async with self._client_lock:
+            if self._client is None:
+                self._client = self._new_client()
+            client = self._client
+            self._request_inflight += 1
+        try:
+            yield client
+        finally:
+            async with self._client_lock:
+                self._request_inflight -= 1
+                self._last_request_at = time.monotonic()
+
+    async def recycle_if_idle(
+        self, idle_seconds: int, *, now: float | None = None
+    ) -> bool:
+        timestamp = time.monotonic() if now is None else now
+        async with self._client_lock:
+            if (
+                self._client is None
+                or self._request_inflight
+                or timestamp - self._last_request_at < idle_seconds
+            ):
+                return False
+            client, self._client = self._client, None
+        close = getattr(client, "aclose", None) or getattr(client, "close")
+        result = close()
+        if inspect.isawaitable(result):
+            await result
+        return True
 
     async def close(self) -> None:
         async with self._client_lock:
@@ -436,19 +475,19 @@ class ProtocolTikTokClient:
         data: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        client = await self._get_client()
         request_context = {"request_method": method, "request_path": path}
         try:
             request_params: dict[str, Any] = dict(self.params)
             if params:
                 request_params.update(params)
-            response = await client.request(
-                method,
-                path,
-                json=json_body,
-                data=data,
-                params=request_params,
-            )
+            async with self._request_client() as client:
+                response = await client.request(
+                    method,
+                    path,
+                    json=json_body,
+                    data=data,
+                    params=request_params,
+                )
         except (httpx.HTTPError, CurlRequestException) as exc:
             raise TikTokUpstreamError(
                 "TikTok request temporarily failed",
@@ -992,8 +1031,8 @@ class ProtocolTikTokClient:
         return str(candidate) if isinstance(candidate, str) and candidate.startswith("http") else None
 
     async def fetch_video(self, video_url: str) -> tuple[bytes, str]:
-        client = await self._get_client()
-        response = await client.get(video_url, timeout=180)
+        async with self._request_client() as client:
+            response = await client.get(video_url, timeout=180)
         if response.status_code >= 400:
             raise TikTokUpstreamError(
                 f"TikTok CDN returned HTTP {response.status_code}",
@@ -1121,8 +1160,10 @@ class ProtocolTikTokClient:
             body=content,
             content_type="application/json" if body is not None and service == "imagex" else None,
         )
-        client = await self._get_client()
-        response = await client.request(method, path, headers=headers, content=content or None)
+        async with self._request_client() as client:
+            response = await client.request(
+                method, path, headers=headers, content=content or None
+            )
         if response.status_code >= 400:
             raise TikTokUpstreamError(
                 f"TikTok upload gateway returned HTTP {response.status_code}",
@@ -1190,9 +1231,10 @@ class ProtocolTikTokClient:
     ) -> dict[str, Any]:
         base = f"https://{address['host']}/upload/v1/{address['oid']}"
         headers = self._storage_headers(address)
-        init = await (await self._get_client()).post(
-            base + "?uploadmode=part&phase=init", headers=headers
-        )
+        async with self._request_client() as client:
+            init = await client.post(
+                base + "?uploadmode=part&phase=init", headers=headers
+            )
         init_payload = self._storage_json(init, "initialize")
         upload_id = str(_deep_find(init_payload, {"uploadid", "uploadId"}) or "")
         if not upload_id:
@@ -1214,9 +1256,10 @@ class ProtocolTikTokClient:
             f"{base}?uploadmode=part&phase=finish&uploadid={_quote(upload_id)}"
             f"&size={path.stat().st_size}"
         )
-        finish = await (await self._get_client()).post(
-            finish_url, headers=headers, content=body.encode()
-        )
+        async with self._request_client() as client:
+            finish = await client.post(
+                finish_url, headers=headers, content=body.encode()
+            )
         return self._storage_json(finish, "finish")
 
     async def _upload_binary(
@@ -1234,9 +1277,10 @@ class ProtocolTikTokClient:
                 "Content-Type": "application/octet-stream",
             }
         )
-        response = await (await self._get_client()).post(
-            url, headers=headers, content=content, timeout=1800
-        )
+        async with self._request_client() as client:
+            response = await client.post(
+                url, headers=headers, content=content, timeout=1800
+            )
         return self._storage_json(response, "transfer")
 
     @staticmethod

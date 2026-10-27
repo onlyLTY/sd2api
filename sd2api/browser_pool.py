@@ -59,6 +59,7 @@ class BrowserPoolClient:
         self._monitor_task: asyncio.Task[None] | None = None
         self._keepalive_task: asyncio.Task[None] | None = None
         self._subaccount_refresh_task: asyncio.Task[None] | None = None
+        self._protocol_cleanup_task: asyncio.Task[None] | None = None
         self._keepalive_accounts: set[str] = set()
         self._keepalive_condition = asyncio.Condition()
         self._keepalive_revision = 0
@@ -296,6 +297,26 @@ class BrowserPoolClient:
             self._subaccount_refresh_task = asyncio.create_task(
                 self._subaccount_refresh_loop(), name="sd2api-subaccount-refresh"
             )
+        if self._protocol_cleanup_task is None:
+            self._protocol_cleanup_task = asyncio.create_task(
+                self._protocol_session_cleanup_loop(),
+                name="sd2api-protocol-session-cleanup",
+            )
+
+    async def _protocol_session_cleanup_loop(self) -> None:
+        interval = min(60, self.settings.sd2api_protocol_session_idle_seconds)
+        while True:
+            await asyncio.sleep(interval)
+            clients = list(self._protocol_clients.values())
+            await asyncio.gather(
+                *(
+                    client.recycle_if_idle(
+                        self.settings.sd2api_protocol_session_idle_seconds
+                    )
+                    for client in clients
+                ),
+                return_exceptions=True,
+            )
 
     async def stop(self) -> None:
         startup_tasks = list(self._startup_tasks.values())
@@ -303,6 +324,12 @@ class BrowserPoolClient:
             task.cancel()
         await asyncio.gather(*startup_tasks, return_exceptions=True)
         self._startup_tasks.clear()
+        if self._protocol_cleanup_task:
+            self._protocol_cleanup_task.cancel()
+            await asyncio.gather(
+                self._protocol_cleanup_task, return_exceptions=True
+            )
+            self._protocol_cleanup_task = None
         if self._subaccount_refresh_task:
             self._subaccount_refresh_task.cancel()
             await asyncio.gather(
@@ -509,7 +536,15 @@ class BrowserPoolClient:
         ) <= int(time.time())
 
     def _subaccount_load(self, account_id: str, advertiser_id: str) -> int:
-        stored = len(self.store.active_task_ids(account_id, advertiser_id))
+        stored = len(
+            self.store.active_task_ids(
+                account_id,
+                advertiser_id,
+                created_after=(
+                    int(time.time()) - self.settings.sd2api_task_expiry_seconds
+                ),
+            )
+        )
         client = self._protocol_clients.get((account_id, advertiser_id))
         return max(stored, client.load if client is not None else 0)
 
@@ -1783,7 +1818,12 @@ class BrowserPoolClient:
                 if status.get("session_available"):
                     stored = len(
                         self.store.active_task_ids(
-                            status["id"], subaccount["advertiser_id"]
+                            status["id"],
+                            subaccount["advertiser_id"],
+                            created_after=(
+                                int(time.time())
+                                - self.settings.sd2api_task_expiry_seconds
+                            ),
                         )
                     )
                     return max(
