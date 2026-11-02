@@ -6,7 +6,12 @@ from typing import Any
 
 from .browser_pool import BrowserPoolClient
 from .store import TaskRecord, TaskStore
-from .tiktok import TikTokUpstreamError
+from .tiktok import (
+    TikTokUpstreamError,
+    UPSTREAM_UNAVAILABLE_CODE,
+    UPSTREAM_UNAVAILABLE_MESSAGE,
+    is_tiktok_resource_unavailable,
+)
 from .uploads import StagedMedia, UploadManager
 
 
@@ -158,16 +163,26 @@ class VideoSubmissionDispatcher:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            code = (
+            raw_code = (
                 str(exc.code)
                 if isinstance(exc, TikTokUpstreamError) and exc.code
                 else "submission_failed"
+            )
+            raw_message = str(exc)
+            resource_unavailable = isinstance(
+                exc, TikTokUpstreamError
+            ) and is_tiktok_resource_unavailable(raw_code, raw_message)
+            code = (
+                UPSTREAM_UNAVAILABLE_CODE if resource_unavailable else raw_code
+            )
+            message = (
+                UPSTREAM_UNAVAILABLE_MESSAGE if resource_unavailable else raw_message
             )
             try:
                 failed = self.store.fail_submission(
                     record.id,
                     error_code=code,
-                    error_message=str(exc),
+                    error_message=message,
                 )
             except KeyError:
                 return
@@ -184,8 +199,13 @@ class VideoSubmissionDispatcher:
                 account_id=context.get("account_id") or failed.account_id,
                 task_id=failed.id,
                 details={
-                    "error_code": code,
-                    "error_message": str(exc),
+                    "error_code": raw_code,
+                    "error_message": raw_message,
+                    **(
+                        {"public_error_code": code}
+                        if code != raw_code
+                        else {}
+                    ),
                     **context,
                 },
             )

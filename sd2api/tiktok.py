@@ -82,6 +82,33 @@ class TikTokUpstreamError(RuntimeError):
         return self
 
 
+UPSTREAM_UNAVAILABLE_CODE = "upstream_unavailable"
+UPSTREAM_UNAVAILABLE_MESSAGE = (
+    "Video generation service is temporarily unavailable. Please retry later."
+)
+
+
+def is_tiktok_resource_unavailable(
+    error_code: str | None, error_message: str | None = None
+) -> bool:
+    """Recognize provider gateway failures wrapped as terminal task errors."""
+    code = str(error_code or "").strip().lower()
+    message = str(error_message or "").strip().lower()
+    if code != "10040209":
+        return False
+    return any(
+        marker in message
+        for marker in (
+            "resourceunavailable",
+            "resource unavailable",
+            "504 gateway",
+            "gateway time-out",
+            "gateway timeout",
+            "<center>tlb</center>",
+        )
+    )
+
+
 def is_tiktok_authentication_error(exc: BaseException) -> bool:
     """Recognize HTTP auth failures and TikTok's HTTP-200 login errors."""
     code = str(getattr(exc, "code", "") or "").strip().lower()
@@ -108,6 +135,8 @@ def is_tiktok_transient_error(exc: BaseException) -> bool:
     code = str(getattr(exc, "code", "") or "").strip().lower()
     message = str(exc).strip().lower()
     if is_tiktok_rpm_rate_limit(code, message):
+        return True
+    if is_tiktok_resource_unavailable(code, message):
         return True
     if code in {"tiktok_transport_error", "protocol_session_unavailable"}:
         return True

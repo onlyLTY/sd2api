@@ -18,6 +18,7 @@ from .temp_mail import TempMailClient
 from .tiktok import (
     TikTokUpstreamError,
     is_tiktok_authentication_error,
+    is_tiktok_resource_unavailable,
     is_tiktok_rpm_rate_limit,
     is_tiktok_transient_error,
     tiktok_authentication_error,
@@ -615,6 +616,8 @@ class BrowserPoolClient:
 
     @staticmethod
     def _is_retryable_submission_error(exc: TikTokUpstreamError) -> bool:
+        if is_tiktok_resource_unavailable(exc.code, str(exc)):
+            return True
         if exc.code == "10001200":
             return "face check timed out" in str(exc).lower()
         if exc.code != "50000":
@@ -1930,9 +1933,14 @@ class BrowserPoolClient:
                                 **exc.context,
                             },
                         )
+                        submission_retry_limit = (
+                            3
+                            if is_tiktok_resource_unavailable(exc.code, str(exc))
+                            else 2
+                        )
                         if (
                             self._is_retryable_submission_error(exc)
-                            and submission_retries < 2
+                            and submission_retries < submission_retry_limit
                         ):
                             submission_retries += 1
                             candidates.append((selected_account, selected_subaccount))
@@ -1946,7 +1954,7 @@ class BrowserPoolClient:
                                 details={
                                     "advertiser_id": advertiser_id,
                                     "retry": submission_retries,
-                                    "max_retries": 2,
+                                    "max_retries": submission_retry_limit,
                                     "upstream_code": exc.code,
                                     "upstream_message": str(exc),
                                 },
