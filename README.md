@@ -155,6 +155,8 @@ print(f"Current Status: {status.status}")
 
 若 Seedance 已接受任务、但随后在生成结果中返回明确的账号 RPM 限制（例如 `EndpointAccountRpmRateLimitExceeded`），sd2api 会短时冷却该子账号，并使用同一个本地 `video_*` ID 自动换号重提，最多两次。该规则按 RPM provider 文案识别，不会仅凭 `10043100/10043101` 将每日额度错误误判为短时限流。
 
+若 Seedance 将提供方网关超时包装为 `10040209 / ResourceUnavailable`（例如响应包含 `504 Gateway Time-out`），sd2api 会保留同一个本地 `video_*` ID 并自动重新排队提交，最多三次。重试期间任务保持非终态；重试耗尽后，查询接口返回 `failed`，错误统一为 `upstream_unavailable / Video generation service is temporarily unavailable. Please retry later.`。TikTok 私有错误码、网关 HTML 和上游任务 ID 仅写入内部审计日志，不对调用方暴露。尚未受理的同步请求如果最终遇到同类错误，则返回 HTTP `502` 和相同的标准错误体。
+
 #### cURL 调用示例
 
 ##### 文生视频 (T2V)

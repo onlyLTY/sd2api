@@ -43,6 +43,9 @@ from .tiktok import (
     REFERENCE_ONLY_MODELS,
     TikTokClient,
     TikTokUpstreamError,
+    UPSTREAM_UNAVAILABLE_CODE,
+    UPSTREAM_UNAVAILABLE_MESSAGE,
+    is_tiktok_resource_unavailable,
     is_tiktok_rpm_rate_limit,
     is_tiktok_transient_error,
 )
@@ -52,6 +55,7 @@ from . import __version__
 
 logger = logging.getLogger("sd2api")
 TERMINAL_RPM_MAX_RETRIES = 2
+TERMINAL_RESOURCE_UNAVAILABLE_MAX_RETRIES = 3
 store = TaskStore(settings.sd2api_database)
 uploads = UploadManager(settings)
 admin_static_dir = Path(__file__).with_name("static")
@@ -422,14 +426,21 @@ async def handle_upstream_error(request: Request, exc: TikTokUpstreamError) -> J
         "TikTok 上游请求失败",
         details={"code": exc.code, "message": str(exc), "path": request.url.path},
     )
+    public_code = exc.code
+    public_message = str(exc)
+    public_status = exc.status_code
+    if is_tiktok_resource_unavailable(exc.code, str(exc)):
+        public_code = UPSTREAM_UNAVAILABLE_CODE
+        public_message = UPSTREAM_UNAVAILABLE_MESSAGE
+        public_status = 502
     return JSONResponse(
-        status_code=exc.status_code,
+        status_code=public_status,
         content={
             "error": {
-                "message": str(exc),
+                "message": public_message,
                 "type": "upstream_error",
                 "param": None,
-                "code": exc.code,
+                "code": public_code,
             }
         },
     )
@@ -474,6 +485,12 @@ def cleanup_submission_payload(payload: dict[str, Any] | None) -> None:
 async def refresh(record: TaskRecord, *, force: bool = False) -> TaskRecord:
     if record.submission_status == "failed":
         return record
+    if (
+        not force
+        and record.status == "failed"
+        and record.error_code == UPSTREAM_UNAVAILABLE_CODE
+    ):
+        return record
     if not force and record.status in {"succeeded", "failed"} and record.video_url:
         return record
     if record.submission_status in {"queued", "submitting"}:
@@ -492,6 +509,63 @@ async def refresh(record: TaskRecord, *, force: bool = False) -> TaskRecord:
             details={"error_code": exc.code},
         )
         return record
+    if (
+        upstream.status == "failed"
+        and is_tiktok_resource_unavailable(
+            upstream.error_code, upstream.error_message
+        )
+    ):
+        payload = dict(record.submission_payload or {})
+        retry_count = int(payload.get("terminal_resource_unavailable_retries") or 0)
+        audit_event(
+            "warning",
+            "video",
+            "Seedance 生成节点暂时不可用",
+            account_id=record.account_id,
+            task_id=record.id,
+            details={
+                "advertiser_id": record.advertiser_id,
+                "upstream_task_id": record.upstream_task_id,
+                "retry": retry_count,
+                "max_retries": TERMINAL_RESOURCE_UNAVAILABLE_MAX_RETRIES,
+                "upstream_code": upstream.error_code,
+                "upstream_message": upstream.error_message,
+            },
+        )
+        if (
+            record.submission_payload is not None
+            and record.upstream_task_id is not None
+            and retry_count < TERMINAL_RESOURCE_UNAVAILABLE_MAX_RETRIES
+        ):
+            payload["terminal_resource_unavailable_retries"] = retry_count + 1
+            retried = store.retry_submitted_task(
+                record.id,
+                expected_upstream_task_id=record.upstream_task_id,
+                payload=payload,
+            )
+            if retried is not None:
+                audit_event(
+                    "warning",
+                    "video",
+                    "Seedance 生成节点超时，已重新排队提交",
+                    account_id=record.account_id,
+                    task_id=record.id,
+                    details={
+                        "advertiser_id": record.advertiser_id,
+                        "retry": retry_count + 1,
+                        "max_retries": TERMINAL_RESOURCE_UNAVAILABLE_MAX_RETRIES,
+                        "upstream_code": upstream.error_code,
+                    },
+                )
+                if submission_dispatcher is not None:
+                    submission_dispatcher.wake()
+                return retried
+            current = store.get(record.id)
+            if current is not None:
+                return current
+        upstream.error_code = UPSTREAM_UNAVAILABLE_CODE
+        upstream.error_message = UPSTREAM_UNAVAILABLE_MESSAGE
+
     if (
         upstream.status == "failed"
         and record.submission_payload is not None

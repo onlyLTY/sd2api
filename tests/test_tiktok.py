@@ -15,6 +15,7 @@ import wave
 import httpx
 import pytest
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
+from fastapi import Request
 from fastapi.testclient import TestClient
 from PIL import Image
 
@@ -39,6 +40,9 @@ from sd2api.temp_mail import TempMailClient
 from sd2api.tiktok import (
     TikTokClient,
     TikTokUpstreamError,
+    UPSTREAM_UNAVAILABLE_CODE,
+    UPSTREAM_UNAVAILABLE_MESSAGE,
+    is_tiktok_resource_unavailable,
     is_tiktok_rpm_rate_limit,
 )
 from sd2api.uploads import StagedMedia, UploadManager
@@ -2740,6 +2744,150 @@ async def test_refresh_reroutes_terminal_rpm_twice_then_exposes_failure(
 
 
 @pytest.mark.asyncio
+async def test_refresh_retries_terminal_resource_unavailable_then_normalizes_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sd2api.main as main
+
+    task_store = TaskStore(str(tmp_path / "resource-unavailable.db"))
+    task_store.create_submission(
+        task_id="video-resource-unavailable",
+        model="seedance-2.0-fast",
+        prompt="retry provider timeout",
+        seconds=5,
+        size="720x1280",
+        api_key_mask=None,
+        idempotency_key_hash=None,
+        payload={"mode": "text", "media": []},
+    )
+
+    upstream_message = (
+        "ResourceUnavailable: provider_code= provider_message=<html>"
+        "<h1>504 Gateway Time-out</h1><center>TLB</center></html>"
+    )
+
+    class Client:
+        calls = 0
+
+        async def check_task(self, task_id: str) -> UpstreamTask:
+            self.calls += 1
+            return UpstreamTask(
+                id=task_id,
+                status="failed",
+                progress=100,
+                error_code="10040209",
+                error_message=upstream_message,
+                raw={"upstream_error": upstream_message},
+            )
+
+    class Dispatcher:
+        wakes = 0
+
+        def wake(self) -> None:
+            self.wakes += 1
+
+    events: list[dict[str, Any]] = []
+    dispatcher = Dispatcher()
+    client = Client()
+    monkeypatch.setattr(main, "client", client)
+    monkeypatch.setattr(main, "store", task_store)
+    monkeypatch.setattr(main, "submission_dispatcher", dispatcher)
+    monkeypatch.setattr(
+        main,
+        "audit_event",
+        lambda *args, **kwargs: events.append({"args": args, **kwargs}),
+    )
+
+    for attempt in range(1, 4):
+        task_store.claim_submission("video-resource-unavailable")
+        submitted = task_store.complete_submission(
+            "video-resource-unavailable",
+            upstream_task_id=f"upstream-{attempt}",
+            account_id=f"account-{attempt}",
+            advertiser_id=f"aio-{attempt}",
+        )
+        retried = await main.refresh(submitted)
+        assert retried.id == "video-resource-unavailable"
+        assert retried.status == "queued"
+        assert retried.upstream_task_id is None
+        assert retried.submission_payload[
+            "terminal_resource_unavailable_retries"
+        ] == attempt
+
+    task_store.claim_submission("video-resource-unavailable")
+    final_submission = task_store.complete_submission(
+        "video-resource-unavailable",
+        upstream_task_id="upstream-4",
+        account_id="account-4",
+        advertiser_id="aio-4",
+    )
+    failed = await main.refresh(final_submission)
+
+    assert failed.status == "failed"
+    assert failed.error_code == UPSTREAM_UNAVAILABLE_CODE
+    assert failed.error_message == UPSTREAM_UNAVAILABLE_MESSAGE
+    assert failed.raw == {"upstream_error": upstream_message}
+    assert failed.submission_payload is None
+    assert dispatcher.wakes == 3
+    assert client.calls == 4
+    assert await main.refresh(failed) == failed
+    assert client.calls == 4
+    assert any(
+        event.get("details", {}).get("upstream_code") == "10040209"
+        and upstream_message in event.get("details", {}).get("upstream_message", "")
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_upstream_exception_handler_hides_resource_unavailable_details(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sd2api.main as main
+
+    events: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        main,
+        "audit_event",
+        lambda *args, **kwargs: events.append({"args": args, **kwargs}),
+    )
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/videos",
+            "query_string": b"",
+            "headers": [],
+            "scheme": "http",
+            "server": ("testserver", 80),
+            "client": ("testclient", 50000),
+        }
+    )
+    upstream_message = (
+        "ResourceUnavailable: provider_message=<h1>504 Gateway Time-out</h1>"
+    )
+    response = await main.handle_upstream_error(
+        request,
+        TikTokUpstreamError(upstream_message, code="10040209"),
+    )
+
+    assert response.status_code == 502
+    assert json.loads(response.body) == {
+        "error": {
+            "message": UPSTREAM_UNAVAILABLE_MESSAGE,
+            "type": "upstream_error",
+            "param": None,
+            "code": UPSTREAM_UNAVAILABLE_CODE,
+        }
+    }
+    assert events[0]["details"] == {
+        "code": "10040209",
+        "message": upstream_message,
+        "path": "/v1/videos",
+    }
+
+
+@pytest.mark.asyncio
 async def test_refresh_does_not_reroute_daily_limit_with_overlapping_code(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4360,6 +4508,16 @@ def test_rpm_limit_detection_requires_rpm_provider_semantics() -> None:
     )
 
 
+def test_resource_unavailable_detection_requires_gateway_failure() -> None:
+    message = (
+        "ResourceUnavailable: provider_code= provider_message=<html>"
+        "<h1>504 Gateway Time-out</h1><center>TLB</center></html>"
+    )
+    assert is_tiktok_resource_unavailable("10040209", message)
+    assert not is_tiktok_resource_unavailable("10040209", "Invalid resource")
+    assert not is_tiktok_resource_unavailable("50000", message)
+
+
 def test_pool_normalizes_model_aliases_for_cooldowns() -> None:
     assert BrowserPoolClient._model_key("sora-2") == "seedance-2.0"
     assert BrowserPoolClient._model_key("Dreamina_Seedance_2-5") == "seedance-2.5"
@@ -4367,14 +4525,21 @@ def test_pool_normalizes_model_aliases_for_cooldowns() -> None:
 
 
 @pytest.mark.parametrize(
-    ("error_code", "error_message"),
+    ("error_code", "error_message", "failures"),
     [
         (
             "50000",
             "biz error: remote or network error[remote]: "
             "THRIFT_EGRESS request timeout connect_timeout=50ms",
+            2,
         ),
-        ("10001200", "Face check timed out"),
+        ("10001200", "Face check timed out", 2),
+        (
+            "10040209",
+            "ResourceUnavailable: provider_message="
+            "<h1>504 Gateway Time-out</h1><center>TLB</center>",
+            3,
+        ),
     ],
 )
 @pytest.mark.asyncio
@@ -4383,6 +4548,7 @@ async def test_pool_retries_transient_submission_timeout(
     monkeypatch: pytest.MonkeyPatch,
     error_code: str,
     error_message: str,
+    failures: int,
 ) -> None:
     store = TaskStore(str(tmp_path / "submission-retry.db"))
     store.create_account(account_id="a", name="a")
@@ -4421,7 +4587,7 @@ async def test_pool_retries_transient_submission_timeout(
 
         async def create_text_video(self, **kwargs: Any) -> str:
             self.attempts += 1
-            if self.attempts < 3:
+            if self.attempts <= failures:
                 raise TikTokUpstreamError(
                     error_message,
                     status_code=502,
@@ -4442,19 +4608,19 @@ async def test_pool_retries_transient_submission_timeout(
     assert await pool.create_text_video(
         prompt="retry timeout", model="seedance-2.0", duration=5
     ) == "retried-task"
-    assert client.attempts == 3
+    assert client.attempts == failures + 1
     retry_events = [
         event
         for event in store.list_events()
         if event.message == "Retrying task submission after transient upstream error"
     ]
-    assert len(retry_events) == 2
+    assert len(retry_events) == failures
     failure_events = [
         event
         for event in store.list_events()
         if event.message == "Subaccount task submission failed"
     ]
-    assert len(failure_events) == 2
+    assert len(failure_events) == failures
     assert failure_events[0].account_id == "a"
     assert failure_events[0].details == {
         "advertiser_id": "sub-a",
