@@ -157,6 +157,8 @@ print(f"Current Status: {status.status}")
 
 若 Seedance 将提供方网关超时包装为 `10040209 / ResourceUnavailable`（例如响应包含 `504 Gateway Time-out`），sd2api 会保留同一个本地 `video_*` ID 并自动重新排队提交，最多三次。重试期间任务保持非终态；重试耗尽后，查询接口返回 `failed`，错误统一为 `upstream_unavailable / Video generation service is temporarily unavailable. Please retry later.`。TikTok 私有错误码、网关 HTML 和上游任务 ID 仅写入内部审计日志，不对调用方暴露。尚未受理的同步请求如果最终遇到同类错误，则返回 HTTP `502` 和相同的标准错误体。
 
+账号正在登录、捕获协议 session 或执行 session 保活时不会承接 Chromium 浏览器兜底任务。关闭 Chromium 前会同时检查浏览器内部队列、正在运行的任务和数据库中尚未终结的 `browser_*` 任务；存在任务时延迟关闭，直至任务状态已持久化。若服务升级前的任务已经丢失浏览器内存状态，后台会保留原本的本地 `video_*` ID 和素材自动重新排队，最多恢复三次，不会创建新的本地任务 ID。
+
 #### cURL 调用示例
 
 ##### 文生视频 (T2V)

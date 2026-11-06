@@ -57,11 +57,13 @@ class BrowserPoolClient:
         self._browser_slot_accounts: set[str] = set()
         self._browser_slot_locks: dict[str, asyncio.Lock] = {}
         self._startup_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
+        self._deferred_worker_closures: dict[str, asyncio.Task[None]] = {}
         self._monitor_task: asyncio.Task[None] | None = None
         self._keepalive_task: asyncio.Task[None] | None = None
         self._subaccount_refresh_task: asyncio.Task[None] | None = None
         self._protocol_cleanup_task: asyncio.Task[None] | None = None
         self._keepalive_accounts: set[str] = set()
+        self._session_capture_accounts: set[str] = set()
         self._keepalive_condition = asyncio.Condition()
         self._keepalive_revision = 0
         self._keepalive_waiters = 0
@@ -179,8 +181,33 @@ class BrowserPoolClient:
         self,
         account_id: str,
         worker: BrowserTikTokClient | None = None,
-    ) -> None:
+        *,
+        force: bool = False,
+    ) -> bool:
         selected = worker or self._workers.get(account_id)
+        worker_load = int(getattr(selected, "load", 0) or 0)
+        persisted_task_ids = self.store.active_browser_task_ids(account_id)
+        if selected is not None and (worker_load > 0 or persisted_task_ids) and not force:
+            self.store.add_event(
+                level="info",
+                category="account",
+                message="Chromium close deferred until browser tasks finish",
+                account_id=account_id,
+                details={
+                    "worker_load": worker_load,
+                    "persisted_task_ids": persisted_task_ids,
+                },
+            )
+            self._schedule_deferred_worker_close(account_id, selected)
+            return False
+        pending_close = self._deferred_worker_closures.get(account_id)
+        if (
+            pending_close is not None
+            and pending_close is not asyncio.current_task()
+        ):
+            pending_close.cancel()
+            await asyncio.gather(pending_close, return_exceptions=True)
+            self._deferred_worker_closures.pop(account_id, None)
         try:
             if selected is not None:
                 await selected.stop()
@@ -188,8 +215,68 @@ class BrowserPoolClient:
             if selected is None or self._workers.get(account_id) is selected:
                 self._workers.pop(account_id, None)
             await self._release_browser_slot(account_id)
+        return True
+
+    def _schedule_deferred_worker_close(
+        self, account_id: str, worker: BrowserTikTokClient
+    ) -> None:
+        current = self._deferred_worker_closures.get(account_id)
+        if current is not None and not current.done():
+            return
+        task = asyncio.create_task(
+            self._close_worker_when_idle(account_id, worker),
+            name=f"sd2api-browser-close-{account_id}",
+        )
+        self._deferred_worker_closures[account_id] = task
+
+        def clear(done: asyncio.Task[None]) -> None:
+            if self._deferred_worker_closures.get(account_id) is done:
+                self._deferred_worker_closures.pop(account_id, None)
+
+        task.add_done_callback(clear)
+
+    async def _close_worker_when_idle(
+        self, account_id: str, worker: BrowserTikTokClient
+    ) -> None:
+        while self._workers.get(account_id) is worker:
+            if worker.load == 0 and not self.store.active_browser_task_ids(account_id):
+                await self._stop_browser_worker(account_id, worker)
+                return
+            await asyncio.sleep(1)
+
+    def _browser_maintenance_active(self, account_id: str) -> bool:
+        login_task = self._login_tasks.get(account_id)
+        startup_task = self._startup_tasks.get(account_id)
+        return (
+            (login_task is not None and not login_task.done())
+            or (startup_task is not None and not startup_task.done())
+            or account_id in self._keepalive_accounts
+            or account_id in self._session_capture_accounts
+        )
 
     async def _capture_protocol_session(
+        self,
+        account_id: str,
+        worker: BrowserTikTokClient,
+        *,
+        bootstrap_identity: bool = True,
+        identity_fallback: ProtocolSession | None = None,
+        validate: bool = False,
+    ) -> ProtocolSession:
+        self._session_capture_accounts.add(account_id)
+        try:
+            return await self._capture_protocol_session_inner(
+                account_id,
+                worker,
+                bootstrap_identity=bootstrap_identity,
+                identity_fallback=identity_fallback,
+                validate=validate,
+            )
+        finally:
+            self._session_capture_accounts.discard(account_id)
+            await self._notify_keepalive_finished()
+
+    async def _capture_protocol_session_inner(
         self,
         account_id: str,
         worker: BrowserTikTokClient,
@@ -272,6 +359,7 @@ class BrowserPoolClient:
     ) -> None:
         if self._startup_tasks.get(account_id) is task:
             self._startup_tasks.pop(account_id, None)
+        asyncio.create_task(self._notify_keepalive_finished())
         if task.cancelled():
             return
         error = task.exception()
@@ -320,6 +408,11 @@ class BrowserPoolClient:
             )
 
     async def stop(self) -> None:
+        deferred_closures = list(self._deferred_worker_closures.values())
+        for task in deferred_closures:
+            task.cancel()
+        await asyncio.gather(*deferred_closures, return_exceptions=True)
+        self._deferred_worker_closures.clear()
         startup_tasks = list(self._startup_tasks.values())
         for task in startup_tasks:
             task.cancel()
@@ -353,7 +446,7 @@ class BrowserPoolClient:
         workers = list(self._workers.items())
         await asyncio.gather(
             *(
-                self._stop_browser_worker(account_id, worker)
+                self._stop_browser_worker(account_id, worker, force=True)
                 for account_id, worker in workers
             ),
             return_exceptions=True,
@@ -361,6 +454,7 @@ class BrowserPoolClient:
         await self._close_protocol_clients()
         self._started_accounts.clear()
         self._keepalive_accounts.clear()
+        self._session_capture_accounts.clear()
 
     async def status(self) -> dict[str, Any]:
         accounts = await self.list_accounts()
@@ -452,6 +546,9 @@ class BrowserPoolClient:
             runtime.setdefault("browser_running", bool(worker))
             runtime.setdefault("backend", "browser" if worker else "stopped")
             runtime["keepalive_active"] = account["id"] in self._keepalive_accounts
+            runtime["browser_maintenance_active"] = self._browser_maintenance_active(
+                account["id"]
+            )
             result.append(
                 {
                     **account,
@@ -1038,14 +1135,15 @@ class BrowserPoolClient:
                 code="account_busy",
             )
         if worker:
-            if worker.load > 0 and not force:
+            active_browser_task_ids = self.store.active_browser_task_ids(account_id)
+            if (worker.load > 0 or active_browser_task_ids) and not force:
                 self._workers[account_id] = worker
                 raise TikTokUpstreamError(
                     f"Account {account_id!r} still has running or queued tasks",
                     status_code=409,
                     code="account_busy",
                 )
-            await self._stop_browser_worker(account_id, worker)
+            await self._stop_browser_worker(account_id, worker, force=force)
         else:
             await self._release_browser_slot(account_id)
         if force:
@@ -1099,6 +1197,7 @@ class BrowserPoolClient:
             current = self._login_tasks.get(account_id)
             if current is asyncio.current_task():
                 self._login_tasks.pop(account_id, None)
+            await self._notify_keepalive_finished()
 
     async def _run_login_with_slot(self, account_id: str) -> None:
         worker: BrowserTikTokClient | None = None
@@ -1712,24 +1811,28 @@ class BrowserPoolClient:
             cleanup_protocol_media = False
             statuses = await self.list_accounts()
             eligible: list[tuple[dict[str, Any], dict[str, Any]]] = []
-            keepalive_eligible = False
+            maintenance_eligible = False
             for status in statuses:
+                maintenance_active = bool(
+                    status.get("browser_maintenance_active")
+                    or status.get("keepalive_active")
+                )
                 if (
                     status["enabled"]
                     and status["running"]
                     and status["logged_in"]
-                    and status.get("keepalive_active")
+                    and maintenance_active
                     and any(
                         self._subaccount_eligible(subaccount, model)
                         for subaccount in status["subaccounts"]
                     )
                 ):
-                    keepalive_eligible = True
+                    maintenance_eligible = True
                 if not (
                     status["enabled"]
                     and status["running"]
                     and status["logged_in"]
-                    and not status.get("keepalive_active")
+                    and not maintenance_active
                 ):
                     continue
                 eligible.extend(
@@ -1738,7 +1841,7 @@ class BrowserPoolClient:
                     if self._subaccount_eligible(subaccount, model)
                 )
             if not eligible:
-                if keepalive_eligible:
+                if maintenance_eligible:
                     raise _KeepalivePending
                 online_subaccounts = [
                     subaccount
@@ -1873,6 +1976,12 @@ class BrowserPoolClient:
                     candidates.remove((selected_account, selected_subaccount))
                     account_id = selected_account["id"]
                     advertiser_id = selected_subaccount["advertiser_id"]
+                    if self._browser_maintenance_active(account_id):
+                        maintenance_eligible = True
+                        candidates = [
+                            pair for pair in candidates if pair[0]["id"] != account_id
+                        ]
+                        continue
                     protocol_mode = bool(selected_account.get("session_available"))
                     cleanup_protocol_media = protocol_mode
                     target: Any = (
@@ -2058,7 +2167,7 @@ class BrowserPoolClient:
                             last_error=None,
                         )
                     return task_id
-                if keepalive_eligible:
+                if maintenance_eligible:
                     preserve_media = True
                     raise _KeepalivePending
                 if (
@@ -2120,7 +2229,14 @@ class BrowserPoolClient:
         account = self.store.get_account(account_id)
         protocol_client: ProtocolTikTokClient | None = None
         if browser_task:
-            task = await self._worker(account_id).check_task(upstream_task_id)
+            worker = self._workers.get(account_id)
+            if worker is None:
+                raise TikTokUpstreamError(
+                    f"Browser task {upstream_task_id!r} is not present in this running browser session",
+                    status_code=404,
+                    code="task_not_found",
+                )
+            task = await worker.check_task(upstream_task_id)
         elif account and account.get("session_available"):
             protocol_client = self._protocol_client(account_id, advertiser_id)
             task = await protocol_client.check_task(upstream_task_id)

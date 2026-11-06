@@ -56,6 +56,7 @@ from . import __version__
 logger = logging.getLogger("sd2api")
 TERMINAL_RPM_MAX_RETRIES = 2
 TERMINAL_RESOURCE_UNAVAILABLE_MAX_RETRIES = 3
+BROWSER_TASK_RECOVERY_MAX_RETRIES = 3
 store = TaskStore(settings.sd2api_database)
 uploads = UploadManager(settings)
 admin_static_dir = Path(__file__).with_name("static")
@@ -498,6 +499,67 @@ async def refresh(record: TaskRecord, *, force: bool = False) -> TaskRecord:
     try:
         upstream = await client.check_task(record.upstream_task_id or record.id)
     except TikTokUpstreamError as exc:
+        if (
+            exc.code == "task_not_found"
+            and record.upstream_task_id is not None
+            and record.upstream_task_id.startswith("browser_")
+            and record.submission_payload is not None
+        ):
+            payload = dict(record.submission_payload)
+            retry_count = int(payload.get("browser_task_recovery_retries") or 0)
+            audit_event(
+                "warning",
+                "video",
+                "浏览器任务状态丢失",
+                account_id=record.account_id,
+                task_id=record.id,
+                details={
+                    "advertiser_id": record.advertiser_id,
+                    "upstream_task_id": record.upstream_task_id,
+                    "retry": retry_count,
+                    "max_retries": BROWSER_TASK_RECOVERY_MAX_RETRIES,
+                    "error": str(exc),
+                },
+            )
+            if retry_count < BROWSER_TASK_RECOVERY_MAX_RETRIES:
+                payload["browser_task_recovery_retries"] = retry_count + 1
+                retried = store.retry_submitted_task(
+                    record.id,
+                    expected_upstream_task_id=record.upstream_task_id,
+                    payload=payload,
+                )
+                if retried is not None:
+                    audit_event(
+                        "warning",
+                        "video",
+                        "浏览器任务状态丢失，已用原任务 ID 重新排队",
+                        account_id=record.account_id,
+                        task_id=record.id,
+                        details={
+                            "retry": retry_count + 1,
+                            "max_retries": BROWSER_TASK_RECOVERY_MAX_RETRIES,
+                            "lost_upstream_task_id": record.upstream_task_id,
+                        },
+                    )
+                    if submission_dispatcher is not None:
+                        submission_dispatcher.wake()
+                    return retried
+                current = store.get(record.id)
+                if current is not None:
+                    return current
+            failed = store.update(
+                record.id,
+                status="failed",
+                progress=100,
+                error_code="browser_task_lost",
+                error_message=(
+                    "The browser task state was lost before a durable upstream "
+                    "task ID was captured"
+                ),
+                submission_payload=None,
+            )
+            cleanup_submission_payload(record.submission_payload)
+            return failed
         if not is_tiktok_transient_error(exc):
             raise
         audit_event(

@@ -866,6 +866,20 @@ class TaskStore:
             ).fetchall()
         return [str(row["id"]) for row in rows]
 
+    def active_browser_task_ids(self, account_id: str) -> list[str]:
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT id FROM tasks
+                WHERE account_id = ?
+                    AND status IN ('queued', 'running')
+                    AND upstream_task_id LIKE 'browser_%'
+                ORDER BY created_at ASC, id ASC
+                """,
+                (account_id,),
+            ).fetchall()
+        return [str(row["id"]) for row in rows]
+
     def reconcilable_tasks(
         self,
         *,
