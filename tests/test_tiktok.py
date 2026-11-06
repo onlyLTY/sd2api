@@ -2840,6 +2840,72 @@ async def test_refresh_retries_terminal_resource_unavailable_then_normalizes_err
 
 
 @pytest.mark.asyncio
+async def test_refresh_requeues_lost_browser_task_with_original_local_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sd2api.main as main
+
+    task_store = TaskStore(str(tmp_path / "lost-browser-task.db"))
+    upload_manager = UploadManager(
+        Settings(sd2api_upload_dir=str(tmp_path / "uploads"))
+    )
+    source = Path(upload_manager.root) / "reference.png"
+    source.write_bytes(png_bytes())
+    task_store.create_submission(
+        task_id="video-original",
+        model="seedance-2.0-mini",
+        prompt="recover browser task",
+        seconds=11,
+        size="720x1280",
+        api_key_mask=None,
+        idempotency_key_hash=None,
+        payload={
+            "mode": "reference",
+            "media": [{"kind": "image", "source": "path", "value": str(source)}],
+        },
+    )
+    task_store.claim_submission("video-original")
+    record = task_store.complete_submission(
+        "video-original",
+        upstream_task_id="browser_lost",
+        account_id="account-a",
+        advertiser_id="aio-a",
+    )
+
+    class Client:
+        async def check_task(self, _task_id: str) -> UpstreamTask:
+            raise TikTokUpstreamError(
+                "Browser task 'browser_lost' is not present in this running browser session",
+                status_code=404,
+                code="task_not_found",
+            )
+
+    class Dispatcher:
+        wakes = 0
+
+        def wake(self) -> None:
+            self.wakes += 1
+
+    dispatcher = Dispatcher()
+    monkeypatch.setattr(main, "client", Client())
+    monkeypatch.setattr(main, "store", task_store)
+    monkeypatch.setattr(main, "uploads", upload_manager)
+    monkeypatch.setattr(main, "submission_dispatcher", dispatcher)
+
+    recovered = await main.refresh(record)
+
+    assert recovered.id == "video-original"
+    assert recovered.status == "queued"
+    assert recovered.submission_status == "queued"
+    assert recovered.upstream_task_id is None
+    assert recovered.account_id is None
+    assert recovered.advertiser_id is None
+    assert recovered.submission_payload["browser_task_recovery_retries"] == 1
+    assert source.exists()
+    assert dispatcher.wakes == 1
+
+
+@pytest.mark.asyncio
 async def test_upstream_exception_handler_hides_resource_unavailable_details(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4058,6 +4124,187 @@ async def test_pool_request_waits_until_only_account_finishes_keepalive(
 
     assert await asyncio.wait_for(request, timeout=1) == "sub-a-task"
     assert pool._keepalive_waiters == 0
+
+
+@pytest.mark.asyncio
+async def test_pool_request_waits_while_account_is_logging_in_or_capturing_session(
+    tmp_path: Path,
+) -> None:
+    pool = BrowserPoolClient(
+        Settings(sd2api_database=str(tmp_path / "login-wait.db")),
+        TaskStore(str(tmp_path / "login-wait.db")),
+    )
+    maintenance_active = True
+
+    async def fake_list_accounts() -> list[dict[str, Any]]:
+        return [{
+            "id": "login-a",
+            "enabled": True,
+            "running": True,
+            "logged_in": True,
+            "session_available": False,
+            "browser_maintenance_active": maintenance_active,
+            "subaccounts": [{
+                "advertiser_id": "sub-a",
+                "enabled": True,
+                "seedance_access": True,
+                "credits": 100,
+            }],
+        }]
+
+    class FakeBrowser:
+        load = 0
+
+        async def create_text_video(self, **kwargs: Any) -> str:
+            return "browser-safe-task"
+
+    browser = FakeBrowser()
+    pool.list_accounts = fake_list_accounts  # type: ignore[method-assign]
+    pool._worker = lambda _account_id: browser  # type: ignore[method-assign]
+
+    request = asyncio.create_task(
+        pool.create_text_video(prompt="wait", model="seedance-2.0", duration=5)
+    )
+    for _ in range(20):
+        if pool._keepalive_waiters == 1:
+            break
+        await asyncio.sleep(0)
+
+    assert pool._keepalive_waiters == 1
+    assert request.done() is False
+
+    maintenance_active = False
+    await pool._notify_keepalive_finished()
+
+    assert await asyncio.wait_for(request, timeout=1) == "browser-safe-task"
+
+
+@pytest.mark.asyncio
+async def test_pool_rechecks_login_state_before_browser_fallback_submission(
+    tmp_path: Path,
+) -> None:
+    pool = BrowserPoolClient(
+        Settings(sd2api_database=str(tmp_path / "login-race.db")),
+        TaskStore(str(tmp_path / "login-race.db")),
+    )
+    maintenance_active = False
+    list_calls = 0
+
+    async def fake_list_accounts() -> list[dict[str, Any]]:
+        nonlocal list_calls, maintenance_active
+        list_calls += 1
+        if list_calls == 1:
+            asyncio.get_running_loop().call_soon(
+                lambda: pool._session_capture_accounts.add("login-a")
+            )
+            await asyncio.sleep(0)
+        return [{
+            "id": "login-a",
+            "enabled": True,
+            "running": True,
+            "logged_in": True,
+            "session_available": False,
+            "browser_maintenance_active": maintenance_active,
+            "subaccounts": [{
+                "advertiser_id": "sub-a",
+                "enabled": True,
+                "seedance_access": True,
+                "credits": 100,
+            }],
+        }]
+
+    class FakeBrowser:
+        load = 0
+        submissions = 0
+
+        async def create_text_video(self, **kwargs: Any) -> str:
+            self.submissions += 1
+            return "browser-race-task"
+
+    browser = FakeBrowser()
+    pool.list_accounts = fake_list_accounts  # type: ignore[method-assign]
+    pool._worker = lambda _account_id: browser  # type: ignore[method-assign]
+
+    request = asyncio.create_task(
+        pool.create_text_video(prompt="wait", model="seedance-2.0", duration=5)
+    )
+    for _ in range(20):
+        if pool._keepalive_waiters == 1:
+            break
+        await asyncio.sleep(0)
+
+    assert request.done() is False
+    assert browser.submissions == 0
+
+    maintenance_active = False
+    pool._session_capture_accounts.discard("login-a")
+    await pool._notify_keepalive_finished()
+
+    assert await asyncio.wait_for(request, timeout=1) == "browser-race-task"
+    assert browser.submissions == 1
+
+
+@pytest.mark.asyncio
+async def test_pool_defers_browser_close_while_tasks_are_active(tmp_path: Path) -> None:
+    store = TaskStore(str(tmp_path / "deferred-browser-close.db"))
+    pool = BrowserPoolClient(Settings(), store)
+    store.create_account(account_id="login-a", name="Login A")
+
+    class Worker:
+        load = 1
+        stopped = False
+
+        async def stop(self) -> None:
+            self.stopped = True
+
+    worker = Worker()
+    pool._workers["login-a"] = worker  # type: ignore[assignment]
+    await pool._acquire_browser_slot("login-a")
+
+    store.create_submission(
+        task_id="video-browser-active",
+        model="seedance-2.0-mini",
+        prompt="keep browser state alive",
+        seconds=5,
+        size="720x1280",
+        api_key_mask=None,
+        idempotency_key_hash=None,
+        payload={"mode": "text", "media": []},
+    )
+    store.claim_submission("video-browser-active")
+    store.complete_submission(
+        "video-browser-active",
+        upstream_task_id="browser_active",
+        account_id="login-a",
+        advertiser_id="aio-a",
+    )
+
+    assert await pool._stop_browser_worker("login-a", worker) is False
+    assert pool._workers["login-a"] is worker
+    assert worker.stopped is False
+    assert "login-a" in pool._browser_slot_accounts
+    event = store.list_events(category="account")[0]
+    assert event.message == (
+        "Chromium close deferred until browser tasks finish"
+    )
+    assert event.details == {
+        "worker_load": 1,
+        "persisted_task_ids": ["video-browser-active"],
+    }
+
+    worker.load = 0
+    assert await pool._stop_browser_worker("login-a", worker) is False
+    assert worker.stopped is False
+
+    store.retry_submitted_task(
+        "video-browser-active",
+        expected_upstream_task_id="browser_active",
+        payload={"mode": "text", "media": []},
+    )
+    assert await pool._stop_browser_worker("login-a", worker) is True
+    assert worker.stopped is True
+    assert "login-a" not in pool._workers
+    assert "login-a" not in pool._browser_slot_accounts
 
 
 @pytest.mark.asyncio
