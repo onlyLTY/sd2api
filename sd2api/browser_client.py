@@ -203,51 +203,42 @@ class BrowserTikTokClient:
 
     async def status(self) -> dict[str, Any]:
         if self._page is None or self._page.is_closed():
-            if self._login_state not in {"login_failed", "not_configured"}:
-                self._set_login_state("browser_closed")
-            return {
-                "account_id": self.account_id,
-                "running": False,
-                "logged_in": False,
-                "url": None,
-                "queued": self._queue.qsize(),
-                "busy": self._running_job,
-                "credits": None,
-                "login_state": self._login_state,
-                "login_error": self._login_error,
-                "last_login_at": self._last_login_at,
-                "active_advertiser_id": self._active_advertiser_id,
-            }
+            return self._closed_status()
         try:
             logged_in = await self._is_logged_in(self._page)
-        except Exception:
-            if self._browser_unavailable():
-                self._set_login_state("browser_closed")
-                return {
-                    "account_id": self.account_id,
-                    "running": False,
-                    "logged_in": False,
-                    "url": None,
-                    "queued": self._queue.qsize(),
-                    "busy": self._running_job,
-                    "credits": None,
-                    "login_state": self._login_state,
-                    "login_error": self._login_error,
-                    "last_login_at": self._last_login_at,
-                    "active_advertiser_id": self._active_advertiser_id,
-                }
+            if logged_in and self._login_state != "logging_in":
+                self._set_login_state("logged_in")
+            credits = await self._visible_credits(self._page) if logged_in else None
+            url = self._page.url
+        except Exception as exc:
+            if self._browser_unavailable() or self._transient_page_error(exc):
+                return self._closed_status(str(exc))
             raise
-        if logged_in and self._login_state != "logging_in":
-            self._set_login_state("logged_in")
-        credits = await self._visible_credits(self._page) if logged_in else None
         return {
             "running": True,
             "logged_in": logged_in,
-            "url": self._page.url,
+            "url": url,
             "queued": self._queue.qsize(),
             "busy": self._running_job,
             "account_id": self.account_id,
             "credits": credits,
+            "login_state": self._login_state,
+            "login_error": self._login_error,
+            "last_login_at": self._last_login_at,
+            "active_advertiser_id": self._active_advertiser_id,
+        }
+
+    def _closed_status(self, error: str | None = None) -> dict[str, Any]:
+        if self._login_state not in {"login_failed", "not_configured"}:
+            self._set_login_state("browser_closed", error)
+        return {
+            "account_id": self.account_id,
+            "running": False,
+            "logged_in": False,
+            "url": None,
+            "queued": self._queue.qsize(),
+            "busy": self._running_job,
+            "credits": None,
             "login_state": self._login_state,
             "login_error": self._login_error,
             "last_login_at": self._last_login_at,
