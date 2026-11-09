@@ -1259,6 +1259,42 @@ async def test_credits_fallback_reads_new_navigation_text() -> None:
 
 
 @pytest.mark.asyncio
+async def test_browser_status_treats_target_closed_during_credit_read_as_recoverable(
+    tmp_path: Path,
+) -> None:
+    class Page:
+        url = "https://ads.tiktok.com/creative/creativestudio/chat"
+
+        @staticmethod
+        def is_closed() -> bool:
+            return False
+
+    class Client(BrowserTikTokClient):
+        async def _is_logged_in(self, page: Any) -> bool:
+            return True
+
+        @staticmethod
+        async def _visible_credits(page: Any) -> int | None:
+            raise RuntimeError(
+                "Locator.inner_text: Target page, context or browser has been closed"
+            )
+
+    client = Client(
+        Settings(sd2api_browser_profile=str(tmp_path / "profile")),
+        account_id="target-closed",
+    )
+    client._page = Page()  # type: ignore[assignment]
+
+    status = await client.status()
+
+    assert status["running"] is False
+    assert status["logged_in"] is False
+    assert status["login_state"] == "browser_closed"
+    assert "Target page, context or browser has been closed" in status["login_error"]
+    assert not FeishuNotifier(Settings())._needs_manual_action(status)
+
+
+@pytest.mark.asyncio
 async def test_subaccount_scan_uses_control_apis_without_ui_navigation(
     tmp_path: Path,
 ) -> None:
