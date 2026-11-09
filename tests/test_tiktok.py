@@ -3106,6 +3106,45 @@ async def test_protocol_image_upload_apply_transfer_commit(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_protocol_upload_normalizes_connection_reset(tmp_path: Path) -> None:
+    image = tmp_path / "reference.png"
+    image.write_bytes(png_bytes())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadError(
+            "Recv failure: Connection reset by peer",
+            request=request,
+        )
+
+    client = ProtocolTikTokClient(
+        Settings(),
+        protocol_session(),
+        account_id="account-a",
+        advertiser_id="123456789012",
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(TikTokUpstreamError) as error:
+        await client._upload_binary(
+            "https://upload.example.com/upload/v1/image-object",
+            image.read_bytes(),
+            {
+                "signature": "storage-signature",
+                "headers": {},
+            },
+        )
+    await client.close()
+
+    assert error.value.code == "tiktok_transport_error"
+    assert error.value.status_code == 503
+    assert str(error.value) == "TikTok media upload temporarily failed"
+    assert "Connection reset" not in str(error.value)
+    assert error.value.context == {
+        "operation": "media_upload",
+        "request_method": "POST",
+    }
+
+
+@pytest.mark.asyncio
 async def test_protocol_multipart_transfer_uses_isolated_parts_and_finish(
     tmp_path: Path,
 ) -> None:
@@ -4785,6 +4824,11 @@ def test_pool_normalizes_model_aliases_for_cooldowns() -> None:
             "10040209",
             "ResourceUnavailable: provider_message="
             "<h1>504 Gateway Time-out</h1><center>TLB</center>",
+            3,
+        ),
+        (
+            "tiktok_transport_error",
+            "TikTok media upload temporarily failed",
             3,
         ),
     ],
