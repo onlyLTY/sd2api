@@ -715,6 +715,8 @@ class BrowserPoolClient:
     def _is_retryable_submission_error(exc: TikTokUpstreamError) -> bool:
         if is_tiktok_resource_unavailable(exc.code, str(exc)):
             return True
+        if exc.code == "tiktok_transport_error":
+            return True
         if exc.code == "10001200":
             return "face check timed out" in str(exc).lower()
         if exc.code != "50000":
@@ -2044,7 +2046,10 @@ class BrowserPoolClient:
                         )
                         submission_retry_limit = (
                             3
-                            if is_tiktok_resource_unavailable(exc.code, str(exc))
+                            if (
+                                exc.code == "tiktok_transport_error"
+                                or is_tiktok_resource_unavailable(exc.code, str(exc))
+                            )
                             else 2
                         )
                         if (

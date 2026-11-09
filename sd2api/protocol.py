@@ -1160,10 +1160,9 @@ class ProtocolTikTokClient:
             body=content,
             content_type="application/json" if body is not None and service == "imagex" else None,
         )
-        async with self._request_client() as client:
-            response = await client.request(
-                method, path, headers=headers, content=content or None
-            )
+        response = await self._upload_request(
+            method, path, headers=headers, content=content or None
+        )
         if response.status_code >= 400:
             raise TikTokUpstreamError(
                 f"TikTok upload gateway returned HTTP {response.status_code}",
@@ -1231,10 +1230,9 @@ class ProtocolTikTokClient:
     ) -> dict[str, Any]:
         base = f"https://{address['host']}/upload/v1/{address['oid']}"
         headers = self._storage_headers(address)
-        async with self._request_client() as client:
-            init = await client.post(
-                base + "?uploadmode=part&phase=init", headers=headers
-            )
+        init = await self._upload_request(
+            "POST", base + "?uploadmode=part&phase=init", headers=headers
+        )
         init_payload = self._storage_json(init, "initialize")
         upload_id = str(_deep_find(init_payload, {"uploadid", "uploadId"}) or "")
         if not upload_id:
@@ -1256,11 +1254,26 @@ class ProtocolTikTokClient:
             f"{base}?uploadmode=part&phase=finish&uploadid={_quote(upload_id)}"
             f"&size={path.stat().st_size}"
         )
-        async with self._request_client() as client:
-            finish = await client.post(
-                finish_url, headers=headers, content=body.encode()
-            )
+        finish = await self._upload_request(
+            "POST", finish_url, headers=headers, content=body.encode()
+        )
         return self._storage_json(finish, "finish")
+
+    async def _upload_request(
+        self, method: str, url: str, **kwargs: Any
+    ) -> Any:
+        try:
+            async with self._request_client() as client:
+                return await client.request(method, url, **kwargs)
+        except (httpx.HTTPError, CurlRequestException) as exc:
+            raise TikTokUpstreamError(
+                "TikTok media upload temporarily failed",
+                status_code=503,
+                code="tiktok_transport_error",
+            ).with_context(
+                operation="media_upload",
+                request_method=method,
+            ) from exc
 
     async def _upload_binary(
         self,
@@ -1277,10 +1290,9 @@ class ProtocolTikTokClient:
                 "Content-Type": "application/octet-stream",
             }
         )
-        async with self._request_client() as client:
-            response = await client.post(
-                url, headers=headers, content=content, timeout=1800
-            )
+        response = await self._upload_request(
+            "POST", url, headers=headers, content=content, timeout=1800
+        )
         return self._storage_json(response, "transfer")
 
     @staticmethod
