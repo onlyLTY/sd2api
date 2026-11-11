@@ -86,6 +86,38 @@ UPSTREAM_UNAVAILABLE_CODE = "upstream_unavailable"
 UPSTREAM_UNAVAILABLE_MESSAGE = (
     "Video generation service is temporarily unavailable. Please retry later."
 )
+UPSTREAM_CAPACITY_CODE = "tiktok_capacity_unavailable"
+UPSTREAM_CAPACITY_MESSAGE = (
+    "TikTok generation capacity is temporarily unavailable. Please retry later."
+)
+
+
+def tiktok_capacity_rejection_details(
+    exc: BaseException,
+) -> dict[str, Any] | None:
+    """Return details only for an explicit, safe-to-retry capacity rejection."""
+    if str(getattr(exc, "code", "") or "").strip().lower() != "tiktok_http_500":
+        return None
+    context = getattr(exc, "context", None)
+    excerpt = context.get("response_excerpt") if isinstance(context, dict) else None
+    if not isinstance(excerpt, str) or not excerpt.strip():
+        return None
+    try:
+        payload = json.loads(excerpt)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("error_code") or "").strip().lower() != (
+        "reached_max_replica_limit"
+    ):
+        return None
+    return {
+        "capacity_errno": payload.get("errno"),
+        "capacity_error_code": "reached_max_replica_limit",
+        "capacity_error_message": payload.get("error_message"),
+        "capacity_request_id": payload.get("request_id"),
+    }
 
 
 def is_tiktok_resource_unavailable(

@@ -30,10 +30,13 @@ from .tiktok import (
     R2V_MODELS,
     T2V_MODELS,
     TikTokUpstreamError,
+    UPSTREAM_CAPACITY_CODE,
+    UPSTREAM_CAPACITY_MESSAGE,
     _deep_find,
     _first,
     is_tiktok_authentication_error,
     is_tiktok_transient_error,
+    tiktok_capacity_rejection_details,
     tiktok_authentication_error,
 )
 from .uploads import StagedMedia
@@ -53,6 +56,7 @@ R2V_CREATE_PATH = "/creative_bff_i18n/api/cue/i2v/gen_r2v_video"
 CHECK_TASK_PATH = "/creative_bff_i18n/api/cue/generate-task/check"
 CHECK_TASK_MAX_RETRIES = 3
 CHECK_TASK_RETRY_DELAY_SECONDS = 0.5
+CAPACITY_RETRY_DELAYS_SECONDS = (1.0, 2.0, 4.0)
 BIND_VIDEOS_PATH = "/creative_bff_i18n/api/cue/lego/bind_videos"
 VIDEO_INFO_PATH = "/creative_bff_i18n/api/cue/lego/get_video_info"
 ACCOUNT_CONTEXT_COOKIE = "s_aio_client_id"
@@ -643,6 +647,40 @@ class ProtocolTikTokClient:
                 await asyncio.sleep(CHECK_TASK_RETRY_DELAY_SECONDS * (attempt + 1))
         raise RuntimeError("Read request retry loop exited unexpectedly")
 
+    async def _capacity_rejection_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        operation: str,
+        json_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        last_error: TikTokUpstreamError | None = None
+        for attempt in range(len(CAPACITY_RETRY_DELAYS_SECONDS) + 1):
+            try:
+                return await self._request(method, path, json_body=json_body)
+            except TikTokUpstreamError as exc:
+                details = tiktok_capacity_rejection_details(exc)
+                if details is None:
+                    raise
+                last_error = exc
+                if attempt >= len(CAPACITY_RETRY_DELAYS_SECONDS):
+                    raise TikTokUpstreamError(
+                        UPSTREAM_CAPACITY_MESSAGE,
+                        status_code=503,
+                        code=UPSTREAM_CAPACITY_CODE,
+                    ).with_context(
+                        **exc.context,
+                        **details,
+                        capacity_operation=operation,
+                        capacity_retry_attempts=attempt,
+                        original_upstream_code=exc.code,
+                    ) from exc
+                await asyncio.sleep(CAPACITY_RETRY_DELAYS_SECONDS[attempt])
+        raise RuntimeError(
+            f"Capacity retry loop exited unexpectedly after {last_error!r}"
+        )
+
     async def discover_subaccounts(self) -> list[dict[str, Any]]:
         account_list, account_info = await asyncio.gather(
             self._read_request_with_retry("GET", ACCOUNT_LIST_PATH),
@@ -860,7 +898,12 @@ class ProtocolTikTokClient:
     async def _create_task(self, path: str, body: dict[str, Any]) -> str:
         self._inflight += 1
         try:
-            payload = await self._request("POST", path, json_body=body)
+            payload = await self._capacity_rejection_request(
+                "POST",
+                path,
+                operation="create_task",
+                json_body=body,
+            )
         finally:
             self._inflight -= 1
         task_id = _deep_find(payload, {"taskId", "task_id", "TaskId"})
@@ -1055,7 +1098,12 @@ class ProtocolTikTokClient:
             return await self._upload_file(path, media.kind, token)
 
     async def _upload_token(self) -> dict[str, Any]:
-        payload = await self._request("POST", UPLOAD_TOKEN_PATH, json_body={})
+        payload = await self._capacity_rejection_request(
+            "POST",
+            UPLOAD_TOKEN_PATH,
+            operation="upload_token",
+            json_body={},
+        )
         token = _find_mapping(payload, {"SecretAccessKey", "SessionToken"})
         if token is None:
             raise TikTokUpstreamError(
