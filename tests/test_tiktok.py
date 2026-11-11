@@ -40,10 +40,13 @@ from sd2api.temp_mail import TempMailClient
 from sd2api.tiktok import (
     TikTokClient,
     TikTokUpstreamError,
+    UPSTREAM_CAPACITY_CODE,
+    UPSTREAM_CAPACITY_MESSAGE,
     UPSTREAM_UNAVAILABLE_CODE,
     UPSTREAM_UNAVAILABLE_MESSAGE,
     is_tiktok_resource_unavailable,
     is_tiktok_rpm_rate_limit,
+    tiktok_capacity_rejection_details,
 )
 from sd2api.uploads import StagedMedia, UploadManager
 
@@ -2462,6 +2465,184 @@ async def test_protocol_task_check_returns_last_5xx_after_three_retries(
     assert calls == 4
     assert error.value.status_code == 504
     assert error.value.code == "tiktok_http_504"
+
+
+def capacity_limit_response() -> dict[str, Any]:
+    return {
+        "errno": 142901,
+        "error_code": "reached_max_replica_limit",
+        "error_message": "Function has reached its max replica limit.",
+        "request_id": "20261111180432642714F1275240092FCD",
+    }
+
+
+def test_capacity_rejection_requires_explicit_replica_limit_response() -> None:
+    matched = TikTokUpstreamError(
+        "TikTok returned HTTP 500",
+        status_code=500,
+        code="tiktok_http_500",
+    ).with_context(response_excerpt=json.dumps(capacity_limit_response()))
+    generic = TikTokUpstreamError(
+        "TikTok returned HTTP 500",
+        status_code=500,
+        code="tiktok_http_500",
+    ).with_context(response_excerpt='{"error_code":"internal_error"}')
+
+    assert tiktok_capacity_rejection_details(matched) == {
+        "capacity_errno": 142901,
+        "capacity_error_code": "reached_max_replica_limit",
+        "capacity_error_message": "Function has reached its max replica limit.",
+        "capacity_request_id": "20261111180432642714F1275240092FCD",
+    }
+    assert tiktok_capacity_rejection_details(generic) is None
+
+
+@pytest.mark.asyncio
+async def test_protocol_upload_token_retries_explicit_capacity_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls <= 3:
+            return httpx.Response(500, json=capacity_limit_response())
+        return httpx.Response(
+            200,
+            json={
+                "code": 0,
+                "data": {
+                    "AccessKeyID": "access",
+                    "SecretAccessKey": "secret",
+                    "SessionToken": "session-token",
+                },
+            },
+        )
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    client = ProtocolTikTokClient(
+        Settings(),
+        protocol_session(),
+        account_id="account-a",
+        advertiser_id="123456789012",
+        transport=httpx.MockTransport(handler),
+    )
+    token = await client._upload_token()
+    await client.close()
+
+    assert token["SessionToken"] == "session-token"
+    assert calls == 4
+    assert sleeps == [1.0, 2.0, 4.0]
+
+
+@pytest.mark.asyncio
+async def test_protocol_create_task_retries_explicit_capacity_rejection_without_reupload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls <= 3:
+            return httpx.Response(500, json=capacity_limit_response())
+        return httpx.Response(200, json={"code": 0, "data": {"taskId": "task-ok"}})
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    client = ProtocolTikTokClient(
+        Settings(),
+        protocol_session(),
+        account_id="account-a",
+        advertiser_id="123456789012",
+        transport=httpx.MockTransport(handler),
+    )
+    task_id = await client._create_task("/create", {"prompt": "test"})
+    await client.close()
+
+    assert task_id == "task-ok"
+    assert calls == 4
+    assert sleeps == [1.0, 2.0, 4.0]
+
+
+@pytest.mark.asyncio
+async def test_protocol_create_task_does_not_retry_generic_http_500(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500, json={"error_code": "internal_error"})
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    client = ProtocolTikTokClient(
+        Settings(),
+        protocol_session(),
+        account_id="account-a",
+        advertiser_id="123456789012",
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(TikTokUpstreamError) as error:
+        await client._create_task("/create", {"prompt": "test"})
+    await client.close()
+
+    assert error.value.code == "tiktok_http_500"
+    assert calls == 1
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_protocol_capacity_retry_exhaustion_preserves_provider_details(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500, json=capacity_limit_response())
+
+    async def fake_sleep(delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    client = ProtocolTikTokClient(
+        Settings(),
+        protocol_session(),
+        account_id="account-a",
+        advertiser_id="123456789012",
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(TikTokUpstreamError) as error:
+        await client._create_task("/create", {"prompt": "test"})
+    await client.close()
+
+    assert calls == 4
+    assert error.value.code == UPSTREAM_CAPACITY_CODE
+    assert str(error.value) == UPSTREAM_CAPACITY_MESSAGE
+    assert error.value.context["capacity_operation"] == "create_task"
+    assert error.value.context["capacity_retry_attempts"] == 3
+    assert error.value.context["capacity_error_code"] == (
+        "reached_max_replica_limit"
+    )
+    assert error.value.context["capacity_request_id"] == (
+        "20261111180432642714F1275240092FCD"
+    )
+    assert error.value.context["original_upstream_code"] == "tiktok_http_500"
 
 
 @pytest.mark.asyncio
