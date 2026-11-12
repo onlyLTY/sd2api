@@ -2233,25 +2233,31 @@ class BrowserPoolClient:
         browser_task = upstream_task_id.startswith("browser_")
         account = self.store.get_account(account_id)
         protocol_client: ProtocolTikTokClient | None = None
-        if browser_task:
-            worker = self._workers.get(account_id)
-            if worker is None:
+        try:
+            if browser_task:
+                worker = self._workers.get(account_id)
+                if worker is None:
+                    raise TikTokUpstreamError(
+                        f"Browser task {upstream_task_id!r} is not present in this running browser session",
+                        status_code=404,
+                        code="task_not_found",
+                    )
+                task = await worker.check_task(upstream_task_id)
+            elif account and account.get("session_available"):
+                protocol_client = self._protocol_client(account_id, advertiser_id)
+                task = await protocol_client.check_task(upstream_task_id)
+            else:
                 raise TikTokUpstreamError(
-                    f"Browser task {upstream_task_id!r} is not present in this running browser session",
-                    status_code=404,
-                    code="task_not_found",
+                    "The protocol session is temporarily unavailable while checking "
+                    f"task {upstream_task_id!r}",
+                    status_code=503,
+                    code="protocol_session_unavailable",
                 )
-            task = await worker.check_task(upstream_task_id)
-        elif account and account.get("session_available"):
-            protocol_client = self._protocol_client(account_id, advertiser_id)
-            task = await protocol_client.check_task(upstream_task_id)
-        else:
-            raise TikTokUpstreamError(
-                "The protocol session is temporarily unavailable while checking "
-                f"task {upstream_task_id!r}",
-                status_code=503,
-                code="protocol_session_unavailable",
-            )
+        except TikTokUpstreamError as exc:
+            if not is_tiktok_authentication_error(exc):
+                raise
+            await self._mark_account_session_expired(account_id, exc)
+            raise tiktok_authentication_error() from exc
         credits = task.raw.get("credits") if task.raw else None
         if (
             advertiser_id

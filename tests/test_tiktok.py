@@ -2847,6 +2847,105 @@ async def test_refresh_keeps_cached_status_after_transient_retries_are_exhausted
     assert events[0]["details"] == {"error_code": "tiktok_transport_error"}
 
 
+def test_video_status_hides_poll_auth_failure_and_later_completes_same_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sd2api.main as main
+
+    task_store = TaskStore(str(tmp_path / "poll-auth-cache.db"))
+    task_store.create_submission(
+        task_id="video_poll_auth",
+        model="seedance-2.0",
+        prompt="test",
+        seconds=5,
+        size="720x1280",
+        api_key_mask=None,
+        idempotency_key_hash=None,
+        payload={"mode": "text", "media": []},
+    )
+    task_store.claim_submission("video_poll_auth")
+    task_store.complete_submission(
+        "video_poll_auth",
+        upstream_task_id="tiktok-task-123",
+        account_id="account-a",
+        advertiser_id="aio-a",
+    )
+    task_store.update("video_poll_auth", status="running", progress=50)
+    events: list[dict[str, Any]] = []
+
+    class Client:
+        calls = 0
+
+        async def check_task(self, task_id: str) -> UpstreamTask:
+            assert task_id == "tiktok-task-123"
+            self.calls += 1
+            if self.calls == 1:
+                raise TikTokUpstreamError(
+                    "TikTok session expired; the account must log in again",
+                    status_code=401,
+                    code="tiktok_authentication_error",
+                )
+            return UpstreamTask(
+                id=task_id,
+                status="succeeded",
+                progress=100,
+                video_url="https://example.com/video.mp4",
+            )
+
+    class Dispatcher:
+        wake_calls = 0
+
+        def wake(self) -> None:
+            self.wake_calls += 1
+
+    fake_client = Client()
+    dispatcher = Dispatcher()
+    monkeypatch.setattr(main, "client", fake_client)
+    monkeypatch.setattr(main, "store", task_store)
+    monkeypatch.setattr(main, "submission_dispatcher", dispatcher)
+    monkeypatch.setattr(
+        main,
+        "audit_event",
+        lambda *args, **kwargs: events.append({"args": args, **kwargs}),
+    )
+    api = TestClient(main.app)
+    headers = {"Authorization": f"Bearer {main.settings.sd2api_api_key}"}
+
+    unavailable = api.get("/v1/videos/video_poll_auth", headers=headers)
+
+    assert unavailable.status_code == 200
+    assert unavailable.json()["id"] == "video_poll_auth"
+    assert unavailable.json()["status"] == "in_progress"
+    cached = task_store.get("video_poll_auth")
+    assert cached is not None
+    assert cached.upstream_task_id == "tiktok-task-123"
+    assert cached.submission_status == "submitted"
+    assert dispatcher.wake_calls == 0
+    assert events == [
+        {
+            "args": ("warning", "video", "TikTok 任务查询认证失效，保留上次任务状态"),
+            "account_id": "account-a",
+            "task_id": "video_poll_auth",
+            "details": {
+                "advertiser_id": "aio-a",
+                "upstream_task_id": "tiktok-task-123",
+                "error_code": "tiktok_authentication_error",
+                "error": "TikTok session expired; the account must log in again",
+            },
+        }
+    ]
+
+    completed = api.get("/v1/videos/video_poll_auth", headers=headers)
+
+    assert completed.status_code == 200
+    assert completed.json()["id"] == "video_poll_auth"
+    assert completed.json()["status"] == "completed"
+    saved = task_store.get("video_poll_auth")
+    assert saved is not None
+    assert saved.upstream_task_id == "tiktok-task-123"
+    assert saved.video_url == "https://example.com/video.mp4"
+
+
 @pytest.mark.asyncio
 async def test_refresh_reroutes_terminal_rpm_twice_then_exposes_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -5604,6 +5703,67 @@ async def test_refresh_keeps_protocol_task_status_while_session_is_unavailable(
     assert refreshed.status == "running"
     assert refreshed.progress == 50
     assert task_store.get("video-local") == record
+
+
+@pytest.mark.asyncio
+async def test_pool_check_task_expires_session_after_authentication_failure(
+    tmp_path: Path,
+) -> None:
+    task_store = TaskStore(str(tmp_path / "poll-auth-account.db"))
+    task_store.create_account(account_id="login-a", name="Login A")
+    task_store.update_account(
+        "login-a",
+        session_ciphertext="encrypted-session",
+        session_updated_at=int(time.time()),
+        login_state="logged_in",
+    )
+    task_store.create_submission(
+        task_id="video-local",
+        model="seedance-2.0",
+        prompt="test",
+        seconds=5,
+        size="720x1280",
+        api_key_mask=None,
+        idempotency_key_hash=None,
+        payload={"mode": "text", "media": []},
+    )
+    task_store.claim_submission("video-local")
+    task_store.complete_submission(
+        "video-local",
+        upstream_task_id="tiktok-task-123",
+        account_id="login-a",
+        advertiser_id="sub-a",
+    )
+    pool = BrowserPoolClient(Settings(sd2api_auto_login=False), task_store)
+
+    class ExpiredClient:
+        async def check_task(self, _task_id: str) -> UpstreamTask:
+            raise TikTokUpstreamError(
+                "InvalidLogin",
+                status_code=502,
+                code="38001001",
+            )
+
+    pool._protocol_client = (  # type: ignore[method-assign]
+        lambda _account_id, _advertiser_id=None: ExpiredClient()
+    )
+
+    with pytest.raises(TikTokUpstreamError) as error:
+        await pool.check_task("tiktok-task-123")
+
+    assert error.value.status_code == 401
+    assert error.value.code == "tiktok_authentication_error"
+    account = task_store.get_account("login-a")
+    assert account is not None
+    assert account["login_state"] == "pending"
+    assert account["session_available"] is False
+    assert account["last_error"] == (
+        "TikTok session expired; the account must log in again"
+    )
+    record = task_store.get("video-local")
+    assert record is not None
+    assert record.upstream_task_id == "tiktok-task-123"
+    assert record.submission_status == "submitted"
 
 
 def test_admin_account_routes_without_starting_browser(

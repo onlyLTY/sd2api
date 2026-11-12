@@ -45,6 +45,7 @@ from .tiktok import (
     TikTokUpstreamError,
     UPSTREAM_UNAVAILABLE_CODE,
     UPSTREAM_UNAVAILABLE_MESSAGE,
+    is_tiktok_authentication_error,
     is_tiktok_resource_unavailable,
     is_tiktok_rpm_rate_limit,
     is_tiktok_transient_error,
@@ -499,6 +500,25 @@ async def refresh(record: TaskRecord, *, force: bool = False) -> TaskRecord:
     try:
         upstream = await client.check_task(record.upstream_task_id or record.id)
     except TikTokUpstreamError as exc:
+        if (
+            is_tiktok_authentication_error(exc)
+            and record.submission_status == "submitted"
+            and record.upstream_task_id is not None
+        ):
+            audit_event(
+                "warning",
+                "video",
+                "TikTok 任务查询认证失效，保留上次任务状态",
+                account_id=record.account_id,
+                task_id=record.id,
+                details={
+                    "advertiser_id": record.advertiser_id,
+                    "upstream_task_id": record.upstream_task_id,
+                    "error_code": exc.code,
+                    "error": str(exc),
+                },
+            )
+            return store.get(record.id) or record
         if (
             exc.code == "task_not_found"
             and record.upstream_task_id is not None
