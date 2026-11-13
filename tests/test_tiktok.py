@@ -334,6 +334,107 @@ async def test_feishu_notifier_reports_deduplicated_subaccount_refresh_failures(
     assert "upstream unavailable" in fake.messages[2]
 
 
+@pytest.mark.asyncio
+async def test_feishu_notifier_reports_new_frozen_subaccounts_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    configured = Settings(
+        sd2api_feishu_enabled=True,
+        sd2api_feishu_instance_name="Instance A",
+    )
+
+    class FakeFeishu:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        async def send_text(self, message: str) -> str:
+            self.messages.append(message)
+            return "om_test"
+
+    fake = FakeFeishu()
+    notifier = FeishuNotifier(configured, feishu_client=fake)  # type: ignore[arg-type]
+    healthy = {
+        "id": "account-a",
+        "enabled": True,
+        "name": "user@example.com",
+        "login_state": "logged_in",
+        "subaccounts": [
+            {
+                "advertiser_id": "aio-a",
+                "name": "AIO A",
+                "credits": 3455,
+                "credit_frozen": False,
+                "credit_frozen_reason": None,
+            }
+        ],
+    }
+    frozen = {
+        **healthy,
+        "subaccounts": [
+            {
+                **healthy["subaccounts"][0],
+                "credit_frozen": True,
+                "credit_frozen_reason": "cue_credit_frozen_reason_1",
+                "last_error": "CreditAccountFrozen",
+            }
+        ],
+    }
+
+    await notifier.check_accounts([healthy])
+    await notifier.check_accounts([frozen])
+    await notifier.check_accounts([frozen])
+
+    assert len(fake.messages) == 1
+    assert "子账号积分账户被冻结" in fake.messages[0]
+    assert "Instance A" in fake.messages[0]
+    assert "user@example.com" in fake.messages[0]
+    assert "AIO A" in fake.messages[0]
+    assert "aio-a" in fake.messages[0]
+    assert "3455" in fake.messages[0]
+    assert "cue_credit_frozen_reason_1" in fake.messages[0]
+    assert "已自动移出调度" in fake.messages[0]
+
+    await notifier.check_accounts([healthy])
+    await notifier.check_accounts([frozen])
+    assert len(fake.messages) == 2
+
+
+@pytest.mark.asyncio
+async def test_feishu_notifier_seeds_existing_frozen_subaccounts_without_alerting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    configured = Settings(sd2api_feishu_enabled=True)
+
+    class FakeFeishu:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        async def send_text(self, message: str) -> str:
+            self.messages.append(message)
+            return "om_test"
+
+    fake = FakeFeishu()
+    notifier = FeishuNotifier(configured, feishu_client=fake)  # type: ignore[arg-type]
+    existing = {
+        "id": "account-a",
+        "enabled": True,
+        "subaccounts": [
+            {
+                "advertiser_id": "aio-a",
+                "credit_frozen": True,
+                "credits": 3455,
+            }
+        ],
+    }
+
+    await notifier.check_accounts([existing])
+    await notifier.check_accounts([existing])
+
+    assert fake.messages == []
+
+
 @pytest.mark.parametrize(
     ("payload", "expected"),
     [

@@ -159,6 +159,8 @@ print(f"Current Status: {status.status}")
 
 `10044103 / CreditAccountFrozen` 表示该子账号的积分账户已被冻结。sd2api 会直接禁用该子账号并换号，不设置自动恢复时间。周期刷新会通过积分账户接口更新冻结状态、冻结原因和真实积分；接口确认恢复后会清除冻结标记，但不会自动打开调度开关，需在后台确认后手动启用。
 
+飞书通知启用后，运行期间新检测到子账号积分冻结会向已配置的个人或群聊发送一次通知，包含登录账户、子账号、AIO ID、剩余积分和冻结原因。持续冻结不会重复通知；恢复后再次冻结会重新通知。服务启动时已处于冻结状态的存量子账号只建立去重基线，不补发历史通知。
+
 若 Seedance 将提供方网关超时包装为 `10040209 / ResourceUnavailable`（例如响应包含 `504 Gateway Time-out`），sd2api 会保留同一个本地 `video_*` ID 并自动重新排队提交，最多三次。重试期间任务保持非终态；重试耗尽后，查询接口返回 `failed`，错误统一为 `upstream_unavailable / Video generation service is temporarily unavailable. Please retry later.`。TikTok 私有错误码、网关 HTML 和上游任务 ID 仅写入内部审计日志，不对调用方暴露。尚未受理的同步请求如果最终遇到同类错误，则返回 HTTP `502` 和相同的标准错误体。
 
 已提交任务在状态查询期间遇到 TikTok session 失效时，sd2api 会在内部清理该账号的失效 session 并安排重新登录，同时以 HTTP `200` 返回任务上一次持久化的非终态状态。任务继续使用原本的本地 `video_*` ID 和 TikTok task ID，不会重新提交或重复扣费；账号恢复后，后续轮询会继续更新同一任务直至终态。认证错误及账号信息仅写入内部审计日志。
