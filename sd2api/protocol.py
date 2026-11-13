@@ -770,6 +770,10 @@ class ProtocolTikTokClient:
         return {
             "advertiser_id": str(account.get("aioClientID") or ""),
             "credits": self._parse_credits(credit),
+            "credit_frozen": bool(_deep_find(credit, {"frozen", "is_frozen", "isFrozen"})),
+            "credit_frozen_reason": _deep_find(
+                credit, {"frozen_reason", "frozenReason"}
+            ),
             "seedance_access": self._seedance2_access(permissions, level),
         }
 
