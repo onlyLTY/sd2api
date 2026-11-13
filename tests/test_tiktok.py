@@ -5173,6 +5173,25 @@ async def test_pool_disables_frozen_credit_account_and_fails_over(
     )
     assert other_model_task == "healthy-task"
 
+    store.upsert_subaccounts(
+        "frozen",
+        [
+            {
+                "advertiser_id": "frozen-a",
+                "name": "frozen-a-refreshed",
+                "account_type": "partner",
+                "seedance_access": True,
+                "credits": 3400,
+                "last_error": None,
+            }
+        ],
+    )
+    refreshed = store.list_subaccounts("frozen")[0]
+    assert refreshed["enabled"] is False
+    assert refreshed["credits"] == 3400
+    assert refreshed["name"] == "frozen-a-refreshed"
+    assert refreshed["last_error"] == "CreditAccountFrozen"
+
 
 def test_daily_pool_boundaries_use_utc_midnight() -> None:
     assert BrowserPoolClient._utc_today_start(1_756_684_799) == 1_756_598_400
