@@ -1288,7 +1288,15 @@ class TaskStore:
                         credits = COALESCE(excluded.credits, subaccounts.credits),
                         active = excluded.active,
                         last_checked_at = excluded.last_checked_at,
-                        last_error = excluded.last_error
+                        last_error = CASE
+                            WHEN subaccounts.enabled = 0
+                                AND (
+                                    subaccounts.last_error LIKE '%10044103%'
+                                    OR lower(subaccounts.last_error) LIKE '%creditaccountfrozen%'
+                                )
+                            THEN subaccounts.last_error
+                            ELSE excluded.last_error
+                        END
                     """,
                     (
                         account_id,
