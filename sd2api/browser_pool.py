@@ -682,7 +682,7 @@ class BrowserPoolClient:
         return ((int(timestamp) // 86400) + 1) * 86400
 
     def _is_daily_quota_error(self, exc: TikTokUpstreamError) -> bool:
-        known_codes = {"10040104", "10044103", "10044200"}
+        known_codes = {"10040104", "10044200"}
         configured_codes = {
             item.strip()
             for item in self.settings.sd2api_pool_daily_quota_codes.split(",")
@@ -710,6 +710,10 @@ class BrowserPoolClient:
             "生成额度",
         )
         return any(marker in text for marker in markers)
+
+    @staticmethod
+    def _is_credit_account_frozen(exc: TikTokUpstreamError) -> bool:
+        return exc.code == "10044103" or "creditaccountfrozen" in str(exc).lower()
 
     @staticmethod
     def _is_retryable_submission_error(exc: TikTokUpstreamError) -> bool:
@@ -1955,6 +1959,7 @@ class BrowserPoolClient:
             try:
                 last_authentication_error: TikTokUpstreamError | None = None
                 quota_failures = 0
+                frozen_credit_failures = 0
                 transient_limit_failures = 0
                 submission_retries = 0
                 preserve_media = False
@@ -2082,7 +2087,19 @@ class BrowserPoolClient:
                                 pair for pair in candidates if pair[0]["id"] != account_id
                             ]
                             continue
-                        if self._is_daily_quota_error(exc):
+                        if self._is_credit_account_frozen(exc):
+                            frozen_credit_failures += 1
+                            blocked_until = None
+                            self.store.set_subaccount_enabled(
+                                account_id, advertiser_id, False
+                            )
+                            self.store.update_subaccount(
+                                account_id,
+                                advertiser_id,
+                                last_error=str(exc),
+                            )
+                            event_message = "Subaccount credit account frozen and disabled"
+                        elif self._is_daily_quota_error(exc):
                             quota_failures += 1
                             blocked_until = self._next_utc_day_start()
                             self.store.update_subaccount_model_limit(
@@ -2178,6 +2195,7 @@ class BrowserPoolClient:
                 if (
                     last_authentication_error is not None
                     and quota_failures == 0
+                    and frozen_credit_failures == 0
                     and transient_limit_failures == 0
                 ):
                     raise last_authentication_error
@@ -2193,6 +2211,12 @@ class BrowserPoolClient:
                         "All selected subaccounts are temporarily limited by TikTok",
                         status_code=429,
                         code="subaccount_rate_limited",
+                    )
+                if frozen_credit_failures and quota_failures == 0:
+                    raise TikTokUpstreamError(
+                        "No usable subaccounts remain after frozen credit accounts were disabled",
+                        status_code=503,
+                        code="account_pool_unavailable",
                     )
                 raise TikTokUpstreamError(
                     f"All selected subaccounts have exhausted their daily quota for {self._model_key(model)}",
