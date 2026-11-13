@@ -2772,10 +2772,61 @@ async def test_protocol_capability_read_retries_upstream_out_of_memory(
     assert result == {
         "advertiser_id": "aio-a",
         "credits": 100,
+        "credit_frozen": False,
+        "credit_frozen_reason": None,
         "seedance_access": True,
     }
     assert account_info_calls == 4
     assert sleeps == [0.5, 1.0, 1.5]
+
+
+@pytest.mark.asyncio
+async def test_protocol_capabilities_include_credit_account_frozen_state() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("ClientGetAccountInfo"):
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"account": {"aioClientID": "aio-a"}}},
+            )
+        if request.url.path.endswith("QueryCreditAccount"):
+            return httpx.Response(
+                200,
+                json={
+                    "BaseResp": {"StatusCode": 0, "StatusMessage": ""},
+                    "credits": "3455",
+                    "bonus": "0",
+                    "frozen": True,
+                    "frozen_reason": "cue_credit_frozen_reason_1",
+                },
+            )
+        if request.url.path.endswith("get_miniapp_permission_with_allowlist"):
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"allowlist": ["cue_mini_i2v_seedance_2"]}},
+            )
+        return httpx.Response(
+            200,
+            json={"code": 0, "data": {"user_segment_tier": "T1"}},
+        )
+
+    client = ProtocolTikTokClient(
+        Settings(),
+        protocol_session(),
+        account_id="account-a",
+        advertiser_id="aio-a",
+        transport=httpx.MockTransport(handler),
+    )
+
+    result = await client.account_capabilities()
+    await client.close()
+
+    assert result == {
+        "advertiser_id": "aio-a",
+        "credits": 3455,
+        "credit_frozen": True,
+        "credit_frozen_reason": "cue_credit_frozen_reason_1",
+        "seedance_access": True,
+    }
 
 
 @pytest.mark.asyncio
@@ -5182,6 +5233,8 @@ async def test_pool_disables_frozen_credit_account_and_fails_over(
                 "account_type": "partner",
                 "seedance_access": True,
                 "credits": 3400,
+                "credit_frozen": True,
+                "credit_frozen_reason": "cue_credit_frozen_reason_1",
                 "last_error": None,
             }
         ],
@@ -5606,6 +5659,76 @@ async def test_refresh_subaccounts_is_allowed_while_generation_is_active(
     )
     result = await pool.refresh_subaccounts("login-a", check_access=True)
     assert result["subaccounts"][0]["credits"] == 95
+
+
+@pytest.mark.asyncio
+async def test_refresh_subaccounts_tracks_credit_frozen_state_without_auto_enabling(
+    tmp_path: Path,
+) -> None:
+    store = TaskStore(str(tmp_path / "refresh-credit-frozen.db"))
+    store.create_account(account_id="login-a", name="Login A")
+    store.upsert_subaccounts(
+        "login-a",
+        [
+            {
+                "advertiser_id": "sub-a",
+                "name": "Sub A",
+                "seedance_access": True,
+                "credits": 3455,
+            }
+        ],
+    )
+    store.set_subaccount_enabled("login-a", "sub-a", True)
+    pool = BrowserPoolClient(Settings(), store)
+
+    class RootClient:
+        async def discover_subaccounts(self) -> list[dict[str, Any]]:
+            return [
+                {
+                    "advertiser_id": "sub-a",
+                    "name": "Sub A",
+                    "account_type": "client",
+                }
+            ]
+
+    class SubClient:
+        frozen = True
+
+        async def account_capabilities(self) -> dict[str, Any]:
+            return {
+                "advertiser_id": "sub-a",
+                "credits": 3455,
+                "credit_frozen": self.frozen,
+                "credit_frozen_reason": (
+                    "cue_credit_frozen_reason_1" if self.frozen else None
+                ),
+                "seedance_access": True,
+            }
+
+    sub_client = SubClient()
+    pool._protocol_client = (  # type: ignore[method-assign]
+        lambda _account_id, advertiser_id=None: (
+            sub_client if advertiser_id else RootClient()
+        )
+    )
+
+    frozen_result = await pool.refresh_subaccounts("login-a", check_access=True)
+    frozen = frozen_result["subaccounts"][0]
+    assert frozen["enabled"] is False
+    assert frozen["credit_frozen"] is True
+    assert frozen["credit_frozen_reason"] == "cue_credit_frozen_reason_1"
+    assert frozen["credits"] == 3455
+    assert frozen["last_error"] == (
+        "CreditAccountFrozen: cue_credit_frozen_reason_1"
+    )
+
+    sub_client.frozen = False
+    recovered_result = await pool.refresh_subaccounts("login-a", check_access=True)
+    recovered = recovered_result["subaccounts"][0]
+    assert recovered["enabled"] is False
+    assert recovered["credit_frozen"] is False
+    assert recovered["credit_frozen_reason"] is None
+    assert recovered["last_error"] is None
 
 
 @pytest.mark.asyncio

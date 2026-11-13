@@ -498,14 +498,16 @@ function renderSubaccounts(account) {
   const items = account.subaccounts || [];
   if (!items.length) return '<div class="table-empty">尚未发现子账号。登录后点击“刷新子账号”获取权限与 Credits。</div>';
   return `<div class="subaccounts"><div class="subaccounts-head"><span>子账号</span><span>Seedance 权限</span><span>余额</span><span>加入调度</span><span>说明</span></div>${items.map((sub) => {
-    const canSchedule = sub.seedance_access === true;
+    const canSchedule = sub.seedance_access === true && !sub.credit_frozen;
     const modelLimits = sub.model_limits || [];
     const modelLimitText = modelLimits.map((limit) => {
       const until = Math.max(Number(limit.quota_blocked_until || 0), Number(limit.rate_limited_until || 0));
       return `${limit.model} 至 ${formatUnix(until)}`;
     }).join("；");
-    const switchLabel = sub.rate_limited ? "账号频率冷却" : modelLimits.length ? "部分模型冷却" : sub.enabled ? "已加入调度" : canSchedule ? "未加入调度" : "不可加入调度";
-    const note = canSchedule
+    const switchLabel = sub.credit_frozen ? "积分账户冻结" : sub.rate_limited ? "账号频率冷却" : modelLimits.length ? "部分模型冷却" : sub.enabled ? "已加入调度" : canSchedule ? "未加入调度" : "不可加入调度";
+    const note = sub.credit_frozen
+      ? `积分账户冻结${sub.credit_frozen_reason ? ` · ${sub.credit_frozen_reason}` : ""}`
+      : canSchedule
       ? (sub.rate_limited
           ? `TikTok 账号频率限制，暂停至 ${formatUnix(sub.rate_limited_until)}`
         : modelLimits.length
@@ -518,7 +520,7 @@ function renderSubaccounts(account) {
     return `
     <div class="sub-row">
       <div class="sub-name"><div><strong>${esc(sub.name)}</strong><span class="cell-sub mono">${esc(sub.advertiser_id)} · ${esc(sub.account_type)}</span></div></div>
-      <div>${sub.seedance_access === true ? '<span class="pill ok">SD2 可用</span>' : sub.seedance_access === false ? '<span class="pill bad">无 SD2 权限</span>' : '<span class="pill wait">未检查</span>'}</div>
+      <div>${sub.credit_frozen ? '<span class="pill bad">积分冻结</span>' : sub.seedance_access === true ? '<span class="pill ok">SD2 可用</span>' : sub.seedance_access === false ? '<span class="pill bad">无 SD2 权限</span>' : '<span class="pill wait">未检查</span>'}</div>
       <div><strong>${sub.credits ?? "—"}</strong><span class="cell-sub">Credits</span></div>
       <label class="schedule-control ${schedulable ? "" : "disabled"}">
         <span class="switch">

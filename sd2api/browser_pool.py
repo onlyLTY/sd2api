@@ -621,6 +621,7 @@ class BrowserPoolClient:
         if not (
             bool(item.get("enabled"))
             and item.get("seedance_access") is True
+            and not item.get("credit_frozen")
             and (item.get("credits") is None or int(item["credits"]) > 0)
             and int(item.get("rate_limited_until") or 0) <= int(time.time())
         ):
@@ -1584,10 +1585,20 @@ class BrowserPoolClient:
                             raise RuntimeError(
                                 "TikTok returned a different subaccount context"
                             )
+                        credit_frozen = bool(capability.get("credit_frozen"))
+                        frozen_reason = capability.get("credit_frozen_reason")
                         checked.update(
                             credits=capability["credits"],
+                            credit_frozen=credit_frozen,
+                            credit_frozen_reason=frozen_reason,
                             seedance_access=capability["seedance_access"],
-                            last_error=None,
+                            last_error=(
+                                f"CreditAccountFrozen: {frozen_reason}"
+                                if credit_frozen and frozen_reason
+                                else "CreditAccountFrozen"
+                                if credit_frozen
+                                else None
+                            ),
                             last_checked_at=int(time.time()),
                         )
                     except TikTokUpstreamError as exc:
@@ -1621,6 +1632,11 @@ class BrowserPoolClient:
                 code="subaccount_scan_failed",
             ) from exc
         self.store.upsert_subaccounts(account_id, discovered)
+        for item in discovered:
+            if item.get("credit_frozen"):
+                self.store.set_subaccount_enabled(
+                    account_id, str(item["advertiser_id"]), False
+                )
         self.store.update_account(account_id, last_error=None)
         return await self.account_status(account_id)
 
@@ -2096,6 +2112,8 @@ class BrowserPoolClient:
                             self.store.update_subaccount(
                                 account_id,
                                 advertiser_id,
+                                credit_frozen=True,
+                                credit_frozen_reason=str(exc),
                                 last_error=str(exc),
                             )
                             event_message = "Subaccount credit account frozen and disabled"

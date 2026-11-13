@@ -224,6 +224,8 @@ class TaskStore:
                     enabled INTEGER NOT NULL DEFAULT 0,
                     seedance_access INTEGER,
                     credits INTEGER,
+                    credit_frozen INTEGER NOT NULL DEFAULT 0,
+                    credit_frozen_reason TEXT,
                     active INTEGER NOT NULL DEFAULT 0,
                     last_checked_at INTEGER,
                     last_error TEXT,
@@ -244,6 +246,8 @@ class TaskStore:
                 ).fetchall()
             }
             subaccount_migrations = {
+                "credit_frozen": "INTEGER NOT NULL DEFAULT 0",
+                "credit_frozen_reason": "TEXT",
                 "quota_blocked_until": "INTEGER",
                 "quota_reason": "TEXT",
                 "quota_updated_at": "INTEGER",
@@ -1244,6 +1248,7 @@ class TaskStore:
         result["active"] = bool(result["active"])
         if result.get("seedance_access") is not None:
             result["seedance_access"] = bool(result["seedance_access"])
+        result["credit_frozen"] = bool(result.get("credit_frozen"))
         return result
 
     def list_subaccounts(self, account_id: str | None = None) -> list[dict[str, Any]]:
@@ -1277,8 +1282,9 @@ class TaskStore:
                     """
                     INSERT INTO subaccounts (
                         account_id, advertiser_id, name, account_type, enabled,
-                        seedance_access, credits, active, last_checked_at, last_error
-                    ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+                        seedance_access, credits, credit_frozen,
+                        credit_frozen_reason, active, last_checked_at, last_error
+                    ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(account_id, advertiser_id) DO UPDATE SET
                         name = excluded.name,
                         account_type = excluded.account_type,
@@ -1286,10 +1292,13 @@ class TaskStore:
                             excluded.seedance_access, subaccounts.seedance_access
                         ),
                         credits = COALESCE(excluded.credits, subaccounts.credits),
+                        credit_frozen = excluded.credit_frozen,
+                        credit_frozen_reason = excluded.credit_frozen_reason,
                         active = excluded.active,
                         last_checked_at = excluded.last_checked_at,
                         last_error = CASE
-                            WHEN subaccounts.enabled = 0
+                            WHEN excluded.credit_frozen = 1
+                                AND subaccounts.enabled = 0
                                 AND (
                                     subaccounts.last_error LIKE '%10044103%'
                                     OR lower(subaccounts.last_error) LIKE '%creditaccountfrozen%'
@@ -1305,6 +1314,8 @@ class TaskStore:
                         str(item.get("account_type") or "unknown"),
                         None if seedance_access is None else int(bool(seedance_access)),
                         item.get("credits"),
+                        int(bool(item.get("credit_frozen"))),
+                        item.get("credit_frozen_reason"),
                         int(bool(item.get("active"))),
                         int(item.get("last_checked_at") or now),
                         item.get("last_error"),
@@ -1339,6 +1350,8 @@ class TaskStore:
             "account_type",
             "seedance_access",
             "credits",
+            "credit_frozen",
+            "credit_frozen_reason",
             "active",
             "last_checked_at",
             "last_error",
@@ -1352,7 +1365,7 @@ class TaskStore:
         invalid = set(changes) - allowed
         if invalid:
             raise ValueError(f"Unsupported subaccount fields: {sorted(invalid)}")
-        for key in ("seedance_access", "active"):
+        for key in ("seedance_access", "credit_frozen", "active"):
             if key in changes and changes[key] is not None:
                 changes[key] = int(bool(changes[key]))
         assignments = ", ".join(f"{name} = :{name}" for name in changes)
