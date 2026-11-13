@@ -682,7 +682,7 @@ class BrowserPoolClient:
         return ((int(timestamp) // 86400) + 1) * 86400
 
     def _is_daily_quota_error(self, exc: TikTokUpstreamError) -> bool:
-        known_codes = {"10040104", "10044200"}
+        known_codes = {"10040104", "10044103", "10044200"}
         configured_codes = {
             item.strip()
             for item in self.settings.sd2api_pool_daily_quota_codes.split(",")

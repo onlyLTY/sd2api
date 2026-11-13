@@ -4997,6 +4997,7 @@ async def test_protocol_pool_uses_upstream_limits_to_fail_over_subaccounts(
     ("quota_message", "quota_code"),
     [
         ("User Generation Day Limit: limit_level=STRATEGY", "10040104"),
+        ("CreditAccountFrozen", "10044103"),
         ("InsufficientCredits", "10044200"),
     ],
 )
