@@ -275,6 +275,8 @@ class FeishuNotifier:
         self.poll_seconds = poll_seconds
         self._active_incidents: dict[str, tuple[str, str]] = {}
         self._active_refresh_incidents: dict[str, str] = {}
+        self._active_frozen_subaccounts: set[str] = set()
+        self._frozen_baseline_initialized = False
 
     def _needs_manual_action(self, account: dict[str, Any]) -> bool:
         state = str(account.get("login_state") or "")
@@ -387,6 +389,29 @@ class FeishuNotifier:
         }
         if not self.settings.sd2api_feishu_enabled:
             return
+        frozen_subaccounts = {
+            f"{account.get('id')}:{subaccount.get('advertiser_id')}"
+            for account in accounts
+            if account.get("enabled", True)
+            for subaccount in account.get("subaccounts", [])
+            if subaccount.get("credit_frozen")
+        }
+        if not self._frozen_baseline_initialized:
+            self._active_frozen_subaccounts = frozen_subaccounts
+            self._frozen_baseline_initialized = True
+        else:
+            for account in accounts:
+                for subaccount in account.get("subaccounts", []):
+                    key = f"{account.get('id')}:{subaccount.get('advertiser_id')}"
+                    if (
+                        key not in frozen_subaccounts
+                        or key in self._active_frozen_subaccounts
+                    ):
+                        continue
+                    await self.client.send_text(
+                        self._credit_frozen_message(account, subaccount)
+                    )
+            self._active_frozen_subaccounts = frozen_subaccounts
         for account in accounts:
             account_key = f"{account.get('id')}:*"
             account_fingerprint = refresh_incidents.get(account_key)
@@ -415,6 +440,23 @@ class FeishuNotifier:
                     )
                 )
                 self._active_refresh_incidents[key] = fingerprint
+
+    def _credit_frozen_message(
+        self, account: dict[str, Any], subaccount: dict[str, Any]
+    ) -> str:
+        return "\n".join(
+            [
+                "[sd2api] 子账号积分账户被冻结",
+                f"实例：{self.settings.sd2api_feishu_instance_name or 'sd2api'}",
+                f"账号：{account.get('name') or account.get('username') or account.get('id')}",
+                f"子账号：{subaccount.get('name') or subaccount.get('advertiser_id')}",
+                f"AIO：{subaccount.get('advertiser_id')}",
+                f"剩余积分：{subaccount.get('credits') if subaccount.get('credits') is not None else '未知'}",
+                f"冻结原因：{subaccount.get('credit_frozen_reason') or subaccount.get('last_error') or 'CreditAccountFrozen'}",
+                "处理：已自动移出调度，不会继续接收新任务。",
+                f"时间：{datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}",
+            ]
+        )
 
     def _subaccount_refresh_failure_message(
         self,
