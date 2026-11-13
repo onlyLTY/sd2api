@@ -4997,7 +4997,6 @@ async def test_protocol_pool_uses_upstream_limits_to_fail_over_subaccounts(
     ("quota_message", "quota_code"),
     [
         ("User Generation Day Limit: limit_level=STRATEGY", "10040104"),
-        ("CreditAccountFrozen", "10044103"),
         ("InsufficientCredits", "10044200"),
     ],
 )
@@ -5091,6 +5090,88 @@ async def test_pool_fails_over_when_subaccount_hits_daily_quota(
     assert same_model_task == "healthy-task"
     assert clients["sub-a"].requested_models == ["seedance-2.0", "seedance-2.5"]
     assert pool.account_for_task(same_model_task) == "b"
+
+
+@pytest.mark.asyncio
+async def test_pool_disables_frozen_credit_account_and_fails_over(
+    tmp_path: Path,
+) -> None:
+    store = TaskStore(str(tmp_path / "frozen-credit-account.db"))
+    for account_id, advertiser_id in (("frozen", "frozen-a"), ("healthy", "healthy-a")):
+        store.create_account(account_id=account_id, name=account_id)
+        store.upsert_subaccounts(
+            account_id,
+            [
+                {
+                    "advertiser_id": advertiser_id,
+                    "name": advertiser_id,
+                    "account_type": "partner",
+                    "seedance_access": True,
+                    "credits": 3455,
+                }
+            ],
+        )
+        store.set_subaccount_enabled(account_id, advertiser_id, True)
+    pool = BrowserPoolClient(Settings(), store)
+
+    async def fake_list_accounts() -> list[dict[str, Any]]:
+        return [
+            {
+                "id": account_id,
+                "enabled": True,
+                "running": True,
+                "logged_in": True,
+                "session_available": True,
+                "subaccounts": pool._decorate_subaccounts(
+                    account_id, store.list_subaccounts(account_id)
+                ),
+            }
+            for account_id in ("frozen", "healthy")
+        ]
+
+    class FrozenClient:
+        load = 0
+
+        async def create_text_video(self, **kwargs: Any) -> str:
+            raise TikTokUpstreamError(
+                "CreditAccountFrozen",
+                status_code=502,
+                code="10044103",
+            )
+
+    class HealthyClient:
+        load = 0
+
+        async def create_text_video(self, **kwargs: Any) -> str:
+            return "healthy-task"
+
+    clients = {"frozen-a": FrozenClient(), "healthy-a": HealthyClient()}
+    pool.list_accounts = fake_list_accounts  # type: ignore[method-assign]
+    pool._protocol_client = (  # type: ignore[method-assign]
+        lambda _account_id, advertiser_id=None: clients[str(advertiser_id)]
+    )
+
+    task_id = await pool.create_text_video(
+        prompt="fail over frozen credit account",
+        model="seedance-2.0",
+        duration=5,
+    )
+
+    assert task_id == "healthy-task"
+    frozen = store.list_subaccounts("frozen")[0]
+    assert frozen["enabled"] is False
+    assert frozen["credits"] == 3455
+    assert frozen["last_error"] == "CreditAccountFrozen"
+    assert frozen["quota_blocked_until"] is None
+    assert store.list_subaccount_model_limits("frozen", "frozen-a") == []
+    assert pool.account_for_task(task_id) == "healthy"
+
+    other_model_task = await pool.create_text_video(
+        prompt="disabled account stays disabled",
+        model="seedance-2.5",
+        duration=5,
+    )
+    assert other_model_task == "healthy-task"
 
 
 def test_daily_pool_boundaries_use_utc_midnight() -> None:

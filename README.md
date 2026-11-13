@@ -155,7 +155,9 @@ print(f"Current Status: {status.status}")
 
 若 Seedance 已接受任务、但随后在生成结果中返回明确的账号 RPM 限制（例如 `EndpointAccountRpmRateLimitExceeded`），sd2api 会短时冷却该子账号，并使用同一个本地 `video_*` ID 自动换号重提，最多两次。该规则按 RPM provider 文案识别，不会仅凭 `10043100/10043101` 将每日额度错误误判为短时限流。
 
-任务提交时返回 `10040104 / User Generation Day Limit`、`10044103 / CreditAccountFrozen` 或 `10044200 / InsufficientCredits` 时，sd2api 会将当前子账号对应模型冷却到下一个 UTC 00:00，并继续尝试号池中的其他子账号。数据库保留上游返回的真实积分，不会因额度错误将积分归零；只有全池该模型均不可用时才返回统一的池额度错误。
+任务提交时返回 `10040104 / User Generation Day Limit` 或 `10044200 / InsufficientCredits` 时，sd2api 会将当前子账号对应模型冷却到下一个 UTC 00:00，并继续尝试号池中的其他子账号。数据库保留上游返回的真实积分，不会因额度错误将积分归零；只有全池该模型均不可用时才返回统一的池额度错误。
+
+`10044103 / CreditAccountFrozen` 表示该子账号的积分账户已被冻结。sd2api 会直接禁用该子账号并换号，不设置自动恢复时间；周期刷新不会重新启用它，需在后台确认积分账户恢复后手动启用。
 
 若 Seedance 将提供方网关超时包装为 `10040209 / ResourceUnavailable`（例如响应包含 `504 Gateway Time-out`），sd2api 会保留同一个本地 `video_*` ID 并自动重新排队提交，最多三次。重试期间任务保持非终态；重试耗尽后，查询接口返回 `failed`，错误统一为 `upstream_unavailable / Video generation service is temporarily unavailable. Please retry later.`。TikTok 私有错误码、网关 HTML 和上游任务 ID 仅写入内部审计日志，不对调用方暴露。尚未受理的同步请求如果最终遇到同类错误，则返回 HTTP `502` 和相同的标准错误体。
 
