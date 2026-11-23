@@ -7,6 +7,7 @@ from typing import Any
 from .browser_pool import BrowserPoolClient
 from .store import TaskRecord, TaskStore
 from .tiktok import (
+    TikTokClient,
     TikTokUpstreamError,
     UPSTREAM_UNAVAILABLE_CODE,
     UPSTREAM_UNAVAILABLE_MESSAGE,
@@ -146,6 +147,11 @@ class VideoSubmissionDispatcher:
                 upstream_task_id=upstream_task_id,
                 account_id=account_id,
                 advertiser_id=advertiser_id,
+                draft_id=(
+                    self.client.take_created_draft_id(upstream_task_id)
+                    if isinstance(self.client, (BrowserPoolClient, TikTokClient))
+                    else None
+                ),
             )
             self.audit(
                 "info",

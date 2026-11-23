@@ -238,6 +238,7 @@ class UpstreamTask(BaseModel):
     id: str
     status: Literal["queued", "running", "succeeded", "failed"]
     progress: int = Field(default=0, ge=0, le=100)
+    draft_id: str | None = None
     video_id: str | None = None
     video_url: str | None = None
     poster_url: str | None = None

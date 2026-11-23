@@ -25,6 +25,7 @@ from curl_cffi.requests.exceptions import RequestException as CurlRequestExcepti
 from .config import Settings
 from .models import UpstreamTask
 from .tiktok import (
+    DRAFT_DETAIL_PATH,
     I2V_MODELS,
     MODEL_PERMISSION_CODES,
     R2V_MODELS,
@@ -32,7 +33,10 @@ from .tiktok import (
     TikTokUpstreamError,
     UPSTREAM_CAPACITY_CODE,
     UPSTREAM_CAPACITY_MESSAGE,
+    _created_task_ids,
     _deep_find,
+    _draft_id,
+    _draft_task_ids,
     _first,
     is_tiktok_authentication_error,
     is_tiktok_transient_error,
@@ -54,6 +58,10 @@ T2V_CREATE_PATH = "/creative_bff_i18n/api/cue/t2v/create_generate_task"
 I2V_CREATE_PATH = "/creative_bff_i18n/api/cue/i2v/create_generate_task"
 R2V_CREATE_PATH = "/creative_bff_i18n/api/cue/i2v/gen_r2v_video"
 CHECK_TASK_PATH = "/creative_bff_i18n/api/cue/generate-task/check"
+HISTORY_TASKS_PATH = "/creative_bff_i18n/api/cue/history/tasks"
+HISTORY_PAGE_SIZE = 50
+HISTORY_MAX_PAGES = 10
+HISTORY_CACHE_SECONDS = 30
 CHECK_TASK_MAX_RETRIES = 3
 CHECK_TASK_RETRY_DELAY_SECONDS = 0.5
 CAPACITY_RETRY_DELAYS_SECONDS = (1.0, 2.0, 4.0)
@@ -327,6 +335,10 @@ class ProtocolTikTokClient:
         self._request_inflight = 0
         self._last_request_at = time.monotonic()
         self._active_tasks: set[str] = set()
+        self._created_draft_ids: dict[str, str] = {}
+        self._history_lock = asyncio.Lock()
+        self._history_draft_ids: dict[str, str] = {}
+        self._history_cache_until = 0.0
         self._inflight = 0
         self._upload_semaphore = asyncio.Semaphore(
             settings.sd2api_protocol_upload_concurrency
@@ -910,35 +922,122 @@ class ProtocolTikTokClient:
             )
         finally:
             self._inflight -= 1
-        task_id = _deep_find(payload, {"taskId", "task_id", "TaskId"})
-        if task_id is None:
-            data = payload.get("data")
-            if isinstance(data, (str, int)):
-                task_id = data
-        if task_id is None:
-            raise TikTokUpstreamError(
-                "TikTok accepted the request but did not return a task ID"
-            )
-        result = str(task_id)
-        self._active_tasks.add(result)
-        return result
+        task_id, draft_id = _created_task_ids(payload)
+        if draft_id is not None:
+            self._created_draft_ids[task_id] = draft_id
+        self._active_tasks.add(task_id)
+        return task_id
 
-    async def check_task(self, task_id: str) -> UpstreamTask:
+    def take_created_draft_id(self, task_id: str) -> str | None:
+        return self._created_draft_ids.pop(task_id, None)
+
+    def _matches_advertiser(self, draft: dict[str, Any]) -> bool:
+        advertised = _first(draft, ("AIOId", "aioId", "aio_id"))
+        return (
+            not self.advertiser_id
+            or advertised is None
+            or str(advertised) == self.advertiser_id
+        )
+
+    async def _history_draft_id(self, task_id: str) -> str | None:
+        if not self.advertiser_id:
+            return None
+        async with self._history_lock:
+            if time.monotonic() < self._history_cache_until:
+                return self._history_draft_ids.get(task_id)
+            draft_ids: dict[str, str] = {}
+            ambiguous_ids: set[str] = set()
+            offset = 0
+            for _ in range(HISTORY_MAX_PAGES):
+                try:
+                    payload = await self._request(
+                        "POST",
+                        HISTORY_TASKS_PATH,
+                        json_body={"pageOffset": offset, "pageLimit": HISTORY_PAGE_SIZE},
+                    )
+                except TikTokUpstreamError as exc:
+                    if is_tiktok_authentication_error(exc):
+                        raise
+                    break
+                data = _unwrap_data(payload)
+                if not isinstance(data, dict):
+                    break
+                drafts = _first(data, ("draft_infos", "draftInfos"))
+                if not isinstance(drafts, list) or not drafts:
+                    break
+                for draft in drafts:
+                    if not isinstance(draft, dict) or not self._matches_advertiser(draft):
+                        continue
+                    draft_id = _draft_id(draft)
+                    if draft_id is None:
+                        continue
+                    for alias in _draft_task_ids(draft):
+                        if draft_ids.setdefault(alias, draft_id) != draft_id:
+                            ambiguous_ids.add(alias)
+                offset += len(drafts)
+                total = data.get("total")
+                if isinstance(total, int) and offset >= total:
+                    break
+                if not isinstance(total, int) and len(drafts) < HISTORY_PAGE_SIZE:
+                    break
+            for alias in ambiguous_ids:
+                draft_ids.pop(alias, None)
+            self._history_draft_ids = draft_ids
+            self._history_cache_until = time.monotonic() + HISTORY_CACHE_SECONDS
+            return draft_ids.get(task_id)
+
+    async def _check_draft(
+        self, task_id: str, draft_id: str
+    ) -> UpstreamTask | None:
+        try:
+            payload = await self._read_request_with_retry(
+                "GET", DRAFT_DETAIL_PATH, params={"draftId": draft_id}
+            )
+        except TikTokUpstreamError as exc:
+            if is_tiktok_authentication_error(exc) or is_tiktok_transient_error(exc):
+                raise
+            return None
+        draft = _unwrap_data(payload)
+        if (
+            not isinstance(draft, dict)
+            or _draft_id(draft) != draft_id
+            or not self._matches_advertiser(draft)
+        ):
+            return None
+        aliases = _draft_task_ids(draft)
+        if aliases and task_id not in aliases:
+            return None
+        return await self._parse_draft(task_id, draft, payload)
+
+    async def check_task(
+        self, task_id: str, *, draft_id: str | None = None
+    ) -> UpstreamTask:
+        if draft_id is not None:
+            task = await self._check_draft(task_id, draft_id)
+            if task is not None:
+                return task
         payload = await self._check_task_payload(task_id)
         drafts = _deep_find(payload, {"draft_infos", "draftInfos"})
-        if not isinstance(drafts, list) or not drafts:
-            return UpstreamTask(id=task_id, status="queued", progress=0, raw=payload)
-        draft = next(
-            (
-                item
-                for item in drafts
-                if isinstance(item, dict)
-                and str(_first(item, ("taskId", "task_id")) or task_id) == task_id
-            ),
-            drafts[0],
-        )
-        if not isinstance(draft, dict):
-            raise TikTokUpstreamError("TikTok returned an invalid task record")
+        if isinstance(drafts, list):
+            for draft in drafts:
+                if not isinstance(draft, dict) or not self._matches_advertiser(draft):
+                    continue
+                if draft_id is not None and _draft_id(draft) not in (None, draft_id):
+                    continue
+                aliases = _draft_task_ids(draft)
+                if task_id in aliases or (len(drafts) == 1 and not aliases):
+                    return await self._parse_draft(task_id, draft, payload)
+        if draft_id is None:
+            recovered_id = await self._history_draft_id(task_id)
+            if recovered_id is not None:
+                task = await self._check_draft(task_id, recovered_id)
+                if task is not None:
+                    return task
+        return UpstreamTask(id=task_id, status="queued", progress=0, raw=payload)
+
+    async def _parse_draft(
+        self, task_id: str, draft: dict[str, Any], payload: dict[str, Any]
+    ) -> UpstreamTask:
         draft_status = _first(draft, ("draftTaskStatus", "draft_task_status"))
         render_status = _first(draft, ("renderTaskStatus", "render_task_status"))
         video_id = _first(draft, ("vid", "videoId", "video_id", "watermarkVid"))
@@ -985,10 +1084,12 @@ class ProtocolTikTokClient:
             poster_url = poster_url or self._extract_poster_url(info)
         if status in {"failed", "succeeded"}:
             self._active_tasks.discard(task_id)
+            self._created_draft_ids.pop(task_id, None)
         return UpstreamTask(
             id=task_id,
             status=status,
             progress=progress,
+            draft_id=_draft_id(draft),
             video_id=str(video_id) if video_id is not None else None,
             video_url=video_url,
             poster_url=poster_url,

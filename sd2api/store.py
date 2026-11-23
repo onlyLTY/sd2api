@@ -40,6 +40,7 @@ class TaskRecord:
     error_message: str | None = None
     raw: dict[str, Any] | None = None
     upstream_task_id: str | None = None
+    draft_id: str | None = None
     submission_status: str | None = None
     submission_payload: dict[str, Any] | None = None
     idempotency_key_hash: str | None = None
@@ -113,6 +114,7 @@ class TaskStore:
                     error_message TEXT,
                     raw TEXT,
                     upstream_task_id TEXT,
+                    draft_id TEXT,
                     submission_status TEXT,
                     submission_payload TEXT,
                     idempotency_key_hash TEXT
@@ -130,6 +132,8 @@ class TaskStore:
                 connection.execute("ALTER TABLE tasks ADD COLUMN api_key_mask TEXT")
             if "upstream_task_id" not in columns:
                 connection.execute("ALTER TABLE tasks ADD COLUMN upstream_task_id TEXT")
+            if "draft_id" not in columns:
+                connection.execute("ALTER TABLE tasks ADD COLUMN draft_id TEXT")
             if "submission_status" not in columns:
                 connection.execute("ALTER TABLE tasks ADD COLUMN submission_status TEXT")
             if "submission_payload" not in columns:
@@ -344,6 +348,7 @@ class TaskStore:
         api_key_mask: str | None = None,
         account_id: str | None = None,
         advertiser_id: str | None = None,
+        draft_id: str | None = None,
     ) -> TaskRecord:
         now = int(time.time())
         record = TaskRecord(
@@ -362,6 +367,7 @@ class TaskStore:
             api_key_mask=api_key_mask,
             account_id=account_id,
             advertiser_id=advertiser_id,
+            draft_id=draft_id,
         )
         values = asdict(record)
         values["raw"] = None
@@ -372,12 +378,12 @@ class TaskStore:
                     id, api, model, prompt, seconds, size, ratio, resolution,
                     status, progress, created_at, updated_at, api_key_mask, account_id, advertiser_id, completed_at,
                     video_id, video_url, poster_url, error_code, error_message, raw,
-                    upstream_task_id, submission_status, submission_payload
+                    upstream_task_id, draft_id, submission_status, submission_payload
                 ) VALUES (
                     :id, :api, :model, :prompt, :seconds, :size, :ratio, :resolution,
                     :status, :progress, :created_at, :updated_at, :api_key_mask, :account_id, :advertiser_id, :completed_at,
                     :video_id, :video_url, :poster_url, :error_code, :error_message, :raw,
-                    :upstream_task_id, :submission_status, :submission_payload
+                    :upstream_task_id, :draft_id, :submission_status, :submission_payload
                 )
                 """,
                 values,
@@ -484,6 +490,7 @@ class TaskStore:
         upstream_task_id: str,
         account_id: str | None,
         advertiser_id: str | None,
+        draft_id: str | None = None,
     ) -> TaskRecord:
         now = int(time.time())
         with self._lock, self._connection() as connection:
@@ -491,11 +498,11 @@ class TaskStore:
                 """
                 UPDATE tasks
                 SET upstream_task_id = ?, submission_status = 'submitted',
-                    account_id = ?, advertiser_id = ?,
+                    account_id = ?, advertiser_id = ?, draft_id = ?,
                     updated_at = ?
                 WHERE id = ?
                 """,
-                (upstream_task_id, account_id, advertiser_id, now, task_id),
+                (upstream_task_id, account_id, advertiser_id, draft_id, now, task_id),
             )
         record = self.get(task_id)
         if record is None:
@@ -520,7 +527,7 @@ class TaskStore:
                 SET status = 'queued', progress = 0, completed_at = NULL,
                     video_id = NULL, video_url = NULL, poster_url = NULL,
                     error_code = NULL, error_message = NULL, raw = NULL,
-                    upstream_task_id = NULL, submission_status = 'queued',
+                    upstream_task_id = NULL, draft_id = NULL, submission_status = 'queued',
                     submission_payload = ?, account_id = NULL,
                     advertiser_id = NULL, updated_at = ?
                 WHERE id = ? AND upstream_task_id = ?
@@ -581,7 +588,13 @@ class TaskStore:
             ).fetchone()
         return self._decode(row) if row else None
 
-    def update(self, task_id: str, **changes: Any) -> TaskRecord:
+    def update(
+        self,
+        task_id: str,
+        *,
+        expected_upstream_task_id: str | None = None,
+        **changes: Any,
+    ) -> TaskRecord:
         allowed = {
             "status",
             "progress",
@@ -596,6 +609,7 @@ class TaskStore:
             "account_id",
             "advertiser_id",
             "upstream_task_id",
+            "draft_id",
             "submission_status",
             "submission_payload",
         }
@@ -621,11 +635,14 @@ class TaskStore:
         assignments = ", ".join(f"{name} = :{name}" for name in encoded)
         encoded["id"] = task_id
         encoded["expired_code"] = TASK_EXPIRED_CODE
+        predicate = "id = :id AND error_code IS NOT :expired_code"
+        if expected_upstream_task_id is not None:
+            predicate += " AND upstream_task_id = :expected_upstream_task_id"
+            encoded["expected_upstream_task_id"] = expected_upstream_task_id
         with self._lock, self._connection() as connection:
-            # A task can expire while an upstream status check is in progress.
+            # A task can expire or switch to another submission during a status check.
             connection.execute(
-                f"UPDATE tasks SET {assignments} "
-                "WHERE id = :id AND error_code IS NOT :expired_code",
+                f"UPDATE tasks SET {assignments} WHERE {predicate}",
                 encoded,
             )
         record = self.get(task_id)
@@ -679,7 +696,7 @@ class TaskStore:
                 "id, api, model, prompt, seconds, size, ratio, resolution, status, "
                 "progress, created_at, updated_at, api_key_mask, account_id, "
                 "advertiser_id, completed_at, video_id, video_url, poster_url, "
-                "error_code, error_message, NULL AS raw, upstream_task_id, "
+                "error_code, error_message, NULL AS raw, upstream_task_id, draft_id, "
                 "submission_status, NULL AS submission_payload, idempotency_key_hash"
             )
         params.extend([limit, offset])
@@ -912,8 +929,14 @@ class TaskStore:
                 """
                 SELECT * FROM tasks
                 WHERE status IN ('queued', 'running')
-                  AND submission_status = 'submitted'
-                  AND upstream_task_id IS NOT NULL
+                  AND (
+                    (submission_status = 'submitted' AND upstream_task_id IS NOT NULL)
+                    OR (
+                        submission_status IS NULL AND api = 'seedance'
+                        AND account_id IS NOT NULL AND advertiser_id IS NOT NULL
+                        AND id NOT GLOB 'browser_*'
+                    )
+                  )
                   AND created_at >= ? AND updated_at <= ?
                 ORDER BY updated_at, created_at, id
                 LIMIT ?

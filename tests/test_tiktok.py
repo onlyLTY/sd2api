@@ -2129,6 +2129,93 @@ async def test_refresh_uses_upstream_id_for_async_submission(
     assert refreshed.status == "running"
 
 
+@pytest.mark.asyncio
+async def test_submitted_draft_survives_restart_and_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sd2api.main as main
+
+    database = str(tmp_path / "draft-id.db")
+    settings = Settings(
+        sd2api_database=database,
+        sd2api_upload_dir=str(tmp_path / "uploads"),
+        tiktok_base_url="https://test.example",
+        tiktok_cookie="sessionid=test",
+    )
+    task_store = TaskStore(database)
+    legacy = task_store.create(
+        task_id="legacy-task",
+        api="seedance",
+        model="seedance-2.0",
+        prompt="Existing task",
+        seconds=5,
+    )
+    # Model a pre-migration database containing an existing task.
+    with sqlite3.connect(database) as connection:
+        connection.execute("ALTER TABLE tasks DROP COLUMN draft_id")
+    task_store = TaskStore(database)
+    migrated = task_store.get(legacy.id)
+    assert migrated is not None and migrated.draft_id is None
+    task_store.create_submission(
+        task_id="video_local",
+        model="seedance-2.0",
+        prompt="A red ball",
+        seconds=5,
+        size="720x1280",
+        api_key_mask=None,
+        idempotency_key_hash=None,
+        payload={"mode": "text", "media": []},
+    )
+    requested_drafts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(
+                200, json={"code": 0, "data": {
+                    "task_id": "submitted-id", "draft_infos": [{"id": "draft-id"}],
+                }},
+            )
+        assert request.url.path.endswith("/history/task/detail")
+        requested_drafts.append(request.url.params["draftId"])
+        return httpx.Response(
+            200, json={"code": 0, "data": {
+                "id": "draft-id", "taskId": "submitted-id",
+                "draftTaskStatus": 2, "renderTaskStatus": 2,
+            }},
+        )
+
+    fake = TikTokClient(settings, transport=httpx.MockTransport(handler))
+    dispatcher = VideoSubmissionDispatcher(
+        store=task_store,
+        uploads=UploadManager(settings),
+        client=fake,
+        concurrency=1,
+        audit=lambda *args, **kwargs: None,
+    )
+    await dispatcher._submit("video_local")
+    reopened = TaskStore(database)
+    record = reopened.get("video_local")
+    assert record is not None
+    assert record.submission_status == "submitted", record.error_message
+    assert (record.upstream_task_id, record.draft_id) == ("submitted-id", "draft-id")
+    monkeypatch.setattr(main, "store", reopened)
+    monkeypatch.setattr(main, "client", fake)
+
+    result = await main.refresh(record)
+    assert requested_drafts == ["draft-id"]
+    assert (result.status, result.draft_id) == ("running", "draft-id")
+    retried = reopened.retry_submitted_task(
+        record.id, expected_upstream_task_id="submitted-id",
+        payload={"mode": "text", "media": []},
+    )
+    assert retried is not None and retried.draft_id is None
+    after_stale_write = reopened.update(
+        record.id, expected_upstream_task_id="submitted-id",
+        status="succeeded", draft_id="old-draft",
+    )
+    assert (after_stale_write.status, after_stale_write.draft_id) == ("queued", None)
+
+
 def test_video_routes_accept_local_and_upstream_task_ids(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2505,6 +2592,162 @@ async def test_protocol_status_two_is_running_until_zero_with_vid() -> None:
 
 
 @pytest.mark.asyncio
+async def test_protocol_task_check_discovers_draft_by_exact_history_task_alias() -> None:
+    advertiser_id = "123456789012"
+    video_url = "https://example.com/generated.mp4"
+    matched = {
+        "id": "draft-matched",
+        "taskId": "foundry-matched",
+        "AIOId": advertiser_id,
+        "draftTaskStatus": 2,
+        "renderTaskStatus": 2,
+        "vid": "",
+        "extra": json.dumps(
+            {
+                "vg_async_task": {
+                    "async_task_id": "submit-matched",
+                    "foundry_task_id": "foundry-matched",
+                    "generation": {"status": "RUNNING"},
+                }
+            }
+        ),
+    }
+    other_task = {
+        **matched,
+        "id": "draft-other-task",
+        "taskId": "submit-matched-suffix",
+        "draftTaskStatus": 3,
+        "renderTaskStatus": 3,
+        "extra": json.dumps(
+            {"vg_async_task": {"async_task_id": "prefix-submit-matched"}}
+        ),
+    }
+    other_advertiser = {
+        **matched,
+        "id": "draft-other-advertiser",
+        "AIOId": "987654321098",
+        "draftTaskStatus": 3,
+        "renderTaskStatus": 3,
+    }
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        requests.append(path)
+        if path.endswith("/generate-task/check"):
+            assert request.method == "POST"
+            assert json.loads(request.content) == {"taskId": "submit-matched"}
+            return httpx.Response(200, json={"code": 0, "data": {"draft_infos": []}})
+        if path.endswith("/history/tasks"):
+            assert request.method == "POST"
+            assert json.loads(request.content) == {"pageOffset": 0, "pageLimit": 50}
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "draft_infos": [other_task, other_advertiser, matched],
+                        "pageOffset": 0,
+                        "pageLimit": 50,
+                        "total": 3,
+                    },
+                },
+            )
+        assert path.endswith("/history/task/detail")
+        assert request.method == "GET"
+        assert request.url.params["draftId"] == "draft-matched"
+        return httpx.Response(
+            200,
+            json={
+                "code": 0,
+                "data": {
+                    **matched,
+                    "draftTaskStatus": 0,
+                    "renderTaskStatus": 0,
+                    "vid": "video-matched",
+                    "MainUrl": video_url,
+                    "extra": json.dumps(
+                        {
+                            "vg_async_task": {
+                                "async_task_id": "submit-matched",
+                                "foundry_task_id": "foundry-matched",
+                                "generation": {"status": "SUCCEEDED"},
+                            }
+                        }
+                    ),
+                },
+            },
+        )
+
+    client = ProtocolTikTokClient(
+        Settings(),
+        protocol_session(),
+        account_id="account-a",
+        advertiser_id=advertiser_id,
+        transport=httpx.MockTransport(handler),
+    )
+    result = await client.check_task("submit-matched")
+    await client.close()
+
+    assert [path.removeprefix("/creative_bff_i18n/api/cue") for path in requests] == [
+        "/generate-task/check",
+        "/history/tasks",
+        "/history/task/detail",
+    ]
+    assert result.id == "submit-matched"
+    assert result.draft_id == "draft-matched"
+    assert result.status == "succeeded"
+    assert result.video_url == video_url
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("returned_draft", "returned_task"),
+    [
+        ("draft-different", "submit-matched"),
+        ("draft-matched", "submit-different"),
+    ],
+    ids=["different-draft", "different-task"],
+)
+async def test_protocol_task_check_rejects_mismatched_detail(
+    returned_draft: str, returned_task: str
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/history/task/detail"):
+            assert request.url.params["draftId"] == "draft-matched"
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "id": returned_draft,
+                        "taskId": returned_task,
+                        "AIOId": "123456789012",
+                        "draftTaskStatus": 0,
+                        "renderTaskStatus": 0,
+                        "vid": "video-different",
+                        "MainUrl": "https://example.com/unrelated.mp4",
+                    },
+                },
+            )
+        assert request.url.path.endswith(("/generate-task/check", "/history/tasks"))
+        return httpx.Response(200, json={"code": 0, "data": {"draft_infos": []}})
+
+    client = ProtocolTikTokClient(
+        Settings(),
+        protocol_session(),
+        account_id="account-a",
+        advertiser_id="123456789012",
+        transport=httpx.MockTransport(handler),
+    )
+    result = await client.check_task("submit-matched", draft_id="draft-matched")
+    await client.close()
+
+    assert result.status == "queued"
+    assert result.video_url is None
+
+
+@pytest.mark.asyncio
 async def test_protocol_task_check_retries_http_5xx_three_times(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2513,6 +2756,9 @@ async def test_protocol_task_check_retries_http_5xx_three_times(
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal calls
+        if request.url.path.endswith("/history/tasks"):
+            return httpx.Response(200, json={"code": 0, "data": {"draft_infos": []}})
+        assert request.url.path.endswith("/generate-task/check")
         calls += 1
         if calls <= 3:
             return httpx.Response(502, json={})
@@ -2755,6 +3001,9 @@ async def test_protocol_task_check_retries_transport_error_without_exposing_ssl(
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal calls
+        if request.url.path.endswith("/history/tasks"):
+            return httpx.Response(200, json={"code": 0, "data": {"draft_infos": []}})
+        assert request.url.path.endswith("/generate-task/check")
         calls += 1
         if calls <= 3:
             raise httpx.ConnectError("SSL handshake failed", request=request)
@@ -3727,9 +3976,44 @@ async def test_protocol_fast_reference_request_allows_empty_media() -> None:
     captured: dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path.endswith("/i2v/gen_r2v_video")
-        captured.update(json.loads(request.content))
-        return httpx.Response(200, json={"code": 0, "data": {"taskId": "fast-task"}})
+        if request.url.path.endswith("/i2v/gen_r2v_video"):
+            assert request.method == "POST"
+            captured.update(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "task_id": "fast-task",
+                        "draft_infos": [{"id": "fast-draft"}],
+                    },
+                },
+            )
+        assert request.url.path.endswith("/history/task/detail")
+        assert request.method == "GET"
+        assert request.url.params["draftId"] == "fast-draft"
+        return httpx.Response(
+            200,
+            json={
+                "code": 0,
+                "data": {
+                    "id": "fast-draft",
+                    "taskId": "fast-foundry-task",
+                    "AIOId": "123456789012",
+                    "draftTaskStatus": 2,
+                    "renderTaskStatus": 2,
+                    "vid": "",
+                    "extra": json.dumps(
+                        {
+                            "vg_async_task": {
+                                "async_task_id": "fast-task",
+                                "foundry_task_id": "fast-foundry-task",
+                            }
+                        }
+                    ),
+                },
+            },
+        )
 
     client = ProtocolTikTokClient(
         Settings(),
@@ -3745,9 +4029,16 @@ async def test_protocol_fast_reference_request_allows_empty_media() -> None:
         duration=5,
         media=[],
     )
+    draft_id = client.take_created_draft_id(task_id)
+    assert client.take_created_draft_id(task_id) is None
+    result = await client.check_task(task_id, draft_id=draft_id)
     await client.close()
 
     assert task_id == "fast-task"
+    assert draft_id == "fast-draft"
+    assert result.id == task_id
+    assert result.draft_id == draft_id
+    assert result.status == "running"
     assert captured["model"] == "2000012"
     assert captured["images"] == []
     assert captured["mentions"] == []
