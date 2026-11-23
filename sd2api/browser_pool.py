@@ -44,6 +44,7 @@ class BrowserPoolClient:
         self._started_accounts: set[str] = set()
         self._task_accounts: dict[str, str] = {}
         self._task_advertisers: dict[str, str] = {}
+        self._created_drafts: dict[str, str] = {}
         self._scheduler_lock = asyncio.Lock()
         self._last_selected: dict[str, int] = {}
         self._selection_counter = 0
@@ -2190,6 +2191,10 @@ class BrowserPoolClient:
                     ] = self._selection_counter
                     self._task_accounts[task_id] = account_id
                     self._task_advertisers[task_id] = advertiser_id
+                    if isinstance(target, ProtocolTikTokClient) and (
+                        draft_id := target.take_created_draft_id(task_id)
+                    ):
+                        self._created_drafts[task_id] = draft_id
                     cleared_model_limit = self.store.clear_subaccount_model_limit(
                         account_id, advertiser_id, self._model_key(model)
                     )
@@ -2255,6 +2260,9 @@ class BrowserPoolClient:
     def advertiser_for_task(self, task_id: str) -> str | None:
         return self._task_advertisers.get(task_id)
 
+    def take_created_draft_id(self, task_id: str) -> str | None:
+        return self._created_drafts.pop(task_id, None)
+
     async def check_task(self, task_id: str) -> UpstreamTask:
         record = self.store.get(task_id) or self.store.get_by_upstream_task_id(
             task_id
@@ -2287,7 +2295,12 @@ class BrowserPoolClient:
                 task = await worker.check_task(upstream_task_id)
             elif account and account.get("session_available"):
                 protocol_client = self._protocol_client(account_id, advertiser_id)
-                task = await protocol_client.check_task(upstream_task_id)
+                if record and record.draft_id:
+                    task = await protocol_client.check_task(
+                        upstream_task_id, draft_id=record.draft_id
+                    )
+                else:
+                    task = await protocol_client.check_task(upstream_task_id)
             else:
                 raise TikTokUpstreamError(
                     "The protocol session is temporarily unavailable while checking "

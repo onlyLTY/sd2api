@@ -14,16 +14,26 @@ from urllib.parse import parse_qs, urlparse
 from playwright.async_api import (
     BrowserContext,
     Frame,
+    Locator,
     Page,
     Playwright,
+    Response,
     TimeoutError as PlaywrightTimeoutError,
     async_playwright,
 )
 
 from .config import Settings
 from .models import UpstreamTask
-from .tiktok import I2V_MODELS, R2V_MODELS, T2V_MODELS, TikTokUpstreamError
+from .protocol import I2V_CREATE_PATH, R2V_CREATE_PATH, T2V_CREATE_PATH
 from .temp_mail import TempMailClient, TempMailError
+from .tiktok import (
+    I2V_MODELS,
+    R2V_MODELS,
+    T2V_MODELS,
+    TikTokUpstreamError,
+    _created_task_ids,
+    _first,
+)
 from .uploads import StagedMedia
 
 
@@ -89,6 +99,7 @@ class BrowserJob:
     mode: Literal["text", "image", "reference"] = "text"
     media: tuple[StagedMedia, ...] = ()
     advertiser_id: str | None = None
+    draft_id: str | None = None
 
 
 class BrowserTikTokClient:
@@ -1380,6 +1391,7 @@ class BrowserTikTokClient:
                     id=job.id,
                     status="failed",
                     progress=100,
+                    draft_id=job.draft_id,
                     error_code="browser_automation_error",
                     error_message=f"{exc.__class__.__name__}: {exc}",
                 )
@@ -1431,8 +1443,66 @@ class BrowserTikTokClient:
             await page.wait_for_timeout(1_000)
         if await submit.is_disabled():
             raise RuntimeError("TikTok generate button is disabled")
-        await submit.click()
+        await self._submit_and_wait(page, submit, job, previous_sources)
 
+    async def _submit_and_wait(
+        self, page: Page, submit: Locator, job: BrowserJob, previous_sources: set[str]
+    ) -> None:
+        create_path = {
+            "text": T2V_CREATE_PATH,
+            "image": I2V_CREATE_PATH,
+            "reference": R2V_CREATE_PATH,
+        }[job.mode]
+        capture: asyncio.Task[None] | None = None
+
+        async def capture_draft(response: Response) -> None:
+            try:
+                payload = await response.json()
+                if not isinstance(payload, dict):
+                    return
+                code = _first(payload, ("code", "status_code", "statusCode"))
+                if code not in (None, 0, "0", 200, "200"):
+                    return
+                _, draft_id = _created_task_ids(payload)
+            except Exception:
+                # Draft capture must not affect the browser's generation flow.
+                return
+            if draft_id is not None:
+                job.draft_id = draft_id
+                self._tasks[job.id].draft_id = draft_id
+
+        def observe_response(response: Response) -> None:
+            nonlocal capture
+            if job.draft_id is not None or (capture is not None and not capture.done()):
+                return
+            url = urlparse(response.url)
+            if (
+                url.hostname != "ads.tiktok.com"
+                or url.path != create_path
+                or response.request.method != "POST"
+                or not response.ok
+            ):
+                return
+            try:
+                request = response.request.post_data_json
+            except Exception:
+                return
+            if isinstance(request, dict) and request.get("prompt") == job.prompt:
+                capture = asyncio.create_task(capture_draft(response))
+
+        page.on("response", observe_response)
+        try:
+            await submit.click()
+            await self._wait_for_job_result(page, job, previous_sources)
+        finally:
+            page.remove_listener("response", observe_response)
+            if capture is not None:
+                capture.cancel()
+                await asyncio.gather(capture, return_exceptions=True)
+
+    async def _wait_for_job_result(
+        self, page: Page, job: BrowserJob, previous_sources: set[str]
+    ) -> None:
         started = time.monotonic()
         deadline = started + self.settings.sd2api_browser_max_wait
         while time.monotonic() < deadline:
@@ -1444,17 +1514,19 @@ class BrowserTikTokClient:
             if new_sources:
                 source = new_sources[0]
                 poster = await self._poster_for_source(page, source)
+                credits = await self._visible_credits(page)
                 self._tasks[job.id] = UpstreamTask(
                     id=job.id,
                     status="succeeded",
                     progress=100,
+                    draft_id=job.draft_id,
                     video_url=source,
                     poster_url=poster,
                     raw={
                         "backend": "browser",
                         "account_id": self.account_id,
                         "advertiser_id": job.advertiser_id,
-                        "credits": await self._visible_credits(page),
+                        "credits": credits,
                         "elapsed_seconds": int(time.monotonic() - started),
                     },
                 )
@@ -1467,6 +1539,7 @@ class BrowserTikTokClient:
                     id=job.id,
                     status="failed",
                     progress=100,
+                    draft_id=job.draft_id,
                     error_code="tiktok_generation_failed",
                     error_message=message,
                 )
@@ -1482,12 +1555,15 @@ class BrowserTikTokClient:
                     if match:
                         progress = min(99, int(match.group(1)))
                         break
-            self._tasks[job.id] = UpstreamTask(id=job.id, status="running", progress=progress)
+            self._tasks[job.id] = UpstreamTask(
+                id=job.id, status="running", progress=progress, draft_id=job.draft_id
+            )
 
         self._tasks[job.id] = UpstreamTask(
             id=job.id,
             status="failed",
             progress=100,
+            draft_id=job.draft_id,
             error_code="browser_timeout",
             error_message=f"TikTok did not finish within {self.settings.sd2api_browser_max_wait} seconds",
         )

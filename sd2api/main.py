@@ -498,7 +498,11 @@ async def refresh(record: TaskRecord, *, force: bool = False) -> TaskRecord:
     if record.submission_status in {"queued", "submitting"}:
         return record
     try:
-        upstream = await client.check_task(record.upstream_task_id or record.id)
+        upstream_id = record.upstream_task_id or record.id
+        if record.draft_id and isinstance(client, TikTokClient):
+            upstream = await client.check_task(upstream_id, draft_id=record.draft_id)
+        else:
+            upstream = await client.check_task(upstream_id)
     except TikTokUpstreamError as exc:
         if (
             is_tiktok_authentication_error(exc)
@@ -569,6 +573,7 @@ async def refresh(record: TaskRecord, *, force: bool = False) -> TaskRecord:
                     return current
             failed = store.update(
                 record.id,
+                expected_upstream_task_id=record.upstream_task_id,
                 status="failed",
                 progress=100,
                 error_code="browser_task_lost",
@@ -709,8 +714,12 @@ async def refresh(record: TaskRecord, *, force: bool = False) -> TaskRecord:
     }
     if upstream.status in {"succeeded", "failed"}:
         changes["submission_payload"] = None
-    updated = store.update(record.id, **changes)
-    if upstream.status in {"succeeded", "failed"}:
+    if upstream.draft_id:
+        changes["draft_id"] = upstream.draft_id
+    updated = store.update(
+        record.id, expected_upstream_task_id=record.upstream_task_id, **changes
+    )
+    if updated.status in {"succeeded", "failed"}:
         cleanup_submission_payload(record.submission_payload)
     if updated.status != record.status:
         if updated.status == "succeeded":
@@ -1611,6 +1620,11 @@ async def create_seedance_video(
         advertiser_id=(
             client.advertiser_for_task(task_id)
             if isinstance(client, BrowserPoolClient)
+            else None
+        ),
+        draft_id=(
+            client.take_created_draft_id(task_id)
+            if isinstance(client, (BrowserPoolClient, TikTokClient))
             else None
         ),
     )

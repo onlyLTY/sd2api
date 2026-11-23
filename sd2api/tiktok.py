@@ -43,6 +43,7 @@ R2V_MODELS: dict[str, str] = {
 }
 
 REFERENCE_ONLY_MODELS = frozenset(R2V_MODELS).difference(T2V_MODELS)
+DRAFT_DETAIL_PATH = "/creative_bff_i18n/api/cue/history/task/detail"
 
 MODEL_PERMISSION_CODES = {"10001100"}
 AUTHENTICATION_ERROR_CODES = {
@@ -226,6 +227,50 @@ def _deep_find(value: Any, names: set[str]) -> Any:
     return None
 
 
+def _identifier(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    return None
+
+
+def _draft_id(draft: dict[str, Any]) -> str | None:
+    return _identifier(_first(draft, ("id", "draftId", "draft_id")))
+
+
+def _draft_task_ids(draft: dict[str, Any]) -> set[str]:
+    ids = [_first(draft, ("taskId", "task_id", "TaskId"))]
+    extra = draft.get("extra")
+    if isinstance(extra, str):
+        try:
+            extra = json.loads(extra)
+        except ValueError:
+            extra = None
+    generation = extra.get("vg_async_task") if isinstance(extra, dict) else None
+    if isinstance(generation, dict):
+        ids.extend((generation.get("async_task_id"), generation.get("foundry_task_id")))
+    return {result for value in ids if (result := _identifier(value)) is not None}
+
+
+def _created_task_ids(payload: dict[str, Any]) -> tuple[str, str | None]:
+    task_keys = ("task_id", "taskId", "TaskId")
+    data = payload.get("data")
+    task_id = _identifier(_first(data, task_keys)) if isinstance(data, dict) else None
+    if task_id is None:
+        task_id = _identifier(_first(payload, task_keys)) or _identifier(
+            _deep_find(payload, set(task_keys))
+        )
+    if task_id is None:
+        task_id = _identifier(data)
+    if task_id is None:
+        raise TikTokUpstreamError("TikTok accepted the request but did not return a task ID")
+
+    drafts = _deep_find(payload, {"draft_infos", "draftInfos"})
+    draft = drafts[0] if isinstance(drafts, list) and drafts else None
+    return task_id, _draft_id(draft) if isinstance(draft, dict) else None
+
+
 class TikTokClient:
     create_path = "/creative_bff_i18n/api/cue/t2v/create_generate_task"
     check_path = "/creative_bff_i18n/api/cue/generate-task/check"
@@ -238,6 +283,10 @@ class TikTokClient:
     def __init__(self, settings: Settings, transport: httpx.AsyncBaseTransport | None = None) -> None:
         self.settings = settings
         self.transport = transport
+        self._created_draft_ids: dict[str, str] = {}
+
+    def take_created_draft_id(self, task_id: str) -> str | None:
+        return self._created_draft_ids.pop(task_id, None)
 
     @property
     def params(self) -> dict[str, str]:
@@ -312,7 +361,7 @@ class TikTokClient:
                 f"TikTok returned HTTP {response.status_code}",
                 status_code=502,
                 code="tiktok_http_error",
-            )
+            ).with_context(http_status=response.status_code)
         try:
             payload = response.json()
         except ValueError as exc:
@@ -355,16 +404,31 @@ class TikTokClient:
                 "settings": json.dumps(settings, ensure_ascii=False, separators=(",", ":")),
             },
         )
-        task_id = _deep_find(payload, {"taskId", "task_id", "TaskId"})
-        if task_id is None:
-            data = payload.get("data")
-            if isinstance(data, (str, int)):
-                task_id = data
-        if task_id is None:
-            raise TikTokUpstreamError("TikTok accepted the request but did not return a task ID")
-        return str(task_id)
+        task_id, draft_id = _created_task_ids(payload)
+        if draft_id is not None:
+            self._created_draft_ids[task_id] = draft_id
+        return task_id
 
-    async def check_task(self, task_id: str) -> UpstreamTask:
+    async def check_task(self, task_id: str, *, draft_id: str | None = None) -> UpstreamTask:
+        if draft_id is not None:
+            try:
+                detail = await self._request(
+                    "GET", DRAFT_DETAIL_PATH, params={"draftId": draft_id}
+                )
+            except TikTokUpstreamError as exc:
+                if is_tiktok_authentication_error(exc) or (
+                    exc.code != "10001001" and exc.context.get("http_status") != 404
+                ):
+                    raise
+            else:
+                draft = detail.get("data")
+                if isinstance(draft, dict) and _draft_id(draft) == draft_id:
+                    task_ids = _draft_task_ids(draft)
+                    if not task_ids or task_id in task_ids:
+                        return await self._task_from_draft(
+                            task_id, draft, detail, draft_id=draft_id
+                        )
+
         payload = await self._request("POST", self.check_path, json={"taskId": task_id})
         drafts = _deep_find(payload, {"draft_infos", "draftInfos"})
         if not isinstance(drafts, list) or not drafts:
@@ -374,14 +438,28 @@ class TikTokClient:
             (
                 item
                 for item in drafts
-                if isinstance(item, dict)
-                and str(_first(item, ("taskId", "task_id")) or task_id) == task_id
+                if isinstance(item, dict) and task_id in _draft_task_ids(item)
             ),
             drafts[0],
         )
         if not isinstance(draft, dict):
             raise TikTokUpstreamError("TikTok returned an invalid task record")
 
+        return await self._task_from_draft(
+            task_id,
+            draft,
+            payload,
+            draft_id=_draft_id(draft) if task_id in _draft_task_ids(draft) else None,
+        )
+
+    async def _task_from_draft(
+        self,
+        task_id: str,
+        draft: dict[str, Any],
+        payload: dict[str, Any],
+        *,
+        draft_id: str | None,
+    ) -> UpstreamTask:
         draft_status = _first(draft, ("draftTaskStatus", "draft_task_status"))
         render_status = _first(draft, ("renderTaskStatus", "render_task_status"))
         video_id = _first(draft, ("vid", "videoId", "video_id", "watermarkVid"))
@@ -417,6 +495,7 @@ class TikTokClient:
             id=task_id,
             status=status,
             progress=progress,
+            draft_id=draft_id,
             video_id=str(video_id) if video_id is not None else None,
             video_url=video_url,
             poster_url=poster_url,
