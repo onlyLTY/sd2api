@@ -37,7 +37,7 @@ from .models import (
     SubaccountUpdateRequest,
     VideoURLContent,
 )
-from .store import TaskRecord, TaskStore
+from .store import TASK_EXPIRED_CODE, TaskRecord, TaskStore
 from .submissions import VideoSubmissionDispatcher
 from .tiktok import (
     REFERENCE_ONLY_MODELS,
@@ -485,7 +485,7 @@ def cleanup_submission_payload(payload: dict[str, Any] | None) -> None:
 
 
 async def refresh(record: TaskRecord, *, force: bool = False) -> TaskRecord:
-    if record.submission_status == "failed":
+    if record.submission_status == "failed" or record.error_code == TASK_EXPIRED_CODE:
         return record
     if (
         not force
@@ -590,7 +590,7 @@ async def refresh(record: TaskRecord, *, force: bool = False) -> TaskRecord:
             task_id=record.id,
             details={"error_code": exc.code},
         )
-        return record
+        return store.get(record.id) or record
     if (
         upstream.status == "failed"
         and is_tiktok_resource_unavailable(

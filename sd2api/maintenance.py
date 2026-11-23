@@ -5,7 +5,7 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from .store import ExpiredTask, TaskRecord, TaskStore
+from .store import TASK_EXPIRED_CODE, ExpiredTask, TaskRecord, TaskStore
 from .uploads import StagedMedia, UploadManager
 
 
@@ -47,7 +47,7 @@ class TaskMaintenance:
         timestamp = int(time.time()) if now is None else now
         expired = self.store.expire_active_tasks(
             created_before=timestamp - self.expiry_seconds,
-            error_code="task_expired",
+            error_code=TASK_EXPIRED_CODE,
             error_message=(
                 f"Task did not reach a terminal state within {self.expiry_seconds} seconds"
             ),

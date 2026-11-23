@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import Any
 
 
+TASK_EXPIRED_CODE = "task_expired"
+
+
 @dataclass(slots=True)
 class TaskRecord:
     id: str
@@ -522,8 +525,15 @@ class TaskStore:
                     advertiser_id = NULL, updated_at = ?
                 WHERE id = ? AND upstream_task_id = ?
                     AND submission_status = 'submitted'
+                    AND error_code IS NOT ?
                 """,
-                (encoded_payload, now, task_id, expected_upstream_task_id),
+                (
+                    encoded_payload,
+                    now,
+                    task_id,
+                    expected_upstream_task_id,
+                    TASK_EXPIRED_CODE,
+                ),
             )
         if result.rowcount == 0:
             return None
@@ -610,8 +620,14 @@ class TaskStore:
             )
         assignments = ", ".join(f"{name} = :{name}" for name in encoded)
         encoded["id"] = task_id
+        encoded["expired_code"] = TASK_EXPIRED_CODE
         with self._lock, self._connection() as connection:
-            connection.execute(f"UPDATE tasks SET {assignments} WHERE id = :id", encoded)
+            # A task can expire while an upstream status check is in progress.
+            connection.execute(
+                f"UPDATE tasks SET {assignments} "
+                "WHERE id = :id AND error_code IS NOT :expired_code",
+                encoded,
+            )
         record = self.get(task_id)
         if record is None:
             raise KeyError(task_id)
