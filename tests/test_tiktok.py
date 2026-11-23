@@ -6882,6 +6882,112 @@ async def test_task_maintenance_expires_three_day_tasks_and_cleans_media(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("force", [False, True], ids=["cached", "forced"])
+@pytest.mark.parametrize(
+    "expire_during_check", [False, True], ids=["already-expired", "expires-during-check"]
+)
+async def test_refresh_preserves_expired_submitted_task(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    force: bool,
+    expire_during_check: bool,
+) -> None:
+    import sd2api.main as main
+
+    task_store = TaskStore(str(tmp_path / "expired-status.db"))
+    task = task_store.create_submission(
+        task_id="video_expired",
+        model="seedance-2.0",
+        prompt="test",
+        seconds=5,
+        size="720x1280",
+        api_key_mask=None,
+        idempotency_key_hash=None,
+        payload={"mode": "text", "media": []},
+    )
+    submitted = task_store.complete_submission(
+        task.id,
+        upstream_task_id="upstream_expired",
+        account_id="account-a",
+        advertiser_id="sub-a",
+    )
+    expiry = 3 * 24 * 60 * 60
+    maintenance = TaskMaintenance(
+        store=task_store,
+        uploads=UploadManager(Settings(sd2api_upload_dir=str(tmp_path / "uploads"))),
+        refresh=main.refresh,
+        audit=lambda *args, **kwargs: None,
+        expiry_seconds=expiry,
+        reconcile_interval=60,
+        reconcile_concurrency=4,
+    )
+    checked: list[str] = []
+
+    class FakeClient:
+        async def check_task(self, task_id: str) -> UpstreamTask:
+            checked.append(task_id)
+            if expire_during_check:
+                maintenance.expire_tasks(now=task.created_at + expiry + 1)
+            return UpstreamTask(
+                id=task_id, status="queued", progress=0, raw={"draftInfos": []}
+            )
+
+    monkeypatch.setattr(main, "store", task_store)
+    monkeypatch.setattr(main, "client", FakeClient())
+
+    if not expire_during_check:
+        maintenance.expire_tasks(now=task.created_at + expiry + 1)
+        record = task_store.get(task.id)
+        assert record is not None
+    else:
+        record = submitted
+
+    refreshed = await main.refresh(record, force=force)
+
+    assert checked == (["upstream_expired"] if expire_during_check else [])
+    assert refreshed.status == "failed"
+    assert refreshed.error_code == "task_expired"
+    assert refreshed.progress == 100
+    assert refreshed.completed_at is not None
+    assert task_store.get(task.id) == refreshed
+
+
+def test_retry_submitted_task_preserves_expiry(tmp_path: Path) -> None:
+    task_store = TaskStore(str(tmp_path / "expired-retry.db"))
+    payload = {"mode": "text", "media": []}
+    task = task_store.create_submission(
+        task_id="video_expired",
+        model="seedance-2.0",
+        prompt="test",
+        seconds=5,
+        size="720x1280",
+        api_key_mask=None,
+        idempotency_key_hash=None,
+        payload=payload,
+    )
+    task_store.complete_submission(
+        task.id,
+        upstream_task_id="upstream_expired",
+        account_id="account-a",
+        advertiser_id="sub-a",
+    )
+    task_store.expire_active_tasks(
+        created_before=task.created_at + 1,
+        error_code="task_expired",
+        error_message="Task expired",
+    )
+    expired = task_store.get(task.id)
+    assert expired is not None
+    assert expired.status == "failed"
+    assert expired.error_code == "task_expired"
+
+    assert task_store.retry_submitted_task(
+        task.id, expected_upstream_task_id="upstream_expired", payload=payload
+    ) is None
+    assert task_store.get(task.id) == expired
+
+
+@pytest.mark.asyncio
 async def test_task_maintenance_reconciles_recent_submitted_tasks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
