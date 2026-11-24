@@ -13,7 +13,7 @@ from .config import Settings
 from .models import UpstreamTask
 from .protocol import ProtocolSession, ProtocolTikTokClient
 from .security import CredentialError, CredentialVault
-from .store import TaskStore
+from .store import TaskRecord, TaskStore
 from .temp_mail import TempMailClient
 from .tiktok import (
     TikTokUpstreamError,
@@ -683,14 +683,23 @@ class BrowserPoolClient:
         timestamp = time.time() if now is None else now
         return ((int(timestamp) // 86400) + 1) * 86400
 
-    def _is_daily_quota_error(self, exc: TikTokUpstreamError) -> bool:
+    def _is_daily_quota_code(self, code: str | None) -> bool:
         known_codes = {"10040104", "10044200"}
         configured_codes = {
             item.strip()
             for item in self.settings.sd2api_pool_daily_quota_codes.split(",")
             if item.strip()
         }
-        if exc.code in known_codes or exc.code in configured_codes:
+        return code in known_codes or code in configured_codes
+
+    def is_terminal_daily_quota_error(
+        self, code: str | None, message: str | None
+    ) -> bool:
+        reason = (message or "").strip().lower().partition(":")[0].rstrip()
+        return code == "10040104" or reason == "user generation day limit"
+
+    def _is_daily_quota_error(self, exc: TikTokUpstreamError) -> bool:
+        if self._is_daily_quota_code(exc.code):
             return True
         text = f"{exc.code} {exc}".lower()
         markers = (
@@ -712,6 +721,58 @@ class BrowserPoolClient:
             "生成额度",
         )
         return any(marker in text for marker in markers)
+
+    def _block_daily_quota(
+        self, account_id: str, advertiser_id: str, model: str, reason: str
+    ) -> int:
+        now = int(time.time())
+        blocked_until = self._next_utc_day_start(now)
+        self.store.update_subaccount_model_limit(
+            account_id,
+            advertiser_id,
+            self._model_key(model),
+            quota_blocked_until=blocked_until,
+            quota_reason=reason,
+            quota_updated_at=now,
+        )
+        try:
+            self.store.update_subaccount(account_id, advertiser_id, last_error=reason)
+        except KeyError:
+            # A removed subaccount cannot be selected for the retry.
+            pass
+        return blocked_until
+
+    async def retry_task_after_daily_quota(
+        self, record: TaskRecord, *, reason: str, max_retries: int
+    ) -> TaskRecord | None:
+        async with self._scheduler_lock:
+            current = self.store.get(record.id)
+            if (
+                current is None
+                or current.status not in {"queued", "running"}
+                or current.submission_status != "submitted"
+                or current.upstream_task_id != record.upstream_task_id
+                or not current.upstream_task_id
+                or not current.account_id
+                or not current.advertiser_id
+            ):
+                return None
+            # Set the limit before waking the dispatcher, under its scheduling lock.
+            self._block_daily_quota(
+                current.account_id, current.advertiser_id, current.model, reason
+            )
+            if current.submission_payload is None:
+                return None
+            payload = dict(current.submission_payload)
+            retry_count = int(payload.get("terminal_daily_quota_retries") or 0)
+            if retry_count >= max_retries:
+                return None
+            payload["terminal_daily_quota_retries"] = retry_count + 1
+            return self.store.retry_submitted_task(
+                current.id,
+                expected_upstream_task_id=current.upstream_task_id,
+                payload=payload,
+            )
 
     @staticmethod
     def _is_credit_account_frozen(exc: TikTokUpstreamError) -> bool:
@@ -2120,19 +2181,8 @@ class BrowserPoolClient:
                             event_message = "Subaccount credit account frozen and disabled"
                         elif self._is_daily_quota_error(exc):
                             quota_failures += 1
-                            blocked_until = self._next_utc_day_start()
-                            self.store.update_subaccount_model_limit(
-                                account_id,
-                                advertiser_id,
-                                self._model_key(model),
-                                quota_blocked_until=blocked_until,
-                                quota_reason=str(exc),
-                                quota_updated_at=int(time.time()),
-                            )
-                            self.store.update_subaccount(
-                                account_id,
-                                advertiser_id,
-                                last_error=str(exc),
+                            blocked_until = self._block_daily_quota(
+                                account_id, advertiser_id, model, str(exc)
                             )
                             event_message = "Subaccount model daily quota exhausted"
                         else:
