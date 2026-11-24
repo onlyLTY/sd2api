@@ -56,6 +56,7 @@ from . import __version__
 
 logger = logging.getLogger("sd2api")
 TERMINAL_RPM_MAX_RETRIES = 2
+TERMINAL_DAILY_QUOTA_MAX_RETRIES = 2
 TERMINAL_RESOURCE_UNAVAILABLE_MAX_RETRIES = 3
 BROWSER_TASK_RECOVERY_MAX_RETRIES = 3
 store = TaskStore(settings.sd2api_database)
@@ -488,6 +489,12 @@ async def refresh(record: TaskRecord, *, force: bool = False) -> TaskRecord:
     if record.submission_status == "failed" or record.error_code == TASK_EXPIRED_CODE:
         return record
     if (
+        record.status == "failed"
+        and isinstance(client, BrowserPoolClient)
+        and client.is_terminal_daily_quota_error(record.error_code, record.error_message)
+    ):
+        return record
+    if (
         not force
         and record.status == "failed"
         and record.error_code == UPSTREAM_UNAVAILABLE_CODE
@@ -655,6 +662,45 @@ async def refresh(record: TaskRecord, *, force: bool = False) -> TaskRecord:
 
     if (
         upstream.status == "failed"
+        and record.status in {"queued", "running"}
+        and isinstance(client, BrowserPoolClient)
+        and client.is_terminal_daily_quota_error(upstream.error_code, upstream.error_message)
+    ):
+        retried = await client.retry_task_after_daily_quota(
+            record,
+            reason=upstream.error_message or upstream.error_code or "Daily generation limit",
+            max_retries=TERMINAL_DAILY_QUOTA_MAX_RETRIES,
+        )
+        if retried is not None:
+            audit_event(
+                "warning",
+                "video",
+                "生成阶段触发日限额，已重新排队换号",
+                account_id=record.account_id,
+                task_id=record.id,
+                details={
+                    "advertiser_id": record.advertiser_id,
+                    "upstream_task_id": record.upstream_task_id,
+                    "model": record.model,
+                    "retry": (retried.submission_payload or {}).get(
+                        "terminal_daily_quota_retries"
+                    ),
+                    "max_retries": TERMINAL_DAILY_QUOTA_MAX_RETRIES,
+                    "error_code": upstream.error_code,
+                },
+            )
+            if submission_dispatcher is not None:
+                submission_dispatcher.wake()
+            return retried
+        current = store.get(record.id)
+        if current is not None and (
+            current.status not in {"queued", "running"}
+            or current.upstream_task_id != record.upstream_task_id
+        ):
+            return current
+
+    if (
+        upstream.status == "failed"
         and record.submission_payload is not None
         and record.upstream_task_id is not None
         and record.account_id is not None
@@ -717,7 +763,10 @@ async def refresh(record: TaskRecord, *, force: bool = False) -> TaskRecord:
     if upstream.draft_id:
         changes["draft_id"] = upstream.draft_id
     updated = store.update(
-        record.id, expected_upstream_task_id=record.upstream_task_id, **changes
+        record.id,
+        expected_upstream_task_id=record.upstream_task_id,
+        require_active=record.status in {"queued", "running"},
+        **changes,
     )
     if updated.status in {"succeeded", "failed"}:
         cleanup_submission_payload(record.submission_payload)

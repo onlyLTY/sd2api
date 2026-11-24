@@ -532,6 +532,7 @@ class TaskStore:
                     advertiser_id = NULL, updated_at = ?
                 WHERE id = ? AND upstream_task_id = ?
                     AND submission_status = 'submitted'
+                    AND status IN ('queued', 'running')
                     AND error_code IS NOT ?
                 """,
                 (
@@ -593,6 +594,7 @@ class TaskStore:
         task_id: str,
         *,
         expected_upstream_task_id: str | None = None,
+        require_active: bool = False,
         **changes: Any,
     ) -> TaskRecord:
         allowed = {
@@ -639,6 +641,8 @@ class TaskStore:
         if expected_upstream_task_id is not None:
             predicate += " AND upstream_task_id = :expected_upstream_task_id"
             encoded["expected_upstream_task_id"] = expected_upstream_task_id
+        if require_active:
+            predicate += " AND status IN ('queued', 'running')"
         with self._lock, self._connection() as connection:
             # A task can expire or switch to another submission during a status check.
             connection.execute(

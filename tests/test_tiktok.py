@@ -3671,6 +3671,212 @@ async def test_upstream_exception_handler_hides_resource_unavailable_details(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("starting_status", "retries"),
+    [("running", 0), ("failed", 0), ("running", 2)],
+    ids=["failover", "historical-failure", "retries-exhausted"],
+)
+async def test_refresh_handles_terminal_daily_quota(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    starting_status: str,
+    retries: int,
+) -> None:
+    import sd2api.main as main
+
+    now = 2_000_000_000
+    monkeypatch.setattr(time, "time", lambda: now)
+    task_store = TaskStore(str(tmp_path / "terminal-daily-quota.db"))
+    configured = Settings(sd2api_upload_dir=str(tmp_path / "uploads"))
+    upload_manager = UploadManager(configured)
+    accounts = (("account-a", "aio-a"), ("account-b", "aio-b"))
+    for account_id, advertiser_id in accounts:
+        task_store.create_account(account_id=account_id, name=account_id)
+        task_store.upsert_subaccounts(
+            account_id,
+            [
+                {
+                    "advertiser_id": advertiser_id,
+                    "name": advertiser_id,
+                    "account_type": "client",
+                    "seedance_access": True,
+                    "credits": 100,
+                }
+            ],
+        )
+        task_store.set_subaccount_enabled(account_id, advertiser_id, True)
+
+    pool = BrowserPoolClient(configured, task_store)
+    dispatcher = VideoSubmissionDispatcher(
+        store=task_store,
+        uploads=upload_manager,
+        client=pool,
+        concurrency=1,
+        audit=main.audit_event,
+    )
+    quota_message = "User Generation Day Limit: limit_level=STRATEGY"
+    submissions: list[str] = []
+    wakes: list[str] = []
+    status_checks: list[str] = []
+
+    class ProtocolClient:
+        load = 0
+
+        def __init__(self, account_id: str) -> None:
+            self.account_id = account_id
+
+        async def create_text_video(self, **kwargs: Any) -> str:
+            assert kwargs["model"] == "seedance-2.0"
+            submissions.append(self.account_id)
+            return "upstream-replacement"
+
+    clients = {
+        (account_id, advertiser_id): ProtocolClient(account_id)
+        for account_id, advertiser_id in accounts
+    }
+
+    async def list_accounts() -> list[dict[str, Any]]:
+        return [
+            {
+                "id": account_id,
+                "enabled": True,
+                "running": True,
+                "logged_in": True,
+                "session_available": True,
+                "subaccounts": pool._decorate_subaccounts(
+                    account_id, task_store.list_subaccounts(account_id)
+                ),
+            }
+            for account_id, _ in accounts
+        ]
+
+    async def check_task(task_id: str) -> UpstreamTask:
+        status_checks.append(task_id)
+        assert task_id == "upstream-original"
+        return UpstreamTask(
+            id=task_id,
+            status="failed",
+            progress=100,
+            error_code="10040104",
+            error_message=quota_message,
+            draft_id="draft-original",
+        )
+
+    monkeypatch.setattr(pool, "list_accounts", list_accounts)
+    monkeypatch.setattr(
+        pool,
+        "_protocol_client",
+        lambda account_id, advertiser_id: clients[account_id, advertiser_id],
+    )
+    monkeypatch.setattr(pool, "check_task", check_task)
+    monkeypatch.setattr(dispatcher, "wake", lambda: wakes.append("wake"))
+    monkeypatch.setattr(main, "client", pool)
+    monkeypatch.setattr(main, "store", task_store)
+    monkeypatch.setattr(main, "uploads", upload_manager)
+    monkeypatch.setattr(main, "submission_dispatcher", dispatcher)
+
+    task_id = "video-daily-quota"
+    payload: dict[str, Any] = {"mode": "text", "media": []}
+    if retries:
+        payload["terminal_daily_quota_retries"] = retries
+    task_store.create_submission(
+        task_id=task_id,
+        model="seedance-2.0",
+        prompt="retry after daily quota",
+        seconds=5,
+        size="720x1280",
+        api_key_mask=None,
+        idempotency_key_hash=None,
+        payload=payload,
+    )
+    task_store.claim_submission(task_id)
+    task_store.complete_submission(
+        task_id,
+        upstream_task_id="upstream-original",
+        draft_id="draft-original",
+        account_id="account-a",
+        advertiser_id="aio-a",
+    )
+    if starting_status == "failed":
+        record = task_store.update(
+            task_id,
+            status="failed",
+            error_code="10040104",
+            error_message=quota_message,
+        )
+    else:
+        record = task_store.update(task_id, status=starting_status)
+
+    refreshed = await main.refresh(record)
+
+    if starting_status == "failed" or retries == 2:
+        assert refreshed.id == task_id
+        assert refreshed.status == "failed"
+        assert refreshed.error_code == "10040104"
+        assert refreshed.upstream_task_id == "upstream-original"
+        assert task_store.queued_submission_ids() == []
+        assert not wakes
+        if starting_status == "failed":
+            assert await main.refresh(record, force=True) == record
+            assert not status_checks
+            assert task_store.list_subaccount_model_limits("account-a", "aio-a") == []
+        else:
+            stale_poll = task_store.update(
+                task_id,
+                expected_upstream_task_id="upstream-original",
+                require_active=True,
+                status="running",
+            )
+            assert stale_poll == refreshed
+            assert task_store.retry_submitted_task(
+                task_id,
+                expected_upstream_task_id="upstream-original",
+                payload=payload,
+            ) is None
+        return
+
+    assert refreshed.id == task_id
+    assert refreshed.status == "queued"
+    assert refreshed.submission_status == "queued"
+    assert refreshed.upstream_task_id is None
+    assert refreshed.draft_id is None
+    assert refreshed.account_id is None
+    assert refreshed.advertiser_id is None
+    assert refreshed.submission_payload == {
+        "mode": "text",
+        "media": [],
+        "terminal_daily_quota_retries": 1,
+    }
+    assert task_store.get_by_upstream_task_id("upstream-original") is None
+    assert await main.refresh(record) == refreshed
+    assert wakes == ["wake"]
+    assert task_store.queued_submission_ids() == [task_id]
+
+    (blocked,) = task_store.list_subaccount_model_limits("account-a", "aio-a")
+    assert blocked["model"] == "seedance-2.0"
+    assert blocked["quota_blocked_until"] == (now // 86400 + 1) * 86400
+    assert blocked["quota_reason"] == quota_message
+    (subaccount,) = pool._decorate_subaccounts(
+        "account-a", task_store.list_subaccounts("account-a")
+    )
+    assert pool._subaccount_eligible(subaccount, "seedance-2.0-fast")
+
+    await dispatcher._submit(task_id)
+
+    assert submissions == ["account-b"]
+    saved = task_store.get(task_id)
+    assert saved is not None
+    assert saved.id == task_id
+    assert saved.submission_status == "submitted"
+    assert saved.upstream_task_id == "upstream-replacement"
+    assert saved.account_id == "account-b"
+    assert saved.advertiser_id == "aio-b"
+    assert await main.refresh(record) == saved
+    assert wakes == ["wake"]
+    assert task_store.queued_submission_ids() == []
+
+
+@pytest.mark.asyncio
 async def test_refresh_does_not_reroute_daily_limit_with_overlapping_code(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
